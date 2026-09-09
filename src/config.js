@@ -97,6 +97,7 @@ export function createDefaultConfig() {
     switchThreshold: 0.98,
     holdSeconds: 0,
     distributeSessions: false,
+    preferFableDepletedAccounts: false,
     sessionTitles: { enabled: false, width: 18 },
     eventLogging: 'hide',
     blockedModels: [],

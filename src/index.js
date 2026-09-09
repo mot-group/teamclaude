@@ -280,7 +280,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, adaptive });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferFableDepletedAccounts: config.preferFableDepletedAccounts, adaptive });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -401,6 +401,8 @@ async function serverCommand() {
     // it to plain even distribution on every config reload.
     config.distributeSessions = diskConfig.distributeSessions ?? false;
     accountManager.setDistributeSessions(config.distributeSessions);
+    config.preferFableDepletedAccounts = diskConfig.preferFableDepletedAccounts === true;
+    accountManager.preferFableDepletedAccounts = config.preferFableDepletedAccounts;
     // Pick up a switchThreshold change the same way (teamclaude threshold, the
     // TUI settings screen, or a hand edit). thresholdFor() reads it off the
     // manager on every decision, so assigning it is the whole application —
