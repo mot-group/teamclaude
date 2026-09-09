@@ -98,6 +98,12 @@ teamclaude login --codex     # browser sign-in, repeat per account
 Add `--no-browser` to print the URL instead of opening one, and `--name` to
 label the account yourself (it defaults to the email on the login).
 
+Each login stores its own tokens and ChatGPT account ID. Startup, reload and
+restart preserve that account even when the native Codex login belongs to
+someone else or `~/.codex/auth.json` is absent. Re-enrollment updates the same
+account ID, removes an old file binding, and notifies the running proxy. Use a
+distinct `--name` if another account already uses the requested name.
+
 To pool a login you already have, or to add one without a browser, point an
 account at the Codex CLI's own credentials file instead — it defaults to
 `~/.codex/auth.json`:
@@ -117,6 +123,30 @@ CODEX_HOME=~/.codex-second codex login
 { "name": "second", "type": "oauth", "provider": "codex",
   "importFrom": "~/.codex-second/auth.json" }
 ```
+
+Credential sources follow these rules:
+
+- An explicit `importFrom` reads that file, including when stale inline tokens
+  remain in the config.
+- A `source: "login"` entry or an entry with an `accountId` uses inline
+  credentials. A missing token reports an error instead of borrowing the native
+  login. Mark hand-inlined credentials with `source: "login"`.
+- An unmarked legacy Codex entry without `accountId` defaults to the native
+  file. This includes tokens copied into such entries by older TeamClaude
+  saves. Loading normalizes the file binding in memory; the next save retains it.
+
+Imported files remain authoritative across restarts. Reload picks up a changed
+file but does not restore an unchanged file snapshot over tokens refreshed in
+memory. TeamClaude does not write refreshed tokens back to these files. Use
+separate `login --codex` grants when native Codex and the pool refresh
+independently, as described in [remote access and model routing](codex-remote-access.md).
+
+If an enrolled account ran with the startup substitution bug in issue #7,
+re-enroll that pooled account or restore known-good credentials. The proxy
+rejects a readable access-token account claim that disagrees with the stored
+account ID, both on load and after refresh. Opaque tokens cannot establish that
+check. A mismatch discovered only after refresh cannot undo the grant already
+sent. Display names do not recover the original credentials.
 
 Then tell Codex to reach TeamClaude instead of OpenAI, in `~/.codex/config.toml`:
 

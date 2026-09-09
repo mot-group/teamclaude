@@ -1,6 +1,7 @@
 import { importCredentials } from './oauth.js';
-import { importCodexCredentials, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
+import { importCodexCredentials, validateCodexCredentials } from './codex-auth.js';
 import { providerOf } from './provider.js';
+import { credentialFile } from './account-source.js';
 
 /**
  * Turn configured accounts into the objects the AccountManager is built from:
@@ -17,31 +18,31 @@ export async function resolveAccounts(config) {
   const accounts = [];
   for (const acct of config.accounts) {
     if (acct.type === 'oauth') {
-      if (acct.importFrom || providerOf(acct) === 'codex') {
-        // A Codex account defaults to the Codex CLI's own credentials file, so
-        // `{ "name": "...", "type": "oauth", "provider": "codex" }` is enough
-        // to pool an already-signed-in Codex login.
-        const isCodex = providerOf(acct) === 'codex';
-        const from = acct.importFrom || (isCodex ? DEFAULT_CODEX_CREDENTIALS_PATH : null);
-        if (!from) { console.error(`No token for "${acct.name}", skipping`); continue; }
+      const isCodex = providerOf(acct) === 'codex';
+      const from = credentialFile(acct);
+      if (from) {
         try {
           const creds = isCodex ? await importCodexCredentials(from) : await importCredentials(from);
           // A readable file with no token is as unusable as a missing one; the
           // non-import branch below already refuses that case, and pushing it
           // anyway would send `Bearer undefined` upstream on every request.
-          if (!creds.accessToken) {
+          if (!creds.accessToken || (isCodex && (typeof creds.accessToken !== 'string' || !creds.accessToken.trim()))) {
             console.error(`No token in ${from} for "${acct.name}", skipping`);
             continue;
           }
-          accounts.push({ ...acct, ...creds });
+          accounts.push({ ...acct, importFrom: from, ...creds });
           console.log(`Imported "${acct.name}" from ${from}`);
         } catch (err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);
         }
-      } else if (acct.accessToken) {
-        accounts.push(acct);
+      } else if (acct.accessToken && (!isCodex || (typeof acct.accessToken === 'string' && acct.accessToken.trim()))) {
+        try {
+          accounts.push(isCodex ? validateCodexCredentials(acct) : acct);
+        } catch (err) {
+          console.error(`Invalid credentials for "${acct.name}": ${err.message}`);
+        }
       } else {
-        console.error(`No token for "${acct.name}", skipping`);
+        console.error(`No token for "${acct.name}", skipping${isCodex ? '; re-enroll with teamclaude login --codex' : ''}`);
       }
     } else if (acct.type === 'apikey' && acct.apiKey) {
       accounts.push(acct);

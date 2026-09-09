@@ -15,6 +15,8 @@
 // credential, and it separates two entries that agree on everything else.
 
 import { sameIdentity } from './identity.js';
+import { credentialFile, normalizeAccountSources, ownsInlineToken } from './account-source.js';
+import { providerOf } from './provider.js';
 
 /**
  * The manager account built from config entry `acct`, or null if it has none.
@@ -41,30 +43,6 @@ export function configIndexFor(configAccounts, managerAccounts, mgrIdx) {
   const id = managerAccounts[mgrIdx]?.id;
   if (!id) return -1;
   return configAccounts.findIndex(a => a?.id === id);
-}
-
-/**
- * Whether this entry's OAuth token belongs in `config.json` at all.
- *
- * The save used to write `accessToken: am.credential` onto EVERY entry, which
- * is right for an ordinary oauth account and wrong for the other two kinds:
- *
- *   - an API-KEY account's credential is its `apiKey`, so the save mirrored the
- *     same secret into `accessToken` — and makeAccount reads
- *     `acct.accessToken || acct.apiKey`, preferring the mirror. Rotating the key
- *     in config.json was then ignored on the next cold start, while a running
- *     server picked it up, so the failure looked like the provider rejecting a
- *     key that reads correctly in the file (#202).
- *   - an `importFrom` account delegates to a credentials file on purpose. One
- *     save materialised the token into config.json, and from then on the copy
- *     won over re-reading the file, so the entry stopped delegating in practice
- *     (#204).
- *
- * Refreshed tokens for ordinary oauth entries still persist — that is the case
- * this write exists for.
- */
-function ownsInlineToken(entry) {
-  return entry?.type === 'oauth' && !entry.importFrom;
 }
 
 // Entries the operator removed in this process, by id.
@@ -146,6 +124,8 @@ function claimDiskRows(configAccounts, diskAccounts) {
  * and claimDiskRows is where it is decided: one row per entry, one entry per row.
  */
 export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
+  normalizeAccountSources(configAccounts);
+  normalizeAccountSources(diskAccounts);
   const rowFor = claimDiskRows(configAccounts, diskAccounts);
 
   const merged = configAccounts.map((a, i) => {
@@ -155,8 +135,19 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       accessToken: am.credential,
       refreshToken: am.refreshToken,
       expiresAt: am.expiresAt,
+      ...(providerOf(am) === 'codex' && { accountId: am.accountId }),
     } : a;
     const diskAcct = diskAccounts[rowFor.get(i)];
+    if (diskAcct && providerOf(a) === 'codex' && providerOf(diskAcct) === 'codex'
+        && (credentialFile(a) !== credentialFile(diskAcct)
+          || (a.accountId && diskAcct.accountId && a.accountId !== diskAcct.accountId))) {
+      const merged = { ...diskAcct, ...a };
+      for (const key of ['source', 'importFrom', 'accountId', 'accessToken', 'refreshToken', 'expiresAt']) {
+        if (Object.hasOwn(diskAcct, key)) merged[key] = diskAcct[key];
+        else delete merged[key];
+      }
+      return merged;
+    }
     return diskAcct ? { ...diskAcct, ...live } : live;
   });
 
@@ -196,6 +187,18 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
 export function syncRefreshedTokens(configAccounts, managerAccounts, mgrIdx, newTokens) {
   const i = configIndexFor(configAccounts, managerAccounts, mgrIdx);
   if (i < 0) return -1;
+  const entry = configAccounts[i];
+  if (!ownsInlineToken(entry)) return -1;
+  const account = managerAccounts[mgrIdx];
+  if (providerOf(account) === 'codex' || providerOf(entry) === 'codex') {
+    if (providerOf(account) !== providerOf(entry)
+        || credentialFile(account) !== credentialFile(entry)
+        || (entry.accountId && account.accountId && entry.accountId !== account.accountId)) return -1;
+    if (newTokens.previousRefreshToken && entry.refreshToken
+        && entry.refreshToken !== newTokens.previousRefreshToken
+        && entry.refreshToken !== newTokens.refreshToken) return -1;
+    entry.accountId = newTokens.accountId ?? account.accountId ?? null;
+  }
   configAccounts[i].accessToken = newTokens.accessToken;
   configAccounts[i].refreshToken = newTokens.refreshToken;
   configAccounts[i].expiresAt = newTokens.expiresAt;

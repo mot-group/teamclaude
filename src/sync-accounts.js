@@ -1,6 +1,9 @@
 import { importCredentials } from './oauth.js';
-import { sameIdentity } from './identity.js';
+import { sameAccountEntry } from './identity.js';
 import { ensureAccountIds } from './account-id.js';
+import { resolveAccounts } from './resolve-accounts.js';
+import { credentialFile, normalizeAccountSources, importedCodexTuple } from './account-source.js';
+import { providerOf } from './provider.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -9,6 +12,8 @@ import { ensureAccountIds } from './account-id.js';
  */
 export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
+  normalizeAccountSources(diskConfig.accounts);
+  normalizeAccountSources(memConfig.accounts);
   // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
   // Each disk entry claims at most one unclaimed manager account, so multiple
   // same-person/different-org entries pair correctly instead of all matching the
@@ -16,7 +21,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   const claimed = new Set();
   const claim = (diskAcct) => {
     for (let i = 0; i < accountManager.accounts.length; i++) {
-      if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
+      if (!claimed.has(i) && sameAccountEntry(accountManager.accounts[i], diskAcct)) {
         claimed.add(i);
         return i;
       }
@@ -32,7 +37,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   const cfgClaimed = new Set();
   const claimConfig = (diskAcct) => {
     for (let i = 0; i < memConfig.accounts.length; i++) {
-      if (!cfgClaimed.has(i) && sameIdentity(memConfig.accounts[i], diskAcct)) {
+      if (!cfgClaimed.has(i) && sameAccountEntry(memConfig.accounts[i], diskAcct)) {
         cfgClaimed.add(i);
         return memConfig.accounts[i];
       }
@@ -41,6 +46,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   };
 
   for (const diskAcct of diskConfig.accounts) {
+    const isCodex = providerOf(diskAcct) === 'codex';
+    const resolved = isCodex ? (await resolveAccounts({ accounts: [diskAcct] }))[0] : diskAcct;
     const mgrIdx = claim(diskAcct);
     // Claimed once per disk entry and reused below. Calling claimConfig twice
     // for one entry would consume two different config rows.
@@ -69,7 +76,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         ensureAccountIds(memConfig.accounts);
         cfgClaimed.add(memConfig.accounts.length - 1);
       }
-      accountManager.addAccount(diskAcct);
+      if (!resolved) continue;
+      accountManager.addAccount(isCodex ? { ...resolved, id: cfgAcct?.id || diskAcct.id } : diskAcct);
       claimed.add(accountManager.accounts.length - 1);
       added++;
       console.log(cfgAcct
@@ -107,6 +115,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // the running account too. Delete-on-absence keeps the saved JSON clean,
     // the same shape a hand edit produces.
     if (cfgAcct) {
+      if (isCodex && diskAcct.name) cfgAcct.name = diskAcct.name;
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
@@ -114,6 +123,37 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
+
+    if (isCodex) {
+      if (!resolved) continue;
+      const sourceChanged = credentialFile(mgr) !== credentialFile(diskAcct);
+      const identityChanged = mgr.accountId !== (resolved.accountId ?? null);
+      const tuple = importedCodexTuple(resolved);
+      const unchangedFile = tuple && mgr._importedCodexTuple
+        && tuple.every((value, i) => value === mgr._importedCodexTuple[i]);
+      const diskIsStaler = !sourceChanged && !identityChanged && resolved.expiresAt && mgr.expiresAt
+        && resolved.expiresAt < mgr.expiresAt;
+      if (diskIsStaler || (unchangedFile && !sourceChanged && !identityChanged)) continue;
+
+      mgr.importFrom = credentialFile(diskAcct);
+      mgr.source = diskAcct.source || null;
+      mgr._importedCodexTuple = tuple;
+      if (cfgAcct) {
+        const source = mgr.importFrom ? diskAcct : resolved;
+        for (const key of ['source', 'importFrom', 'accountId', 'accessToken', 'refreshToken', 'expiresAt']) {
+          if (Object.hasOwn(source, key)) cfgAcct[key] = source[key];
+          else delete cfgAcct[key];
+        }
+      }
+      if (diskAcct.type === 'oauth' && (sourceChanged || identityChanged
+          || mgr.credential !== resolved.accessToken || mgr.refreshToken !== (resolved.refreshToken ?? null)
+          || mgr.expiresAt !== (resolved.expiresAt ?? null))) {
+        accountManager.updateAccountTokens(mgr.index, resolved);
+      } else if (diskAcct.type === 'apikey') {
+        mgr.credential = resolved.apiKey;
+      }
+      continue;
+    }
 
     // Existing account — resolve fresh credentials from disk
     let freshCred = null;

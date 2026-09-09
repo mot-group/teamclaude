@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
 import { ensureAccountIds } from './account-id.js';
+import { normalizeAccountSources } from './account-source.js';
 
 export function getConfigPath() {
   if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
@@ -113,6 +114,7 @@ export async function loadConfig() {
     // so a config written before the field existed — or edited by hand — is given
     // ids here, before anything can read one. The next save persists them.
     ensureAccountIds(config.accounts);
+    normalizeAccountSources(config.accounts);
     applyUpstreamProxy(config);
     return config;
   } catch (err) {
@@ -163,6 +165,7 @@ export async function loadOrCreateConfig() {
 }
 
 export async function saveConfig(config) {
+  normalizeAccountSources(config.accounts);
   // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
   // for why this is not a plain writeFile.
   await writeJsonAtomic(getConfigPath(), config);
