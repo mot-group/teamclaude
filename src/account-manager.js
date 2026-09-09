@@ -1,6 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount } from './provider.js';
-import { refreshCodexToken } from './codex-auth.js';
+import { refreshCodexToken, validateCodexCredentials } from './codex-auth.js';
+import { credentialFile, importedCodexTuple } from './account-source.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, WEEKLY_BUCKET_KEYS } from './model.js';
@@ -177,6 +178,9 @@ function makeAccount(acct, index) {
     // that id. The Anthropic counterpart is `accountUuid`, which is patched
     // into the request body instead.
     accountId: acct.accountId || null,
+    source: acct.source || null,
+    importFrom: credentialFile(acct),
+    _importedCodexTuple: importedCodexTuple(acct),
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -3621,17 +3625,34 @@ export class AccountManager {
       // imported one dead on invalid_grant (locking the account out until a
       // re-login), or overwriting it with a result minted from the old family.
       const sent = account.refreshToken;
+      const sentAccess = account.credential;
+      const sentId = account.accountId;
+      const sentFile = credentialFile(account);
+      const replaced = () => account.refreshToken !== sent || (providerOf(account) === 'codex'
+        && (account.credential !== sentAccess || account.accountId !== sentId || credentialFile(account) !== sentFile));
       try {
         // Each provider mints tokens at its own endpoint with its own client
         // id, so the grant is dispatched by provider. Both return the same
         // { accessToken, refreshToken, expiresAt } shape, which is what lets
         // everything downstream stay provider-agnostic.
-        const newTokens = await (providerOf(account) === 'codex'
+        let newTokens = await (providerOf(account) === 'codex'
           ? this._codexRefreshFn(sent)
           : this._refreshFn(sent));
-        if (account.refreshToken !== sent) {
+        if (replaced()) {
           console.log(`[TeamClaude] Discarding refresh result for account "${account.name}" — its tokens were replaced while the refresh was in flight`);
           return;
+        }
+        if (providerOf(account) === 'codex') {
+          try {
+            newTokens = validateCodexCredentials({ ...newTokens, accountId: account.accountId });
+          } catch (err) {
+            account.status = 'error';
+            account._deadRefreshToken = sent;
+            console.error(`[TeamClaude] ${err.message}`);
+            return;
+          }
+          account.accountId = newTokens.accountId;
+          newTokens.previousRefreshToken = sent;
         }
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
@@ -3650,6 +3671,7 @@ export class AccountManager {
         // what kept accounts wrongly "errored" after a momentary refresh blip.
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {
+          if (providerOf(account) === 'codex' && replaced()) return;
           // Remember WHICH token was rejected so we stop re-sending it (see the
           // dead-token guard above). A transient failure deliberately does not
           // arm this — that token may still be good. The token that was SENT,
@@ -3681,12 +3703,24 @@ export class AccountManager {
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
-  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
+  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt, accountId }) {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth') return;
 
+    const previousRefreshToken = account.refreshToken;
+    const isCodex = providerOf(account) === 'codex';
+    if (isCodex && accountId !== undefined && account.accountId !== accountId) {
+      account.accountId = accountId;
+      account.quota = emptyQuota();
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+      account.throttledAt = null;
+      account._lastRefreshAt = null;
+      account._deadRefreshToken = null;
+    }
     account.credential = accessToken;
-    if (refreshToken) account.refreshToken = refreshToken;
+    if (isCodex) account.refreshToken = refreshToken || null;
+    else if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
@@ -3694,6 +3728,7 @@ export class AccountManager {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
+      ...(isCodex && { accountId: account.accountId, previousRefreshToken }),
     });
   }
 
@@ -3776,7 +3811,11 @@ export class AccountManager {
         burnRate: this.burnRateLearner.export(a.index),
         concCap: this.concurrencyLearner.export(a.index),
       };
-      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
+      return {
+        provider: providerOf(a),
+        ...(providerOf(a) === 'codex' && { accountId: a.accountId }),
+        accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive,
+      };
     });
   }
 
@@ -3788,7 +3827,7 @@ export class AccountManager {
   restoreQuotaState(saved) {
     if (!Array.isArray(saved)) return;
     for (const account of this.accounts) {
-      const match = saved.find(s => sameIdentity(s, account));
+      const match = saved.find(s => sameIdentity({ ...s, provider: s?.provider ?? providerOf(account) }, account));
       if (!match || !match.quota) continue;
       this._confirmedFable.delete(account);
       for (const f of PERSISTED_QUOTA_FIELDS) {

@@ -15,6 +15,7 @@ import { homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import http from 'node:http';
+import { ensureAccountIds } from './account-id.js';
 import { proxyFetch } from './upstream-fetch.js';
 import { tokenPairFromResponse } from './oauth.js';
 
@@ -37,7 +38,7 @@ const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/auth/callback`;
 // refresh their existing grant rather than minting a new one.
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 
-/** Decode a JWT payload without verifying it. Claims are used for labelling only. */
+/** Read claims for consistency checks. The provider still verifies the token. */
 function decodeJwtClaims(token) {
   const parts = String(token || '').split('.');
   if (parts.length !== 3) return null;
@@ -46,6 +47,49 @@ function decodeJwtClaims(token) {
   } catch {
     return null;
   }
+}
+
+export function validateCodexCredentials(account) {
+  const claims = decodeJwtClaims(account.accessToken);
+  const claimedId = claims?.['https://api.openai.com/auth']?.chatgpt_account_id;
+  const accountId = typeof claimedId === 'string' && claimedId ? claimedId : null;
+  if (accountId && account.accountId && accountId !== account.accountId) {
+    throw new Error('Codex token belongs to a different account; re-enroll with teamclaude login --codex');
+  }
+  const exp = claims?.exp;
+  return {
+    ...account,
+    accountId: account.accountId || accountId || null,
+    expiresAt: account.expiresAt ?? (typeof exp === 'number' && Number.isFinite(exp) && exp > 0 ? exp * 1000 : null),
+  };
+}
+
+export function upsertCodexAccount(accounts, incoming) {
+  incoming = validateCodexCredentials(incoming);
+  let index = incoming.accountId
+    ? accounts.findIndex(a => a.provider === 'codex' && a.accountId === incoming.accountId)
+    : -1;
+  if (index < 0) {
+    const named = accounts.filter(a => a.name === incoming.name);
+    if (named.length > 1 || named.some(a => a.provider !== 'codex'
+        || (a.accountId && incoming.accountId && a.accountId !== incoming.accountId))) {
+      throw new Error('Account name is already in use; choose a distinct --name for this Codex login');
+    }
+    index = named.length ? accounts.indexOf(named[0]) : -1;
+  }
+  const previous = accounts[index];
+  const account = validateCodexCredentials({
+    ...previous,
+    ...incoming,
+    accountId: incoming.accountId || previous?.accountId || null,
+    ...(previous && { name: previous.name, id: previous.id }),
+    source: 'login',
+  });
+  delete account.importFrom;
+  if (index < 0) accounts.push(account);
+  else accounts[index] = account;
+  ensureAccountIds(accounts);
+  return { account, updated: index >= 0 };
 }
 
 /**
@@ -63,7 +107,7 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
   const claims = decodeJwtClaims(tokens.id_token) || {};
   const auth = claims['https://api.openai.com/auth'] || {};
 
-  return {
+  return validateCodexCredentials({
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     // Scopes the token to one ChatGPT account. Prefer the id_token claim and
@@ -72,7 +116,7 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
     accountId: auth.chatgpt_account_id || tokens.account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
-  };
+  });
 }
 
 /**

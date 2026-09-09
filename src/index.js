@@ -13,6 +13,7 @@ import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
+  sameAccountEntry,
   orgKey,
   matchAccounts,
   findUpsertTarget,
@@ -21,7 +22,8 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
-import { loginCodex } from './codex-auth.js';
+import { loginCodex, upsertCodexAccount } from './codex-auth.js';
+import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -318,33 +320,25 @@ async function serverCommand() {
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
+    const refreshedAccount = { ...account };
     // Keep config.accounts in sync so the TUI save does not clobber fresh tokens.
-    // A -1 means no config entry pairs with this account and the in-memory copy
-    // keeps what it had; the disk write below is unaffected either way, since it
-    // resolves its own row through findConfigAccount rather than this pairing.
     syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
-    atomicConfigUpdate(diskConfig => {
+    atomicConfigUpdate(async diskConfig => {
       // Pick up any new accounts from disk so the running fleet serves them
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
       for (const diskAcct of diskConfig.accounts) {
-        const known = config.accounts.some(a => sameIdentity(a, diskAcct));
+        const known = config.accounts.some(a => sameAccountEntry(a, diskAcct));
         if (!known) {
-          // Same object into both lists, so the account carries its entry's id;
-          // ensureAccountIds first, in case the entry brought in one this list
-          // already uses. See the matching add in sync-accounts.js.
+          // Keep the raw entry in config and give its id to the resolved account.
           config.accounts.push(diskAcct);
           ensureAccountIds(config.accounts);
-          accountManager.addAccount(diskAcct);
+          const resolved = providerOf(diskAcct) === 'codex'
+            ? (await resolveAccounts({ accounts: [diskAcct] }))[0] : diskAcct;
+          if (resolved) accountManager.addAccount(resolved);
         }
       }
-      // By entry id only — the index may have shifted, and identity is not
-      // one-to-one (see findConfigAccount). No row: nothing is written.
-      const cfgIdx = findConfigAccount(diskConfig, account);
-      if (cfgIdx >= 0) {
-        diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
-        diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
-        diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
-      }
+      // Recheck ownership against disk after any queued enrollment or reload.
+      syncRefreshedTokens(diskConfig.accounts, [refreshedAccount], 0, newTokens);
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
@@ -379,6 +373,7 @@ async function serverCommand() {
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
+    await persistMintedAccountIds(diskConfig);
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
@@ -778,7 +773,7 @@ async function loginCodexCommand() {
   // the copy loaded before the flow would put the dead token back, and that
   // account would fail on its next restart. So the upsert runs against a fresh
   // read of the file, and only this account's row is touched.
-  await atomicConfigUpdate(config => {
+  const config = await atomicConfigUpdate(config => {
     const name = argValue('--name') || creds.email
       || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
 
@@ -793,23 +788,14 @@ async function loginCodexCommand() {
       expiresAt: creds.expiresAt,
     };
 
-    // Identity for a Codex account is its ChatGPT account id; fall back to the
-    // display name when upstream did not supply one.
-    const idx = config.accounts.findIndex(a => (
-      a.provider === 'codex' && (
-        (account.accountId && a.accountId === account.accountId) || a.name === account.name
-      )
-    ));
-    if (idx >= 0) {
-      const prev = config.accounts[idx];
-      config.accounts[idx] = { ...prev, ...account, name: prev.name };
-      console.log(`Updated account "${prev.name}"`);
-    } else {
-      config.accounts.push(account);
-      console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
-    }
+    const result = upsertCodexAccount(config.accounts, account);
+    console.log(`${result.updated ? 'Updated' : 'Added'} account "${result.account.name}"`);
+  }).catch(err => {
+    console.error(`Codex enrollment failed: ${err.message}`);
+    process.exit(1);
   });
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 async function loginCommand() {

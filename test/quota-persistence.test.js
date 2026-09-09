@@ -12,7 +12,7 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   am.accounts[0].quota.unified7d = 0.42;
   const [entry] = am.exportQuotaState();
 
-  assert.deepEqual(Object.keys(entry).sort(), ['accountUuid', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort());
+  assert.deepEqual(Object.keys(entry).sort(), ['provider', 'accountUuid', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort());
   assert.equal(entry.accountUuid, 'p1');
   assert.equal(entry.quota.unified7d, 0.42);
   // Transient/credential fields must not leak.
@@ -35,6 +35,25 @@ test('adaptive burn and concurrency learning survive an identity-matched restart
 
   assert.equal(am2.burnRateLearner.reserve(0, 'unified7d'), reserve);
   assert.equal(am2.concurrencyLearner.cap(0), 3.5);
+});
+
+test('Codex quota restores from legacy state and new state keeps provider and account identity', () => {
+  const am = new AccountManager([oauth('same', { provider: 'codex', accountId: 'B' })]);
+  const future = Date.now() + 3600_000;
+  am.restoreQuotaState([{ name: 'same', quota: { unified7d: 0.42, unified7dReset: future } }]);
+  assert.equal(am.accounts[0].quota.unified7d, 0.42);
+  assert.equal(am.accounts[0].probing, false);
+  const saved = am.exportQuotaState();
+  assert.equal(saved[0].provider, 'codex');
+  assert.equal(saved[0].accountId, 'B');
+  const restarted = new AccountManager([
+    oauth('same'), oauth('renamed', { provider: 'codex', accountId: 'B' }),
+    oauth('same', { provider: 'codex', accountId: 'C' }),
+  ]);
+  restarted.restoreQuotaState(saved);
+  assert.equal(restarted.accounts[0].quota.unified7d, null);
+  assert.equal(restarted.accounts[1].quota.unified7d, 0.42);
+  assert.equal(restarted.accounts[2].quota.unified7d, null);
 });
 
 test('quota survives an export → restore round-trip', () => {

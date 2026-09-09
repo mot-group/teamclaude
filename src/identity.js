@@ -11,6 +11,16 @@
 // (the profile endpoint has always returned a name), so identity still works on
 // entries created before org UUIDs were stored.
 
+import { providerOf } from './provider.js';
+
+export function sameAccountEntry(a, b) {
+  if (providerOf(a) === 'codex' || providerOf(b) === 'codex') {
+    if (providerOf(a) !== providerOf(b)) return false;
+    if (a?.id && b?.id) return a.id === b.id;
+  }
+  return sameIdentity(a, b);
+}
+
 /** Stable org discriminator for an account record: org UUID, else org name, else null. */
 export function orgKey(acct) {
   return acct?.orgUuid || acct?.orgName || null;
@@ -27,6 +37,11 @@ export function orgKey(acct) {
  * - Otherwise (API-key accounts, or no UUID yet): fall back to matching by name.
  */
 export function sameIdentity(a, b) {
+  if (providerOf(a) === 'codex' || providerOf(b) === 'codex') {
+    if (providerOf(a) !== providerOf(b)) return false;
+    if (a?.accountId && b?.accountId) return a.accountId === b.accountId;
+    return a?.name === b?.name;
+  }
   if (a?.accountUuid && b?.accountUuid) {
     if (a.accountUuid !== b.accountUuid) return false;
     const ka = orgKey(a);

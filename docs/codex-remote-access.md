@@ -30,9 +30,22 @@ Use the name of an enrolled Codex account in place of `codex-2`. The path pin fi
 
 Enroll pooled subscriptions separately with `teamclaude login --codex`. Keep those grants separate from the native desktop credentials. Avoid copying a native refresh token into another independently refreshing client. The maintained Linux setup uses directly enrolled credentials in TeamClaude and preserves the native Codex auth file.
 
+The credential-ownership fix for issue #7 preserves this setup and the provider
+configuration above. An enrolled account retains its own tokens and ChatGPT
+account ID across reload, save and restart. If an older version already saved
+substituted credentials, re-enroll the pooled account. Keep the native desktop
+login in place.
+
 ## Verify the two roles
 
-Check the desktop's signed-in account and whether the remote target is available. Then check the target's effective model-provider configuration, the session's recorded provider, and TeamClaude's activity log. A successful model request logged as `codex-2 [pin]` confirms which pooled account served it. The dashboard's global current-account label alone does not establish which account serves Codex; explicit pins and model routes determine that.
+Check the desktop's signed-in account and whether the remote target is available. Then check the target's effective model-provider configuration, the session's recorded provider, and TeamClaude's activity log. A successful model request logged as `codex-2 [pin]` identifies the selected pool entry. The dashboard's global current-account label alone does not establish which account serves Codex; explicit pins and model routes determine that.
+
+After upgrading, also verify that the selected entry's ChatGPT account ID is B's
+and that the remote target remains accessible after restarting TeamClaude. The
+`codex-2 [pin]` label identifies the config entry; by itself it cannot detect old
+credentials substituted under that name. Regression tests capture the actual
+upstream Bearer token and account-ID header using dummy credentials and a local
+server, including after refresh, save and restart.
 
 In the verified setup, the Linux desktop backend had an active connection to TeamClaude on loopback, the desktop session recorded `model_provider: teamclaude`, and the proxy recorded successful pinned requests to an account whose subscription ID differed from the native login. The user confirmed that the target remained accessible from the Mac.
 
