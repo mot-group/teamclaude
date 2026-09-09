@@ -16,8 +16,8 @@
 import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT } from './status-renderer.js';
 
-export function renderDashboardHtml() {
-  return PAGE;
+export function renderDashboardHtml({ sessionAuth = false } = {}) {
+  return PAGE.replace("var SESSION_AUTH = false;", `var SESSION_AUTH = ${sessionAuth};`);
 }
 
 /**
@@ -316,13 +316,13 @@ const PAGE = `<!doctype html>
 <title>TeamClaude</title>
 <style>
   :root {
-    --bg: #101418; --panel: #171d24; --line: #242c36;
-    --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd;
+    --bg: #0d1117; --panel: #151c25; --line: #2b3542;
+    --text: #edf1f5; --dim: #a1adba; --accent: #7ed6c4;
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 24px; }
-  main { max-width: 860px; margin: 0 auto; }
+  main { max-width: 1360px; margin: 0 auto; }
   h1 { font-size: 18px; margin-bottom: 4px; }
   h2 { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin: 24px 0 8px; }
   .sub { color: var(--dim); margin-bottom: 16px; }
@@ -377,27 +377,89 @@ const PAGE = `<!doctype html>
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #06121f; font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
+
+  html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+  body { padding: 36px; }
+  h1 { font-size: 30px; letter-spacing: -.04em; font-weight: 650; }
+  h2 { font-size: 16px; text-transform: none; letter-spacing: -.01em; color: var(--text); margin-top: 32px; }
+  .eyebrow { color: var(--accent); font: 11px ui-monospace, monospace; letter-spacing: .14em; text-transform: uppercase; margin-bottom: 10px; }
+  .topline { display:flex; justify-content:space-between; align-items:center; gap:20px; }
+  .toolbar, nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button, input, select { font:inherit; }
+  .toolbar button, .search, nav a { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:7px; padding:10px 14px; min-height:44px; }
+  button { cursor:pointer; }
+  button:hover, nav a:hover { border-color:var(--accent); }
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible, th:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  nav { margin:20px 0 28px; border-bottom:1px solid var(--line); padding-bottom:18px; }
+  nav a { text-decoration:none; font-size:13px; background:transparent; border-color:transparent; }
+  .live { color:var(--accent); font-size:12px; }
+  .stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin:24px 0; }
+  .metric { padding:20px; border:1px solid var(--line); border-radius:10px; background:var(--panel); }
+  .metric strong { display:block; font-size:32px; font-weight:600; letter-spacing:-.04em; margin:8px 0; font-variant-numeric:tabular-nums; }
+  .metric small { color:var(--dim); font-size:12px; }
+  .metric-label { color:var(--dim); font-size:13px; }
+  .split { display:grid; grid-template-columns:1.3fr 1fr; gap:20px; }
+  #accounts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+  #accounts .card { margin:0; padding:20px; }
+  .card { border-radius:10px; overflow-x:auto; }
+  .card .name { overflow-wrap:anywhere; }
+  .card .row { margin-bottom:16px; }
+  .quota { grid-template-columns:58px minmax(40px,1fr) 165px; margin-top:12px; }
+  .act { min-height:36px; margin-top:4px; }
+  th, td { padding:12px; font-size:13px; }
+  th { white-space:nowrap; }
+  .section-head { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:30px 0 14px; }
+  .section-head h2 { margin:0; }
+  .search { width:220px; }
+  .details { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .details dt { color:var(--dim); font-size:12px; }
+  .details dd { font-size:14px; overflow-wrap:anywhere; }
+  .empty { padding:24px; color:var(--dim); border:1px dashed var(--line); border-radius:8px; }
+  #keybox { text-align:left; margin:12vh auto; padding:32px; border:1px solid var(--line); border-radius:14px; background:var(--panel); }
+  #keybox h1 { margin-bottom:12px; }
+  #keybox button { width:100%; min-height:44px; }
+  #loginError { color:var(--bad); margin-top:12px; }
+  .history { height:90px; display:flex; align-items:end; gap:3px; margin:20px 0 12px; }
+  .history i { flex:1; background:var(--accent); border-radius:3px 3px 0 0; min-height:2px; }
+  .history-label { color:var(--dim); font-size:12px; }
+  #err { padding:12px; border:1px solid var(--bad); border-radius:8px; }
+  .usage { line-height:1.8; margin-top:14px; }
+  @media(max-width:1000px) { .split { grid-template-columns:1fr; } .stats { grid-template-columns:repeat(2,minmax(0,1fr)); } #accounts { grid-template-columns:1fr; } }
+  @media(max-width:600px) { body { padding:18px; } .topline { align-items:start; flex-direction:column; } h1 { font-size:26px; } .metric { padding:14px; } .metric strong { font-size:27px; } .quota { grid-template-columns:48px minmax(30px,1fr) 150px; gap:5px; } .section-head { align-items:start; flex-direction:column; } nav { gap:0; } nav a { padding:10px; } #keybox { padding:24px; } }
+  @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
 </style>
 </head>
 <body>
 <main>
   <div id="keybox">
+    <div class="eyebrow">Private workspace</div>
     <h1>TeamClaude</h1>
-    <p class="sub">Enter your proxy key to view status.</p>
-    <input id="key" type="password" placeholder="tc-..." autocomplete="off">
-    <br><button id="go">Connect</button>
+    <p class="sub" id="loginHelp">Enter your proxy key to view status.</p>
+    <label for="key" id="keyLabel">Proxy key</label>
+    <input id="key" type="password" autocomplete="current-password">
+    <button id="go">Sign in</button>
+    <p id="loginError" role="alert"></p>
   </div>
   <div id="app" style="display:none">
-    <h1>TeamClaude</h1>
+    <div class="topline">
+      <div><div class="eyebrow">Subscription routing / Operations</div><h1>TeamClaude overview</h1></div>
+      <div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="logout">Sign out</button></div>
+    </div>
     <p class="sub" id="summary"></p>
+    <nav aria-label="Dashboard sections"><a href="#overview">Overview</a><a href="#accountSection">Accounts</a><a href="#routesWrap">Routing</a><a href="#sessionsWrap">Sessions</a><a href="#diagnostics">Diagnostics</a></nav>
+    <div id="overview" class="stats"></div>
     <div id="err"></div>
     <div id="problems"></div>
     <div id="note"></div>
+    <div class="split">
+      <section><h2>Request activity</h2><div class="card"><p class="usage">Requests observed while this page is open</p><div class="history" id="history" role="img" aria-label="Request activity"></div><p class="history-label" id="historyLabel">Collecting the first sample...</p></div></section>
+      <section><h2>Token accounting</h2><div class="card" id="tokens"></div></section>
+    </div>
     <div id="routesWrap" style="display:none">
       <h2>Routing</h2>
       <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
     </div>
-    <h2>Accounts</h2>
+    <div class="section-head" id="accountSection"><h2>Account capacity</h2><input class="search" id="accountSearch" type="search" aria-label="Search accounts" placeholder="Search accounts"></div>
     <div id="accounts"></div>
     <div id="clientsWrap" style="display:none">
       <h2>Clients</h2>
@@ -415,13 +477,19 @@ const PAGE = `<!doctype html>
         <div style="padding:4px 6px"><table id="sessions"></table></div>
       </div>
     </div>
+    <section id="diagnostics"><h2>Server diagnostics</h2><div class="split"><div class="card" id="serverInfo"></div><div class="card" id="routingInfo"></div></div><h2>Quota probes and warmup</h2><div class="card"><table id="jobs"></table></div></section>
     <footer id="foot"></footer>
   </div>
 </main>
 <script>
 (function () {
   'use strict';
+  var SESSION_AUTH = false;
   var KEY = 'teamclaude-dashboard-key';
+  var history = [];
+  var previousSample = null;
+  var polling = false;
+  var authGeneration = 0;
   var POLL_MS = 5000;
   var timer = null;
   var lastStatus = null;
@@ -532,18 +600,24 @@ ${SHARED_HELPERS}
     } else if (q.tokensLimit != null && q.tokensRemaining != null) {
       card.appendChild(quotaRow('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
     } else {
-      card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
+      card.appendChild(el('div', 'usage', 'Quota not reported by the proxy.'));
     }
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
+    if (q.spend) { var spend = q.spend; card.appendChild(el('div', 'usage', 'Extra usage: ' + (spend.enabled ? 'enabled' : 'disabled') + ' · ' + (spend.currency || 'USD') + ' ' + ((spend.usedMinor || 0) / Math.pow(10, spend.exponent == null ? 2 : spend.exponent)).toFixed(2) + ' spent this month')); }
     card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
     return card;
+  }
+
+  function emptyTable(id, text) {
+    var table = document.getElementById(id); table.textContent = '';
+    var row = el('tr'); row.appendChild(el('td', 'usage', text)); table.appendChild(row);
   }
 
   function renderClients(clients) {
     var wrap = document.getElementById('clientsWrap');
     var names = Object.keys(clients || {});
-    if (!names.length) { wrap.style.display = 'none'; return; }
+    if (!names.length) { wrap.style.display = ''; emptyTable('clients', 'No client-attributed usage yet. Requests using the shared proxy key are unattributed.'); return; }
     wrap.style.display = '';
     names.sort(function (a, b) {
       var ca = clients[a], cb = clients[b];
@@ -572,6 +646,10 @@ ${SHARED_HELPERS}
   // it survives the 5s poll: re-rendering re-reads sortState below.
   function addSortableHeader(tr, table, label, key, numeric) {
     var th = el('th', (numeric ? 'num ' : '') + 'sortable', label + (sortState[table].key === key ? (sortState[table].dir === 'asc' ? ' ▲' : ' ▼') : ''));
+    th.tabIndex = 0;
+    th.setAttribute('role', 'button');
+    th.setAttribute('aria-sort', sortState[table].key === key ? (sortState[table].dir === 'asc' ? 'ascending' : 'descending') : 'none');
+    th.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); th.click(); } });
     th.addEventListener('click', function () {
       var st = sortState[table];
       if (st.key === key) st.dir = st.dir === 'asc' ? 'desc' : 'asc';
@@ -599,9 +677,10 @@ ${SHARED_HELPERS}
     var wrap = document.getElementById('sessionsWrap');
     // Absent unless proxy.sessionDetail is on — the aggregate counts in the
     // summary line stay either way.
-    if (!sessions || !sessions.items) { wrap.style.display = 'none'; return; }
+    if (!sessions || !sessions.items) { wrap.style.display = ''; document.querySelector('#sessionsWrap .filters').style.display = 'none'; emptyTable('sessions', 'Session details are disabled on the proxy. Aggregate session counts appear in the overview.'); return; }
     wrap.style.display = '';
 
+    document.querySelector('#sessionsWrap .filters').style.display = '';
     var all = sessionRows(sessions);
     var projectSel = document.getElementById('fProject');
     var clientSel = document.getElementById('fClient');
@@ -618,6 +697,7 @@ ${SHARED_HELPERS}
     var hr = el('tr');
     SESSION_COLUMNS.forEach(function (c) { addSortableHeader(hr, 'sessions', c.label, c.key, !!c.num); });
     table.appendChild(hr);
+    if (!rows.length) { var empty = el('tr'); var cell = el('td', '', 'No sessions match these filters.'); cell.colSpan = SESSION_COLUMNS.length; empty.appendChild(cell); table.appendChild(empty); }
     rows.forEach(function (r) {
       var tr = el('tr');
       tr.appendChild(el('td', r.active ? '' : 'dim', r.id));
@@ -743,6 +823,63 @@ ${SHARED_HELPERS}
     list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
   }
 
+
+  function renderOverview(s) {
+    var accounts = s.accounts || [];
+    var requests = accounts.reduce(function (sum, a) { return sum + ((a.usage || {}).totalRequests || 0); }, 0);
+    var tokens = accounts.reduce(function (sum, a) { return sum + accountTokens(a.usage); }, 0);
+    var ready = accounts.filter(function (a) { return !a.unavailable && !a.disabled && a.status !== 'error'; }).length;
+    var wrap = document.getElementById('overview'); wrap.textContent = '';
+    [['Available accounts', ready + ' / ' + accounts.length, 'Eligibility varies by model family'],
+      ['Requests', fmtNum(requests), 'Cumulative account counters'],
+      ['Tokens reported', fmtNum(tokens), 'Includes cache reads and writes'],
+      ['Active sessions', String((s.sessions || {}).active || 0), ((s.sessions || {}).known || 0) + ' sessions tracked']].forEach(function (m) {
+        var card = el('div', 'metric'); card.appendChild(el('div', 'metric-label', m[0])); card.appendChild(el('strong', '', m[1])); card.appendChild(el('small', '', m[2])); wrap.appendChild(card);
+      });
+    var totals = { totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheCreationTokens: 0 };
+    accounts.forEach(function (a) { Object.keys(totals).forEach(function (k) { totals[k] += (a.usage || {})[k] || 0; }); });
+    details('tokens', [['Input', fmtNum(totals.totalInputTokens)], ['Output', fmtNum(totals.totalOutputTokens)], ['Cache read', fmtNum(totals.totalCacheReadTokens)], ['Cache write', fmtNum(totals.totalCacheCreationTokens)]]);
+    document.getElementById('tokens').appendChild(el('p', 'usage', tokens ? 'Only tokens reported by upstream responses are counted.' : 'No token usage reported yet. Request counts can increase without token reports.'));
+  }
+
+  function details(id, rows) {
+    var wrap = document.getElementById(id); wrap.textContent = '';
+    var list = el('dl', 'details');
+    rows.forEach(function (r) { var item = el('div'); item.appendChild(el('dt', '', r[0])); item.appendChild(el('dd', '', r[1] == null ? 'Unknown' : String(r[1]))); list.appendChild(item); });
+    wrap.appendChild(list);
+  }
+
+  function renderDiagnostics(s) {
+    var server = s.server || {}, loop = server.eventLoop || {}, pool = s.upstreamPool || {};
+    details('serverInfo', [['Proxy uptime', server.uptimeSeconds == null ? null : fmtIn(server.uptimeSeconds)], ['Proxy port', server.port], ['Event loop lag', loop.lastLagMs == null ? null : loop.lastLagMs + ' ms'], ['Worst lag', loop.maxLagMs == null ? null : loop.maxLagMs + ' ms'], ['Active upstream requests', pool.active], ['Queued upstream requests', pool.queued]]);
+    details('routingInfo', [['Default target', s.defaultTarget || s.currentAccount || 'None'], ['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%'], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
+    var overrides = ((s.fableDepletionRouting || {}).models || []);
+    if (overrides.length) { var box = document.getElementById('routingInfo'); box.appendChild(el('p', 'usage', 'Fable depletion overrides')); overrides.forEach(function (r) { box.appendChild(el('p', 'usage', r.model + ' → ' + (r.target || 'None') + ' · ' + r.reason)); }); }
+    var table = document.getElementById('jobs'); table.textContent = '';
+    var hr = el('tr'); ['Account', 'Quota probe', 'Last checked', 'Warmup', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); }); table.appendChild(hr);
+    (s.accounts || []).forEach(function (a) {
+      var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0] || {};
+      var warm = ((s.warm || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0] || {};
+      var row = el('tr'); [a.name, probe.status || 'Unknown', probe.lastProbedAt ? fmtAgo(probe.lastProbedAt) : 'Never', warm.status || 'Unknown', probe.error || warm.error || (probe.durationMs == null ? 'No measurement' : probe.durationMs + ' ms')].forEach(function (v) { row.appendChild(el('td', '', v)); }); table.appendChild(row);
+    });
+  }
+
+  function recordActivity(s) {
+    var total = (s.accounts || []).reduce(function (n, a) { return n + ((a.usage || {}).totalRequests || 0); }, 0);
+    var now = Date.now(), started = (s.server || {}).startedAt;
+    if (previousSample && previousSample.started === started && total >= previousSample.total) {
+      history.push({ count: total - previousSample.total, seconds: (now - previousSample.time) / 1000 });
+      if (history.length > 60) history.shift();
+    } else history = [];
+    previousSample = { total: total, time: now, started: started };
+    var chart = document.getElementById('history'); chart.textContent = '';
+    var max = Math.max.apply(null, [1].concat(history.map(function (h) { return h.count / h.seconds; })));
+    history.forEach(function (h) { var bar = el('i'); bar.style.height = Math.max(2, h.count / h.seconds / max * 100) + '%'; bar.title = h.count + ' requests in ' + Math.round(h.seconds) + 's'; chart.appendChild(bar); });
+    var count = history.reduce(function (n, h) { return n + h.count; }, 0), seconds = history.reduce(function (n, h) { return n + h.seconds; }, 0);
+    var label = history.length ? count + ' requests over ' + Math.round(seconds) + 's · ' + (count / seconds * 60).toFixed(1) + ' req/min' : 'Collecting the first sample...';
+    document.getElementById('historyLabel').textContent = label; chart.setAttribute('aria-label', label);
+  }
+
   function render(s) {
     lastStatus = s;
     var sess = s.sessions || {};
@@ -754,7 +891,12 @@ ${SHARED_HELPERS}
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known sessions' + (up ? ' · ' + up : '')));
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    var query = document.getElementById('accountSearch').value.toLowerCase();
+    var visible = (s.accounts || []).filter(function (a) { return (a.name + ' ' + a.type).toLowerCase().indexOf(query) !== -1; });
+    visible.forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    if (!visible.length) acc.appendChild(el('div', 'empty', query ? 'No matching accounts.' : 'No accounts configured on the proxy.'));
+    renderOverview(s);
+    renderDiagnostics(s);
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
@@ -775,7 +917,7 @@ ${SHARED_HELPERS}
   // in server.js for what "eligible" means).
   function doSwitch(name, btn) {
     btn.disabled = true;
-    var r = switchRequest(name, localStorage.getItem(KEY));
+    var r = switchRequest(name, SESSION_AUTH ? '' : localStorage.getItem(KEY));
     fetch(r.url, r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
@@ -797,28 +939,33 @@ ${SHARED_HELPERS}
     if (timer) { clearInterval(timer); timer = null; }
     document.getElementById('app').style.display = 'none';
     document.getElementById('keybox').style.display = 'block';
+    document.getElementById('key').value = '';
     document.getElementById('key').focus();
   }
 
-  function poll() {
-    fetch('/teamclaude/status', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
-      .then(function (res) {
-        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
-        if (!res.ok) throw new Error('status ' + res.status);
-        return res.json();
-      })
-      .then(function (s) {
-        if (!s) return;
-        document.getElementById('keybox').style.display = 'none';
-        document.getElementById('app').style.display = '';
-        document.getElementById('err').style.display = 'none';
-        render(s);
-      })
-      .catch(function (e) {
-        var err = document.getElementById('err');
-        err.style.display = 'block';
-        err.textContent = 'Cannot reach the proxy: ' + e.message;
-      });
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    var generation = authGeneration;
+    try {
+      var res = await fetch('/teamclaude/status', { headers: SESSION_AUTH ? {} : { 'x-api-key': localStorage.getItem(KEY) || '' }, signal: AbortSignal.timeout(12000) });
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      if (!res.ok) throw new Error('status ' + res.status);
+      var s = await res.json();
+      if (generation !== authGeneration) return;
+      document.getElementById('keybox').style.display = 'none';
+      document.getElementById('app').style.display = '';
+      document.getElementById('err').style.display = 'none';
+      document.getElementById('connection').textContent = 'Live · 5s refresh';
+      recordActivity(s); render(s);
+      if (!timer) timer = setInterval(poll, POLL_MS);
+    } catch (e) {
+      document.getElementById('connection').textContent = 'Disconnected';
+      var err = document.getElementById('err'); err.style.display = 'block';
+      err.textContent = 'Cannot reach the proxy. Displayed values may be stale. ' + e.message;
+      document.getElementById('loginError').textContent = 'Cannot reach the proxy. Try again shortly.';
+    } finally { polling = false; }
   }
 
   function start() {
@@ -826,14 +973,34 @@ ${SHARED_HELPERS}
     if (!timer) timer = setInterval(poll, POLL_MS);
   }
 
-  document.getElementById('go').addEventListener('click', function () {
-    var v = document.getElementById('key').value.trim();
+  document.getElementById('go').addEventListener('click', async function () {
+    var v = document.getElementById('key').value;
     if (!v) return;
-    localStorage.setItem(KEY, v);
-    start();
+    var button = document.getElementById('go'); button.disabled = true;
+    document.getElementById('loginError').textContent = '';
+    try {
+      if (SESSION_AUTH) {
+        var res = await fetch('/teamclaude/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: v }), signal: AbortSignal.timeout(12000) });
+        if (!res.ok) { var json = await res.json(); throw new Error(json.error || 'Sign-in failed'); }
+      } else localStorage.setItem(KEY, v.trim());
+      document.getElementById('key').value = '';
+      start();
+    } catch (e) { document.getElementById('loginError').textContent = e.message; }
+    finally { button.disabled = false; }
   });
   document.getElementById('key').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('go').click();
+  });
+  document.getElementById('refresh').addEventListener('click', poll);
+  document.getElementById('accountSearch').addEventListener('input', function () { if (lastStatus) render(lastStatus); });
+  document.getElementById('logout').addEventListener('click', async function () {
+    try {
+      if (SESSION_AUTH) {
+        var res = await fetch('/teamclaude/logout', { method: 'POST', signal: AbortSignal.timeout(12000) });
+        if (!res.ok && res.status !== 401) throw new Error('Sign-out failed');
+      } else localStorage.removeItem(KEY);
+      authGeneration++; lastStatus = null; history = []; previousSample = null; showKeybox();
+    } catch (e) { note('error', e.message); }
   });
 
   ['fProject', 'fClient'].forEach(function (id) {
@@ -843,7 +1010,11 @@ ${SHARED_HELPERS}
     });
   });
 
-  if (localStorage.getItem(KEY)) start(); else showKeybox();
+  if (SESSION_AUTH) {
+    document.getElementById('loginHelp').textContent = 'Sign in to monitor account capacity and routing.';
+    document.getElementById('keyLabel').textContent = 'Dashboard password';
+    start();
+  } else if (localStorage.getItem(KEY)) start(); else showKeybox();
 })();
 </script>
 </body>

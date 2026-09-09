@@ -101,3 +101,7 @@ TeamClaude is a local proxy holding your own credentials and driving your own Cl
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Password-protected LAN dashboard
+
+Run a separate LAN dashboard with account capacity, routing, request activity, token accounting, sessions, and server diagnostics. It has its own password and expiring browser sessions. See [LAN dashboard setup](docs/lan-dashboard.md) for configuration and a persistent Linux service.

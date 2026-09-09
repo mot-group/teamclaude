@@ -1,0 +1,18 @@
+[Unit]
+Description=TeamClaude password-protected LAN dashboard
+After=network-online.target teamclaude.service
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/node %h/.local/share/teamclaude-dashboard/current/src/dashboard-server.js
+EnvironmentFile=%h/.config/teamclaude-dashboard.env
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+UMask=0077
+
+[Install]
+WantedBy=default.target
