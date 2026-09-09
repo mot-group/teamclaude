@@ -302,6 +302,60 @@ test('broad routes and unknown models cannot overwrite policy cursors, including
   assert.equal(am.accounts[1].rampStartedAt, NOW);
 });
 
+test('policy off retains the plain-model diversion cursor during advisor degradation', t => {
+  clock(t);
+  const am = fleet({ preferFableDepletedAccounts: false, routes: [{ name: 'opus', match: '*opus*', accounts: ['a1', 'a2'] }] }, 3);
+  for (const a of am.accounts) confirm(am, a.index);
+  am.routeCursors.set(am._cursorKey(OPUS), 1);
+  am.routeCursors.set(am._cursorKey(OPUS, FABLE), 2);
+  assert.equal(am.getActiveAccount(null, OPUS, FABLE).index, 1);
+  assert.equal(am.accounts[1].rampStartedAt, null);
+  assert.equal(am.currentIndex, 0);
+});
+
+test('policy off retains executor-only reset consumption when the advisor is unavailable', t => {
+  clock(t);
+  const am = fleet({ preferFableDepletedAccounts: false, expiryRouting: { enabled: true } });
+  confirm(am, 0);
+  am.accounts[0].quota.unified7dReset = NOW + 100 * H;
+  am.accounts[1].quota.unified7dReset = NOW + H;
+  am.accounts[1].quota.unified5hReset = NOW;
+  assert.equal(am.getActiveAccount(null, OPUS, FABLE).index, 1);
+  assert.equal(am.accounts[1].sessionResetPending, false);
+  assert.equal(am.currentIndex, 1);
+});
+
+test('distribution on releases one pin and keeps the ramp stable across alternating families', t => {
+  clock(t);
+  const am = fleet({ distributeSessions: true, expiryRouting: { enabled: true, preempt: true } });
+  am.recordSession('s', 0, OPUS);
+  am.recordSession('s', 0, FABLE);
+  const lines = [];
+  t.mock.method(console, 'log', (...args) => lines.push(args.join(' ')));
+  for (let i = 0; i < 5; i++) {
+    assert.equal(am.getActiveAccount(null, OPUS, null, 's').index, 1);
+    am.recordSession('s', 1, OPUS);
+    assert.equal(am.getActiveAccount(null, FABLE, null, 's').index, 0);
+    assert.equal(am.accounts[1].rampStartedAt, NOW);
+    assert.equal(am.currentIndex, 0);
+    t.mock.timers.tick(100);
+  }
+  assert.equal(lines.filter(line => /released for Fable depletion preference/.test(line)).length, 1);
+});
+
+test('an independent legacy reset can move the global cursor after a scoped policy request', t => {
+  clock(t);
+  const am = fleet({ routes: [{ name: 'opus', match: '*opus*', accounts: ['a1'] }] });
+  am.accounts[1].quota.unified7dReset = NOW + H;
+  am.accounts[1].quota.unified5hReset = NOW;
+  assert.equal(am.getActiveAccount(null, OPUS).index, 1);
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am.accounts[1].sessionResetPending, true);
+  assert.equal(am.getActiveAccount(null, FABLE).index, 0);
+  assert.equal(am.currentIndex, 1, 'the independent session reset retains legacy behavior');
+  assert.equal(am.accounts[1].sessionResetPending, false);
+});
+
 test('session reset pressure cannot move the global cursor for policy or demote a preferred candidate', t => {
   clock(t);
   const am = fleet({ expiryRouting: { enabled: true, preempt: true } });

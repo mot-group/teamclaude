@@ -687,7 +687,7 @@ export class AccountManager {
     // upstream round trip, by which time another request has selected.
     this._selectionDecision = decision;
     this._selectionNow = Date.now();
-    this._selectionCursorKey = this._cursorKey(model, advisorModel, provider);
+    this._selectionCursorKey = this._usesFablePreference(model) ? this._cursorKey(model, advisorModel, provider) : null;
     try {
       account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
     } finally {
@@ -2779,6 +2779,7 @@ export class AccountManager {
   refreshExpiredQuotas(model = null, exclude = null, advisorModel = null) {
     let changed = false;
     const scopedRouting = this.expiryRouting.enabled || this._usesFablePreference(model, advisorModel);
+    const resetAdvisor = this._usesFablePreference(model) ? advisorModel : null;
     // Gated here rather than at the switch call, because the pending flag is read
     // against it too: with the feature off every reset is consumed on sight.
     const scope = scopedRouting ? exclude : null;
@@ -2786,7 +2787,7 @@ export class AccountManager {
     // hands one on every call, empty included, and the TUI loop, getQuotaSummary
     // and selectActiveAccount hand none. The tests below are the switch's own.
     const canRouteTo = account => account != null
-      && !scope.has(account.index) && this._isAvailable(account, model, advisorModel);
+      && !scope.has(account.index) && this._isAvailable(account, model, resetAdvisor);
     // The cursor's account is one end of every comparison the switch makes, so a
     // request that cannot be sent there settles nothing and leaves the event too.
     const spends = !scopedRouting
@@ -2814,7 +2815,7 @@ export class AccountManager {
     // off: threading one in would make the disabled path's candidate filter
     // model-scoped, a live routing change on the path that promises none.
     if (sessionReset.length) {
-      this._switchOnSessionReset(sessionReset, scopedRouting ? model : null, scope, advisorModel);
+      this._switchOnSessionReset(sessionReset, scopedRouting ? model : null, scope, resetAdvisor);
     }
     return changed;
   }

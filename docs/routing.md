@@ -123,6 +123,8 @@ Automatic non-Fable pins move on their next request. Fable pins and in-flight
 streams keep their account. Policy diversions keep the global cursor unchanged
 and join the destination's active storm ramp without extending it. Moving can
 cost one cold prompt cache. Equal-tier pins remain in place after quota recovers.
+Policy moves do not consume rollover observations or add retry exclusions.
+Independent quota resets retain their existing global-cursor behavior.
 
 `/teamclaude/status` reports `fableDepletionRouting`, including model targets and
 reasons such as `fable-depleted`, `numeric-priority` and `manual-route-pin`.
