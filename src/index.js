@@ -790,6 +790,9 @@ async function loginCodexCommand() {
 
     const result = upsertCodexAccount(config.accounts, account);
     console.log(`${result.updated ? 'Updated' : 'Added'} account "${result.account.name}"`);
+  }).catch(err => {
+    console.error(`Codex enrollment failed: ${err.message}`);
+    process.exit(1);
   });
   console.log(`Saved to ${getConfigPath()}`);
   await notifyRunningServer(config);

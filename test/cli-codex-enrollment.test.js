@@ -78,5 +78,12 @@ test('Codex CLI enrollment removes file ownership, saves IDs, and notifies the s
   const newEntry = notifications[1].config.accounts[2];
   assert.equal(typeof newEntry.id, 'string');
   assert.ok(newEntry.id.length > 0);
+  const beforeCollision = await readFile(configPath, 'utf8');
+  const collision = await runCli(home, configPath, { ...creds, accountId: 'D' }, ['login', '--codex', '--name', 'pooled-B']);
+  assert.equal(collision.code, 1);
+  assert.match(collision.output, /Codex enrollment failed:.*distinct --name/);
+  assert.doesNotMatch(collision.output, /\n\s+at /);
+  assert.equal(notifications.length, 2);
+  assert.equal(await readFile(configPath, 'utf8'), beforeCollision);
   assert.equal(await readFile(nativePath, 'utf8'), native);
 });

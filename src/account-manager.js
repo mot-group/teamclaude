@@ -3811,7 +3811,11 @@ export class AccountManager {
         burnRate: this.burnRateLearner.export(a.index),
         concCap: this.concurrencyLearner.export(a.index),
       };
-      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
+      return {
+        provider: providerOf(a),
+        ...(providerOf(a) === 'codex' && { accountId: a.accountId }),
+        accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive,
+      };
     });
   }
 
@@ -3823,7 +3827,7 @@ export class AccountManager {
   restoreQuotaState(saved) {
     if (!Array.isArray(saved)) return;
     for (const account of this.accounts) {
-      const match = saved.find(s => sameIdentity(s, account));
+      const match = saved.find(s => sameIdentity({ ...s, provider: s?.provider ?? providerOf(account) }, account));
       if (!match || !match.quota) continue;
       this._confirmedFable.delete(account);
       for (const f of PERSISTED_QUOTA_FIELDS) {
