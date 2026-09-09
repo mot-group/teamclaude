@@ -10,6 +10,7 @@ import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
+import { ROUTING_PROVIDERS, patternPreviews } from './routing-preview.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -250,14 +251,6 @@ function makeAccount(acct, index) {
 // predicate can't drift.
 function modelMatches(declared, model) {
   return declared === model || declared.replace(/\[\d+m\]$/, '') === model;
-}
-
-// A representative model for a route's own globs, used to report what that route
-// does right now (which accounts may serve it, and which one it would pick).
-// Taken from the route object rather than looked up by name, so two routes
-// sharing a name are still each described by their own globs.
-function sampleModelFor(route) {
-  return route.match[0].replace(/\*/g, '') || 'model';
 }
 
 export class AccountManager {
@@ -1372,20 +1365,33 @@ export class AccountManager {
    * the walk this mirrors, so a distributed session can be routed elsewhere.
    * It decides nothing: no reading is taken and no cursor moves.
    */
-  previewRouteIndex(model, advisorModel = null) {
-    return this._withSelectionTime(() => this._previewRouteIndex(model, advisorModel));
+  previewRouteIndex(model, advisorModel = null, provider = DEFAULT_PROVIDER) {
+    const saved = { index: this.currentIndex, provider: this._selectingProvider, cursor: this._selectionCursorKey };
+    if (providerOf(this.accounts[this.currentIndex]) !== provider) {
+      const own = this.providerCursors.get(provider);
+      if (own != null && this.accounts[own] && providerOf(this.accounts[own]) === provider) this.currentIndex = own;
+    }
+    this._selectingProvider = provider;
+    this._selectionCursorKey = this._usesFablePreference(model) ? this._cursorKey(model, advisorModel, provider) : null;
+    try {
+      return this._withSelectionTime(() => this._previewRouteIndex(model, advisorModel, this._excludeOtherProviders(null, provider)));
+    } finally {
+      this.currentIndex = saved.index;
+      this._selectingProvider = saved.provider;
+      this._selectionCursorKey = saved.cursor;
+    }
   }
 
-  _previewRouteIndex(model, advisorModel = null) {
+  _previewRouteIndex(model, advisorModel = null, exclude = null) {
     const pinned = this._pinnedAccountForModel(model, advisorModel);
-    if (pinned && this._isAvailable(pinned, model, advisorModel)) return pinned.index;
+    if (pinned && !exclude?.has(pinned.index) && this._isAvailable(pinned, model, advisorModel)) return pinned.index;
     const current = this.accounts[this.currentIndex];
-    if (current && this._isAvailable(current, model, advisorModel)) {
+    if (current && !exclude?.has(current.index) && this._isAvailable(current, model, advisorModel)) {
       // Mirror getActiveAccount's priority preemption: a strictly higher-priority
       // available account wins over a healthy current one; same tier stays put.
-      const better = this._preemptedBy(current, model, advisorModel);
+      const better = this._preemptedBy(current, model, advisorModel, exclude);
       if (this._policyMove(current, better, model, advisorModel)) {
-        const diverted = this._divertedFor(model, advisorModel);
+        const diverted = this._divertedFor(model, advisorModel, exclude);
         if (diverted) return diverted.index;
       }
       const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
@@ -1395,11 +1401,11 @@ export class AccountManager {
     // Mirror _select's diversion cursor, so the preview names the account a
     // diverted family will actually land on rather than the one a fresh walk
     // would pick.
-    if (this._currentBarredOnlyFor(model, advisorModel)) {
-      const diverted = this._divertedFor(model, advisorModel);
+    if (this._currentBarredOnlyFor(model, advisorModel, exclude)) {
+      const diverted = this._divertedFor(model, advisorModel, exclude);
       if (diverted) return diverted.index;
     }
-    const best = this._pickBestAvailable(null, model, advisorModel);
+    const best = this._pickBestAvailable(exclude, model, advisorModel);
     return best ? best.index : null;
   }
 
@@ -2515,13 +2521,16 @@ export class AccountManager {
    * pick right now. Everything here is derived for display and thrown away — the
    * entries are fresh objects, never the stored (persisted) route definitions.
    */
-  getRoutes() {
-    const out = this.routes.map(r => ({
-      name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
-      pinned: this._pinnedName(r.name),
-      accounts: this._routeAccountsView(r),
-      target: this._routeTarget(sampleModelFor(r)),
-    }));
+  getRoutes({ blockedModels = [] } = {}) {
+    const out = this.routes.map(r => {
+      const previews = r.match.flatMap(patternPreviews).map(sample => this._routingPreview(sample, blockedModels));
+      const first = previews[0];
+      return {
+        name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
+        pinned: this._pinnedName(r.name), previews,
+        accounts: first?.accounts || [], target: first?.target || null,
+      };
+    });
 
     const detected = [];
     if (this.accounts.some(a => a.quota.unified7dFable != null)) {
@@ -2532,11 +2541,11 @@ export class AccountManager {
     }
     for (const d of detected) {
       if (this._routeForModel(d.sample)) continue; // already covered by a configured route
+      const preview = this._routingPreview({ provider: DEFAULT_PROVIDER, model: d.sample, label: d.match[0] }, blockedModels);
       out.push({
         name: d.name, match: d.match, bucket: null, color: null, autocreated: true,
-        pinned: this._pinnedName(d.name),
-        accounts: this.accounts.map(a => ({ name: a.name, eligible: this._isAvailable(a, d.sample) })),
-        target: this._routeTarget(d.sample),
+        pinned: this._pinnedName(d.name), previews: [preview],
+        accounts: preview.accounts, target: preview.target,
       });
     }
     return out;
@@ -2544,8 +2553,8 @@ export class AccountManager {
 
   /** The name of the account a request for `model` would land on right now, or
    * null when nothing can serve it (every candidate disabled, spent or excluded). */
-  _routeTarget(model) {
-    const idx = this.previewRouteIndex(model);
+  _routeTarget(model, provider = DEFAULT_PROVIDER) {
+    const idx = this.previewRouteIndex(model, null, provider);
     return idx == null ? null : (this.accounts[idx]?.name ?? null);
   }
 
@@ -2555,13 +2564,28 @@ export class AccountManager {
     return idx == null ? null : (this.accounts[idx]?.name ?? null);
   }
 
-  /** Accounts a configured route can use (all accounts when it lists none), each
-   * with a live eligibility flag for a representative model of the route. */
-  _routeAccountsView(route) {
-    const sample = sampleModelFor(route);
-    const inRoute = a => !route.accounts.length
-      || route.accounts.includes(a.name) || route.accounts.includes(String(a.index));
-    return this.accounts.filter(inRoute).map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));
+  _routingPreview(sample, blockedModels = []) {
+    const { model, provider } = sample;
+    const excluded = this._excludeOtherProviders(null, provider);
+    const blocked = blockedModels.some(pattern => modelGlobMatches(pattern, model));
+    const route = this._routeForModel(model);
+    return {
+      ...sample, blocked, route: route?.name || null, pinned: this._pinnedAccountForModel(model)?.name || null,
+      target: blocked ? null : this._routeTarget(model, provider),
+      accounts: this.accounts.filter(a => !excluded?.has(a.index) && this._routeAllows(a, model))
+        .map(a => ({ name: a.name, eligible: !blocked && this._isAvailable(a, model) })),
+    };
+  }
+
+  getProviderRouting({ blockedModels = [] } = {}) {
+    const configured = this.routes.flatMap(route => route.match.flatMap(patternPreviews));
+    return ROUTING_PROVIDERS.map(({ provider, label, models }) => {
+      const samples = models.map(model => ({ ...model, provider }));
+      for (const sample of configured.filter(sample => sample.provider === provider)) {
+        if (!samples.some(existing => existing.model === sample.model)) samples.push(sample);
+      }
+      return { provider, label, models: samples.map(sample => this._routingPreview(sample, blockedModels)) };
+    });
   }
 
   /** A representative model id for a route name (configured or auto fable/sonnet),
@@ -3801,7 +3825,7 @@ export class AccountManager {
     return { model, target: account?.name ?? null, reason, evidence: account ? this._fableEvidence(account) : 'unknown' };
   }
 
-  getStatus({ sessionDetail = false } = {}) {
+  getStatus({ sessionDetail = false, blockedModels = [] } = {}) {
     // Sweep first: nothing else on the read path does, so an idle server kept
     // reporting a window whose reset had already passed — at its old percentage,
     // with a timestamp in the past — to `status --json`, anything scripted
@@ -3827,13 +3851,15 @@ export class AccountManager {
         enabled: this.preferFableDepletedAccounts === true,
         models: ['claude-opus-5', 'claude-sonnet-4-6', 'claude-haiku-4-5'].map(model => this._fableRoutingStatus(model)),
       },
-      routes: this.getRoutes(),
-      sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
+      routes: this.getRoutes({ blockedModels }),
+      providerRouting: this.getProviderRouting({ blockedModels }),
+      sessions: { ...sessions, scope: 'claude-session-header', distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
       accounts: this.accounts.map(a => ({
         name: a.name,
+        provider: providerOf(a),
         type: a.type,
         orgName: a.orgName || null,
         priority: a.priority || 0,

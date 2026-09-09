@@ -67,3 +67,13 @@ Logs are available with `journalctl --user -u teamclaude-dashboard.service`. Aft
 Unknown quota means the proxy has not reported that quota. It does not mean an account has unlimited capacity. Token totals include only tokens reported by upstream responses. Named clients need `proxy.clientKeys`, and project attribution needs `proxy.usageDimensions`. Session rows need `proxy.sessionDetail: true` in the proxy config. See [configuration](configuration.md) for those options. The dashboard explains these empty states instead of inventing values.
 
 The Usage resets section records detected resets and banked Codex reset credits across server restarts. See [reset tracking](reset-tracking.md) for detection rules and Google Chat configuration.
+
+## Model routing summary
+
+The header shows separate Claude and Codex routing previews. Models that share an account are grouped together. Different model targets produce a "Multiple targets" summary; blocked or unavailable models appear explicitly. Account cards name their provider and use "ready" for an available status. The "Prefer" button sets a runtime account preference, subject to model routes and request pins.
+
+These previews describe representative models and configured route patterns. Hover a preview row to see its sample model IDs. They do not identify the native desktop login or promise which account every running request uses. Request pins, existing session assignments, distribution, advisor constraints, and retries can produce a different destination. The detailed routing table shows a provider-specific preview for each configured pattern, rather than a single global fallback account. Unknown model patterns are previewed under both request providers.
+
+The server applies provider subscription boundaries, route restrictions, pins, priority, quota availability, and the live model blocklist to these previews. Reading status does not move account or route cursors, trigger a quota probe, or send a model request. Older proxies without provider summaries show an unavailable-summary message instead of reusing the global current-account field.
+
+Session counts reflect requests carrying Claude's session header. Codex session counts are unavailable in this tracker. A zero count does not mean Codex is idle or its remote target is offline. Codex requests and token usage still contribute to the proxy's traffic totals.

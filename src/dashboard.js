@@ -172,8 +172,40 @@ export function switchOutcome(res) {
 // to "where does a request for this family land right now", so the page does
 // not re-derive routing from quota bars; the eligible split says why a family
 // is where it is.
+export function routingCards(status) {
+  return ((status || {}).providerRouting || []).map(function (provider) {
+    var groups = [];
+    (provider.models || []).forEach(function (model) {
+      var target = model.target || null;
+      var group = groups.filter(function (g) { return g.target === target && g.blocked === !!model.blocked; })[0];
+      if (!group) { group = { target: target, blocked: !!model.blocked, labels: [], models: [] }; groups.push(group); }
+      if (group.labels.indexOf(model.label) < 0) group.labels.push(model.label);
+      group.models.push(model.model);
+    });
+    var available = groups.filter(function (group) { return group.target; });
+    return { provider: provider.provider, label: provider.label, groups: groups,
+      headline: groups.length === 1 && available.length === 1 ? available[0].target
+        : available.length ? (groups.some(function (group) { return !group.target; }) ? 'Partially available' : 'Multiple targets') : 'Unavailable' };
+  });
+}
+
 export function routeRows(status) {
   var s = status || {};
+  if (Array.isArray(s.providerRouting)) {
+    return (s.routes || []).flatMap(function (route) {
+      return (route.previews || []).map(function (preview) {
+        var accounts = preview.accounts || [];
+        return { kind: 'route', name: route.name,
+          label: (preview.provider === 'codex' ? 'Codex' : 'Claude') + ' / ' + route.name,
+          match: preview.label, sampleModel: preview.model,
+          target: preview.target || null, pinned: preview.pinned || null,
+          pinMismatch: !!preview.pinned && preview.pinned !== preview.target,
+          blocked: !!preview.blocked, autocreated: !!route.autocreated,
+          eligible: accounts.filter(function (a) { return a.eligible; }).map(function (a) { return a.name; }),
+          ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }) };
+      });
+    });
+  }
   var blockedModels = s.blockedModels || [];
   var rows = (s.routes || []).map(function (r) {
     var accounts = r.accounts || [];
@@ -301,7 +333,7 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems,
+  switchRequest, switchOutcome, routeRows, routingCards, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The threshold rides along: `problems` closes over it, so a page without it
@@ -398,6 +430,16 @@ const PAGE = `<!doctype html>
   .metric strong { display:block; font-size:32px; font-weight:600; letter-spacing:-.04em; margin:8px 0; font-variant-numeric:tabular-nums; }
   .metric small { color:var(--dim); font-size:12px; }
   .metric-label { color:var(--dim); font-size:13px; }
+  .provider-routing { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+  .provider-card { padding:22px; min-width:0; border-top:3px solid var(--accent); }
+  .provider-card[data-provider="codex"] { border-top-color:#a79bff; }
+  .provider-card h3 { margin:0 0 12px; font-size:14px; color:var(--dim); }
+  .provider-target { font-size:24px; font-weight:650; overflow-wrap:anywhere; margin-bottom:16px; }
+  .provider-route { display:flex; justify-content:space-between; gap:20px; padding:9px 0; border-top:1px solid var(--line); font-size:13px; }
+  .provider-route span { color:var(--dim); }
+  .provider-route b { text-align:right; overflow-wrap:anywhere; }
+  .routing-help { color:var(--dim); font-size:12px; line-height:1.7; }
+  @media(max-width:700px) { .provider-routing { grid-template-columns:1fr; } .provider-target { font-size:21px; } .provider-route { flex-wrap:wrap; gap:6px; } }
   .split { display:grid; grid-template-columns:1.3fr 1fr; gap:20px; }
   #accounts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
   #accounts .card { margin:0; padding:20px; }
@@ -446,6 +488,7 @@ const PAGE = `<!doctype html>
       <div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="logout">Sign out</button></div>
     </div>
     <p class="sub" id="summary"></p>
+    <section aria-labelledby="modelRoutingTitle" id="modelRouting"><h2 id="modelRoutingTitle">Model routing</h2><div class="provider-routing" id="providerRouting"></div><p class="routing-help">Previews for representative models and configured patterns. Request pins, existing sessions, and retries can use a different account. This does not show the desktop sign-in.</p></section>
     <nav aria-label="Dashboard sections"><a href="#overview">Overview</a><a href="#accountSection">Accounts</a><a href="#routesWrap">Routing</a><a href="#sessionsWrap">Sessions</a><a href="#resetsSection">Resets</a><a href="#diagnostics">Diagnostics</a></nav>
     <div id="overview" class="stats"></div>
     <div id="err"></div>
@@ -574,20 +617,18 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current) {
+  function renderAccount(a) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
-    head.appendChild(el('span', 'tag', a.type + ' · prio ' + (a.priority || 0)));
-    if (a.name === current) head.appendChild(el('span', 'badge current', 'current'));
-    head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
-    if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
+    head.appendChild(el('span', 'tag', (a.provider === 'codex' ? 'Codex · ' : a.provider === 'anthropic' ? 'Claude · ' : '') + a.type + ' · prio ' + (a.priority || 0)));
+    head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status === 'active' ? 'ready' : a.status || 'unknown')));
+    if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' tracked session' + (a.sessions > 1 ? 's' : '')));
     // Last in the row so the badges sit in the same place on every card.
-    if (a.name !== current) {
-      var btn = el('button', 'act', 'switch');
-      btn.addEventListener('click', function () { doSwitch(a.name, btn); });
-      head.appendChild(btn);
-    }
+    var btn = el('button', 'act', 'Prefer');
+    btn.title = 'Set an account preference. Model routes and request pins still apply.';
+    btn.addEventListener('click', function () { doSwitch(a.name, btn); });
+    head.appendChild(btn);
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     var q = a.quota || {};
@@ -778,9 +819,7 @@ ${SHARED_HELPERS}
     });
   }
 
-  // Where each metered family goes right now, and which accounts could take
-  // it. The last row is the default: everything without its own route lands
-  // on the current account.
+  // Provider-specific samples use the server's targets and eligibility.
   function renderRoutes(s) {
     var wrap = document.getElementById('routesWrap');
     var rows = routeRows(s);
@@ -789,12 +828,13 @@ ${SHARED_HELPERS}
     var table = document.getElementById('routes');
     table.textContent = '';
     var hr = el('tr');
-    ['Family', 'Goes to', 'Can serve it'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    ['Route / sample', 'Target preview', 'Can serve sample'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
     table.appendChild(hr);
     rows.forEach(function (r) {
       var tr = el('tr');
       var fam = el('td', '', r.label + (r.match ? ' ' : ''));
       if (r.match) fam.appendChild(el('span', 'tag', r.match));
+      if (r.sampleModel) fam.title = 'Representative model: ' + r.sampleModel;
       tr.appendChild(fam);
       var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
       if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
@@ -830,6 +870,25 @@ ${SHARED_HELPERS}
   }
 
 
+  function renderProviderRouting(s) {
+    var wrap = document.getElementById('providerRouting'); wrap.textContent = '';
+    var cards = routingCards(s);
+    if (!cards.length) { wrap.appendChild(el('p', 'routing-help', 'Provider routing is unavailable on this proxy.')); return; }
+    cards.forEach(function (provider) {
+      var card = el('div', 'card provider-card'); card.setAttribute('data-provider', provider.provider);
+      card.appendChild(el('h3', '', provider.label));
+      card.appendChild(el('div', 'provider-target', provider.headline));
+      provider.groups.forEach(function (group) {
+        var row = el('div', 'provider-route');
+        row.title = 'Representative models: ' + group.models.join(', ');
+        row.appendChild(el('span', '', group.labels.join(' · ')));
+        if (provider.groups.length > 1 || !group.target) row.appendChild(el('b', group.target ? '' : 'warnt', group.target || (group.blocked ? 'Blocked' : 'Unavailable')));
+        card.appendChild(row);
+      });
+      wrap.appendChild(card);
+    });
+  }
+
   function renderOverview(s) {
     var accounts = s.accounts || [];
     var requests = accounts.reduce(function (sum, a) { return sum + ((a.usage || {}).totalRequests || 0); }, 0);
@@ -839,7 +898,7 @@ ${SHARED_HELPERS}
     [['Available accounts', ready + ' / ' + accounts.length, 'Eligibility varies by model family'],
       ['Requests', fmtNum(requests), 'Cumulative account counters'],
       ['Tokens reported', fmtNum(tokens), 'Includes cache reads and writes'],
-      ['Active sessions', String((s.sessions || {}).active || 0), ((s.sessions || {}).known || 0) + ' sessions tracked']].forEach(function (m) {
+      ['Tracked Claude sessions', String((s.sessions || {}).active || 0), ((s.sessions || {}).known || 0) + ' known · Codex session count unavailable']].forEach(function (m) {
         var card = el('div', 'metric'); card.appendChild(el('div', 'metric-label', m[0])); card.appendChild(el('strong', '', m[1])); card.appendChild(el('small', '', m[2])); wrap.appendChild(card);
       });
     var totals = { totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheCreationTokens: 0 };
@@ -917,7 +976,7 @@ ${SHARED_HELPERS}
   function renderDiagnostics(s) {
     var server = s.server || {}, loop = server.eventLoop || {}, pool = s.upstreamPool || {};
     details('serverInfo', [['Proxy uptime', server.uptimeSeconds == null ? null : fmtIn(server.uptimeSeconds)], ['Proxy port', server.port], ['Event loop lag', loop.lastLagMs == null ? null : loop.lastLagMs + ' ms'], ['Worst lag', loop.maxLagMs == null ? null : loop.maxLagMs + ' ms'], ['Active upstream requests', pool.active], ['Queued upstream requests', pool.queued]]);
-    details('routingInfo', [['Default target', s.defaultTarget || s.currentAccount || 'None'], ['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%'], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
+    details('routingInfo', [['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%'], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
     var overrides = ((s.fableDepletionRouting || {}).models || []);
     if (overrides.length) { var box = document.getElementById('routingInfo'); box.appendChild(el('p', 'usage', 'Fable depletion overrides')); overrides.forEach(function (r) { box.appendChild(el('p', 'usage', r.model + ' → ' + (r.target || 'None') + ' · ' + r.reason)); }); }
     var table = document.getElementById('jobs'); table.textContent = '';
@@ -951,14 +1010,13 @@ ${SHARED_HELPERS}
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
     sum.textContent = '';
-    sum.appendChild(el('span', '', 'active account '));
-    sum.appendChild(el('b', '', s.currentAccount || 'none'));
-    sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known sessions' + (up ? ' · ' + up : '')));
+    sum.textContent = (up ? 'Proxy ' + up + ' · ' : '') + (sess.active || 0) + ' active tracked Claude sessions';
+    renderProviderRouting(s);
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     var query = document.getElementById('accountSearch').value.toLowerCase();
     var visible = (s.accounts || []).filter(function (a) { return (a.name + ' ' + a.type).toLowerCase().indexOf(query) !== -1; });
-    visible.forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    visible.forEach(function (a) { acc.appendChild(renderAccount(a)); });
     if (!visible.length) acc.appendChild(el('div', 'empty', query ? 'No matching accounts.' : 'No accounts configured on the proxy.'));
     renderOverview(s);
     renderDiagnostics(s);
