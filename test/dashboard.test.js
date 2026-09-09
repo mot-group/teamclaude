@@ -241,12 +241,10 @@ test('route rows read the shape a real AccountManager reports', () => {
   const fable = rows.find(r => r.name === 'fable');
   assert.ok(fable, 'the server autocreates a Fable route once an account meters it');
   assert.deepEqual({ target: fable.target, ineligible: fable.ineligible }, { target: 'b', ineligible: ['a'] });
-  assert.deepEqual({ target: rows[rows.length - 1].target, current: rows[rows.length - 1].current }, { target: 'a', current: 'a' });
-  // The current account becomes unusable: the default row follows the server,
-  // not the stale current name.
-  am.setDisabled(0, true);
-  const after = routeRows(am.getStatus())[rows.length - 1];
-  assert.deepEqual({ target: after.target, current: after.current, why: after.currentUnavailable }, { target: 'b', current: 'a', why: 'disabled' });
+  assert.equal(rows.some(row => row.kind === 'default'), false, 'provider status has no universal fallback row');
+  am.setDisabled(1, true);
+  const after = routeRows(am.getStatus()).find(row => row.name === 'fable');
+  assert.equal(after.target, null, 'unavailable previews do not fall back to the global cursor');
 });
 
 test('a fleet with no routes renders no section', () => {

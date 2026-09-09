@@ -15,7 +15,7 @@ This is the [MOT fork](https://github.com/mot-group/teamclaude) of [KarpelesLab/
 
 | Feature | Details |
 | --- | --- |
-| [Password-protected LAN dashboard](docs/lan-dashboard.md) | Account capacity, routing, activity, token totals, sessions, and diagnostics. Separate password gate and a persistent Linux service. |
+| [Password-protected LAN dashboard](docs/lan-dashboard.md) | Separate Claude and Codex routing summaries, account capacity, activity, token totals, tracked Claude sessions, and diagnostics. Password gate and a persistent Linux service. |
 | [Codex quota probes](docs/quota.md#codex-subscription-probes) | Read-only usage checks for idle subscriptions, including weekly primary windows and model-specific limits. |
 | [Reset tracking and Google Chat](docs/reset-tracking.md) | Restarted windows, quota refills, scheduled rollovers, banked Codex credits with expiry, and persistent notification delivery. |
 | [Fable quota preference](docs/routing.md#prefer-accounts-with-depleted-fable-quota) | Use Fable-depleted accounts for other Claude models while preserving eligible accounts for Fable. Off by default. |
