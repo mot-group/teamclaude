@@ -1,27 +1,45 @@
 # TeamClaude
 
-[![CI](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/@karpeleslab/teamclaude.svg)](https://www.npmjs.com/package/@karpeleslab/teamclaude)
-[![node](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
+[![CI](https://github.com/mot-group/teamclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/mot-group/teamclaude/actions/workflows/ci.yml)
+[![upstream npm version](https://img.shields.io/npm/v/@karpeleslab/teamclaude.svg)](https://www.npmjs.com/package/@karpeleslab/teamclaude)
+[![upstream Node requirement](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Multi-account proxy for [Claude Code](https://claude.ai/claude-code) and [Codex](https://github.com/openai/codex): it pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota.
 
 It sits between the coding agent and the provider's API, holds several accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429. Claude accounts serve Claude Code, Codex accounts serve the Codex CLI, and both pools share one proxy.
 
+This is the [MOT fork](https://github.com/mot-group/teamclaude) of [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude). It adds a persistent LAN dashboard, Codex quota probes, reset history, banked reset inventory, Google Chat alerts, and an opt-in Fable quota preference. See [our changes and fixes](docs/fork-changes.md) for merged PRs and deployment limits. The npm badge above refers to the upstream package.
+
+## Added in this fork
+
+| Feature | Details |
+| --- | --- |
+| [Password-protected LAN dashboard](docs/lan-dashboard.md) | Account capacity, routing, activity, token totals, sessions, and diagnostics. Separate password gate and a persistent Linux service. |
+| [Codex quota probes](docs/quota.md#codex-subscription-probes) | Read-only usage checks for idle subscriptions, including weekly primary windows and model-specific limits. |
+| [Reset tracking and Google Chat](docs/reset-tracking.md) | Restarted windows, quota refills, scheduled rollovers, banked Codex credits with expiry, and persistent notification delivery. |
+| [Fable quota preference](docs/routing.md#prefer-accounts-with-depleted-fable-quota) | Use Fable-depleted accounts for other Claude models while preserving eligible accounts for Fable. Off by default. |
+| [Codex Desktop remote access](docs/codex-remote-access.md) | Intended behavior: retain the native remote-target login while model requests use another subscription through TeamClaude. |
+
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
 ## Quick start
 
-Node.js 20+ required.
+Node.js 20+ required. The runtime uses Node built-ins only, so no `npm install` step is needed to run a source checkout. Install development dependencies only if you need the lint tooling.
+
+For a new source checkout of this fork:
 
 ```bash
-npm install -g @karpeleslab/teamclaude
-
-teamclaude login     # browser OAuth, run it once per account
-teamclaude server    # start the proxy, shows the TUI
-teamclaude run       # in another terminal: Claude Code through the proxy
+git clone https://github.com/mot-group/teamclaude.git
+cd teamclaude
+node src/index.js login     # browser OAuth, run it once per Claude account
+node src/index.js login --codex  # optional Codex subscription
+TEAMCLAUDE_DISABLE_AUTOUPDATE=1 node src/index.js server
+# In another terminal, from this checkout:
+node src/index.js run
 ```
+
+The command reference uses `teamclaude`; from a source checkout, substitute `node src/index.js`. The upstream `npm install -g @karpeleslab/teamclaude` command does not select this fork. Existing installations with local provider guards must preserve those overlays when updating. See [deployment boundaries](docs/fork-changes.md#deployment-boundaries-and-known-limits).
 
 Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
 
@@ -56,6 +74,8 @@ Full reference: [docs/usage.md](docs/usage.md).
 
 Config is at `~/.config/teamclaude.json` (`$XDG_CONFIG_HOME` honoured) and is meant to be hand-editable. A proxy API key is generated on first use. Observed quota goes to a separate `teamclaude.state.json` next to it, safe to delete since quota gets re-learned from traffic.
 
+Detected resets and queued Chat notifications use a separate private file, defaulting to `teamclaude.json.resets.json`. Deleting it loses reset counts, history, and pending notifications. Keep the webhook URL in a private runtime file. See [reset configuration](docs/reset-tracking.md#google-chat-notifications).
+
 Every field, plus environment variables and network tuning: [docs/configuration.md](docs/configuration.md).
 
 ## How it works
@@ -75,14 +95,18 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 | [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, Codex accounts, third-party backends |
 | [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, logging |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
-| [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |
+| [Quota](docs/quota.md) | Claude and Codex quota probes, keep-warm, holding on exhaustion |
+| [LAN dashboard](docs/lan-dashboard.md) | Password gate, persistent service, dashboard deployment and operation |
+| [Reset tracking](docs/reset-tracking.md) | Detection rules, banked credits, persistent history, Google Chat configuration |
+| [Codex remote access](docs/codex-remote-access.md) | Native desktop login and pooled model subscription separation |
+| [MOT changes](docs/fork-changes.md) | Features, fixes, merged PRs, and deployment boundaries |
 | [Configuration](docs/configuration.md) | Config format, every field, environment variables, network tuning |
 | [Proxy modes](docs/proxy-modes.md) | MITM forward proxy, sx.org residential egress |
 | [Compliance](docs/compliance.md) | Terms of service notes |
 
 ## Security
 
-The only canonical sources for TeamClaude are this repository (https://github.com/KarpelesLab/teamclaude) and the [`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude) npm package. TeamClaude is **never** distributed as a downloadable binary archive, so be wary of soft-forks that bundle a `.zip` and tell you to extract and run it. See [SECURITY.md](SECURITY.md) for details and how to report issues.
+The upstream sources are [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) and the [`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude) npm package. MOT maintains this source fork separately and does not publish a separate npm package. TeamClaude is **never** distributed as a downloadable binary archive, so be wary of soft-forks that bundle a `.zip` and tell you to extract and run it. See [SECURITY.md](SECURITY.md) for details and how to report issues.
 
 ## Compliance
 
@@ -100,8 +124,4 @@ TeamClaude is a local proxy holding your own credentials and driving your own Cl
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-### Password-protected LAN dashboard
-
-Run a separate LAN dashboard with account capacity, routing, request activity, token accounting, sessions, and server diagnostics. It has its own password and expiring browser sessions. See [LAN dashboard setup](docs/lan-dashboard.md) for configuration and a persistent Linux service.
+MIT. See [LICENSE](LICENSE).

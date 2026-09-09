@@ -127,7 +127,12 @@ model_provider = "teamclaude"
 name = "teamclaude"
 base_url = "http://127.0.0.1:3456/backend-api/codex"
 wire_api = "responses"
+requires_openai_auth = false
 ```
+
+### Codex Desktop remote targets
+
+The native desktop login and the subscription serving model requests can differ. In the tested Mac-to-Linux setup, the remote target stays accessible under its native login while the Linux model provider routes through another separately enrolled TeamClaude subscription. This is intended behavior. Preserve the native login when changing model routing. See [configuration and verification](codex-remote-access.md).
 
 ### Through the MITM proxy (no Codex config needed)
 
@@ -194,6 +199,8 @@ Two details are worth knowing if you read the raw headers:
   family can put its 7-day window in `primary` while a model-scoped family puts
   a 5-hour window there. Windows are classified by their stated
   `window-minutes`, never by position.
+
+With `teamclaude probe 300`, the background prober also reads Codex subscription usage without generating a completion. It uses the same duration-based window mapping and keeps idle accounts current. The dashboard displays these readings, [detected resets, and banked reset credits](reset-tracking.md).
 
 ## Third-party backend accounts
 

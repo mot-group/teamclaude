@@ -194,11 +194,17 @@ http://localhost:3456/teamclaude/dashboard
 
 The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` with the proxy key, which it asks for once and keeps in the browser's localStorage (a 401 after a key rotation brings the prompt back). Loopback browsers are key-exempt as everywhere else. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
 
+### Password-protected LAN listener
+
+For LAN access, run the [separate dashboard server](lan-dashboard.md). It has its own password gate and expiring cookies, including for loopback visitors. The supplied systemd user unit supports persistent operation. This listener forwards status, quota, and account switching to the loopback proxy.
+
+Both dashboard modes show [reset history and banked Codex reset credits](reset-tracking.md) from the running proxy. Reset history persists across restarts; the request activity chart covers samples collected while the page is open. Google Chat alerts run in the proxy background process and do not require an open browser.
+
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
 
-Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in the config.
+Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in the config. MOT fork deployments should keep it disabled and deploy reviewed source commits. The explicit `teamclaude update` command still installs from upstream npm and can replace fork changes or local provider guards. See [deployment boundaries](fork-changes.md#deployment-boundaries-and-known-limits).
 
 ## Request logging
 

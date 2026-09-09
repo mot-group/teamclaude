@@ -45,6 +45,7 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `proxy.sessionDetail` | Adds a per-session breakdown (`sessions.items`) to `/teamclaude/status` and the dashboard: one row per session with its id, client, dimension values, pinned accounts, and the tokens it spent per weekly bucket. **Off by default** — any holder of any proxy key can read status, so on a shared proxy this shows every consumer what every other consumer is working on. The aggregate `sessions` counts are unaffected and always present |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (`teamclaude threshold <1-100>`, or the TUI settings screen: **Switch threshold**). The screen accepts tenths of a percent, e.g. `99.5`, which is stored as `0.995`. Reported OAuth utilization arrives on a whole-percent grid, so a fraction only changes the outcome for an API-key account, whose used share is continuous |
+| `preferFableDepletedAccounts` | Opt-in preference for confirmed Fable-depleted accounts on recognized non-Fable Claude requests. Default `false`; [routing rules](routing.md#prefer-accounts-with-depleted-fable-quota) still enforce priority and pins |
 | `quotaProbeSeconds` | Background [quota-probe](quota.md#quota-probe) interval in seconds (`0` = off, the default; CLI `probe`, or the **Quota probe** row on the TUI settings screen) |
 | `warmupSeconds` | [Keep-warm](quota.md#keep-warm) interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
 | `warmupSchedule` | Optional reset-target keep-warm schedule. Daily mode stores `{ "resetTime": "15:30", "timezone": "Europe/Moscow" }`; rolling mode also stores `"mode": "rolling"` and an absolute `"anchorResetAt"`. The timezone must be an IANA name. Mutually exclusive with `warmupSeconds`; set with `teamclaude warmup reset HH:MM --timezone Area/City` or `teamclaude warmup rolling HH:MM --timezone Area/City` |
@@ -77,12 +78,17 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `accounts[].stripRequestFields` | Array of **top-level** request-body fields to drop before forwarding to this account. For third-party upstreams that implement the Anthropic message API but reject fields Claude Code sends (e.g. `["context_management"]`, which some return a `400 Extra inputs are not permitted` for — breaking every request once that account is selected). Applies to this account only; Anthropic accounts are untouched. One nested form is accepted: `"cache_control.<subfield>"` (e.g. `["cache_control.scope"]`) drops that subfield from every documented prompt-cache breakpoint (root, `system[]`, `messages[].content[]`, `tools[]`) for backends that reject it with `400 unknown parameter`; `type` and `ttl` are forwarded unless listed. Nothing is dropped without an entry |
 | `accounts[].models` | **Deprecated** — use a [`routes`](routing.md#model-routes) entry with `match` and `accounts` instead. Array of model names this account exclusively handles; kept for backward compatibility with pre-routes configs |
 
+The [separate LAN dashboard](lan-dashboard.md) has its own environment variables for listener address, port, allowed hostnames, and password file. [Reset tracking](reset-tracking.md) documents detection thresholds and notification behavior.
+
 ## Environment variables
 
 | Variable | Effect |
 | --- | --- |
 | `TC_ACCT` | [Pin a session](routing.md#pin-a-session-to-one-account) to **one** account, bypassing rotation. Accepts `accountUuid`, `orgUuid`, `accountUuid/orgUuid`, or a display name/email. Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
 | `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`) |
+| `TEAMCLAUDE_RESET_STATE_FILE` | Private reset history and outbox path; defaults to the config path plus `.resets.json` |
+| `TEAMCLAUDE_CHAT_WEBHOOK_FILE` | Private file containing the Google Chat incoming webhook URL; unset disables notifications |
+| `TEAMCLAUDE_RESET_DASHBOARD_URL` | Optional dashboard link appended to Chat alerts |
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
 | `TEAMCLAUDE_STATUS_TIMEOUT_MS` | How long `teamclaude status` waits for the server's answer before giving up (default `5000`). A connection that is accepted but never answered is reported as a stalled or overloaded server, distinct from a refused one ("Is the server running?") |
