@@ -65,3 +65,5 @@ Logs are available with `journalctl --user -u teamclaude-dashboard.service`. Aft
 ## Data availability
 
 Unknown quota means the proxy has not reported that quota. It does not mean an account has unlimited capacity. Token totals include only tokens reported by upstream responses. Named clients need `proxy.clientKeys`, and project attribution needs `proxy.usageDimensions`. Session rows need `proxy.sessionDetail: true` in the proxy config. See [configuration](configuration.md) for those options. The dashboard explains these empty states instead of inventing values.
+
+The Usage resets section records detected resets and banked Codex reset credits across server restarts. See [reset tracking](reset-tracking.md) for detection rules and Google Chat configuration.

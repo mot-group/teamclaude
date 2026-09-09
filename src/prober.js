@@ -8,7 +8,7 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
-import { fetchCodexUsage } from './codex-usage.js';
+import { fetchCodexUsage, fetchCodexResetCredits } from './codex-usage.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 
 // Node's timers take a 32-bit signed delay: anything above 2^31-1 ms is
@@ -22,11 +22,13 @@ function clampInterval(ms) {
 }
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, resetTracker = null, creditsFn = fetchCodexResetCredits, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
+    this.resetTracker = resetTracker;
+    this.creditsFn = creditsFn;
     this.profileFn = profileFn;
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
@@ -80,6 +82,7 @@ export class Prober {
         this._probeable(account) && (this._isProbeTarget(account) || this._isCodexTarget(account) || this._isBackendTarget(account)));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
+      this.resetTracker?.flush().catch(() => { this.resetTracker.error = 'Could not persist reset notifications'; });
       this.lastRunFinishedAt = Date.now();
       this._running = false;
     }
@@ -160,6 +163,22 @@ export class Prober {
         return;
       }
 
+      if (this.resetTracker) {
+        try {
+          this.resetTracker.observe(account, usage, { maxGapMs: Math.min(3600_000, Math.max(900_000, this.intervalMs * 3)) });
+          if (codex) {
+            let credits = await this.creditsFn(account, { timeoutMs: this.timeoutMs });
+            if (credits?.status === 401) {
+              await this.am.ensureTokenFresh(account.index, true);
+              credits = await this.creditsFn(account, { timeoutMs: this.timeoutMs });
+            }
+            this.resetTracker.observeCredits(account, credits);
+          }
+          this.resetTracker.error = null;
+        } catch {
+          this.resetTracker.error = 'Reset tracking failed; check the private state file and disk access';
+        }
+      }
       if (codex) this.am.applyCodexUsageData(account.index, usage);
       else this.am.applyUsageData(account.index, usage);
       const missingTier = !account.rateLimitTier && !account.seatTier
@@ -204,6 +223,7 @@ export class Prober {
 
   getStatus() {
     return {
+      resets: this.resetTracker?.getStatus(this.am.accounts) || null,
       enabled: this.intervalMs > 0,
       intervalSeconds: Math.round(this.intervalMs / 1000),
       running: this._running,

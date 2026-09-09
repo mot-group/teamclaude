@@ -28,6 +28,7 @@ import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
+import { ResetTracker } from './reset-tracker.js';
 import { Warmer } from './warmer.js';
 import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
 import { TUI } from './tui.js';
@@ -645,7 +646,13 @@ async function serverCommand() {
   quotaSaveInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
+  const resetTracker = new ResetTracker({
+    stateFile: process.env.TEAMCLAUDE_RESET_STATE_FILE || `${getConfigPath()}.resets.json`,
+    webhook: process.env.TEAMCLAUDE_CHAT_WEBHOOK_FILE ? (await readFile(process.env.TEAMCLAUDE_CHAT_WEBHOOK_FILE, 'utf8')).trim() : '',
+    dashboardUrl: process.env.TEAMCLAUDE_RESET_DASHBOARD_URL || '',
+  });
   prober = new Prober(accountManager, {
+    resetTracker,
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
   });

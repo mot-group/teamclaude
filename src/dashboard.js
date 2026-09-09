@@ -402,7 +402,7 @@ const PAGE = `<!doctype html>
   #accounts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
   #accounts .card { margin:0; padding:20px; }
   .card { border-radius:10px; overflow-x:auto; }
-  .card .name { overflow-wrap:anywhere; }
+  .card .name, #resetsSection .card { overflow-wrap:anywhere; min-width:0; }
   .card .row { margin-bottom:16px; }
   .quota { grid-template-columns:58px minmax(40px,1fr) 165px; margin-top:12px; }
   .act { min-height:36px; margin-top:4px; }
@@ -446,7 +446,7 @@ const PAGE = `<!doctype html>
       <div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="logout">Sign out</button></div>
     </div>
     <p class="sub" id="summary"></p>
-    <nav aria-label="Dashboard sections"><a href="#overview">Overview</a><a href="#accountSection">Accounts</a><a href="#routesWrap">Routing</a><a href="#sessionsWrap">Sessions</a><a href="#diagnostics">Diagnostics</a></nav>
+    <nav aria-label="Dashboard sections"><a href="#overview">Overview</a><a href="#accountSection">Accounts</a><a href="#routesWrap">Routing</a><a href="#sessionsWrap">Sessions</a><a href="#resetsSection">Resets</a><a href="#diagnostics">Diagnostics</a></nav>
     <div id="overview" class="stats"></div>
     <div id="err"></div>
     <div id="problems"></div>
@@ -461,6 +461,7 @@ const PAGE = `<!doctype html>
     </div>
     <div class="section-head" id="accountSection"><h2>Account capacity</h2><input class="search" id="accountSearch" type="search" aria-label="Search accounts" placeholder="Search accounts"></div>
     <div id="accounts"></div>
+    <section id="resetsSection"><h2>Usage resets</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div id="resetEvents"></div></section>
     <div id="clientsWrap" style="display:none">
       <h2>Clients</h2>
       <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
@@ -854,6 +855,65 @@ ${SHARED_HELPERS}
     wrap.appendChild(list);
   }
 
+  function resetDate(value) {
+    return value ? new Date(value).toLocaleString() : 'Unknown';
+  }
+
+  function resetType(value) {
+    return value === 'restarted-window' ? 'Restarted window' : 'Quota refill';
+  }
+
+  function renderResets(s) {
+    var data = (s.probe || {}).resets;
+    var summary = document.getElementById('resetSummary');
+    var accounts = document.getElementById('resetAccounts'); accounts.textContent = '';
+    var history = document.getElementById('resetEvents'); history.textContent = '';
+    if (!data) { summary.textContent = 'Reset tracking is unavailable on this proxy.'; return; }
+    var notifications = data.notifications || {};
+    summary.textContent = 'Tracking since ' + resetDate(data.startedAt) + '. ' +
+      ((s.probe || {}).enabled ? 'Unexpected drops need a second probe to confirm. ' : 'Quota probes are off. History is not updating. ') +
+      (notifications.enabled ? 'Google Chat enabled. ' + notifications.pending + ' notifications queued.' : 'Google Chat is off.') +
+      (notifications.lastSentAt ? ' Last sent ' + resetDate(notifications.lastSentAt) + '.' : '') +
+      (data.error ? ' ' + data.error : '') + (notifications.error ? ' ' + notifications.error : '');
+    (data.accounts || []).forEach(function (account) {
+      var card = el('div', 'card');
+      card.appendChild(el('h3', '', account.name));
+      var totals = account.totals || {};
+      card.appendChild(el('p', '', 'Early resets: ' + (totals.early || 0) + ' · Scheduled rollovers: ' + (totals.scheduled || 0) + ' · Uncertain timing: ' + (totals.uncertain || 0)));
+      var types = account.earlyTypes || {};
+      card.appendChild(el('p', 'usage', 'Early restarted windows: ' + (types['restarted-window'] || 0) + ' · Early quota refills: ' + (types['quota-refill'] || 0)));
+      card.appendChild(el('p', 'usage', 'Last observation: ' + resetDate(account.lastObservedAt)));
+      (account.pending || []).forEach(function (pending) {
+        card.appendChild(el('p', 'warnt', 'Awaiting confirmation: ' + pending.after.label + ' ' + resetType(pending.type).toLowerCase() + ', ' + Math.round(pending.before.utilization * 100) + '% to ' + Math.round(pending.after.utilization * 100) + '%.'));
+      });
+      if (account.provider === 'codex') {
+        var inventory = account.credits;
+        card.appendChild(el('p', '', inventory ? 'Banked resets: ' + inventory.availableCount + ' available at last check' : 'Banked resets: unknown'));
+        if (inventory) {
+          card.appendChild(el('p', 'usage', 'Credit inventory checked: ' + resetDate(inventory.observedAt)));
+          inventory.credits.filter(function (credit) { return credit.status === 'available'; }).forEach(function (credit) {
+            card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'Expired ' : 'Expires ') + resetDate(credit.expiresAt) : 'No expiry reported')));
+          });
+        }
+        if (account.creditError) card.appendChild(el('p', 'warnt', account.creditError + '. Showing the last successful inventory.'));
+      } else card.appendChild(el('p', 'usage', 'Banked reset inventory is not reported by this provider.'));
+      accounts.appendChild(card);
+    });
+    if (!(data.accounts || []).length) accounts.appendChild(el('p', 'usage', 'Waiting for the first successful quota probe.'));
+    history.appendChild(el('p', 'usage', 'Latest 500 events. Counts include older events. Times use the browser timezone. Detection is inferred from provider readings; small drops and long gaps are not counted.'));
+    if (!(data.events || []).length) history.appendChild(el('p', 'usage', 'No resets detected yet.'));
+    (data.events || []).forEach(function (event) {
+      var card = el('div', 'card');
+      card.appendChild(el('h3', '', event.account + ' · ' + (event.timing === 'scheduled' ? 'Scheduled rollover' : event.timing === 'early' ? 'Early reset' : 'Reset with uncertain timing')));
+      (event.windows || []).forEach(function (window) {
+        card.appendChild(el('p', '', window.after.label + ' · ' + resetType(window.type) + ' · ' + Math.round(window.before.utilization * 100) + '% → ' + Math.round(window.after.utilization * 100) + '%'));
+        card.appendChild(el('p', 'usage', 'Observed between ' + resetDate(window.before.at) + ' and ' + resetDate(window.after.at)));
+        card.appendChild(el('p', 'usage', 'Reset time: ' + resetDate(window.before.resetAt) + ' → ' + resetDate(window.after.resetAt)));
+      });
+      history.appendChild(card);
+    });
+  }
+
   function renderDiagnostics(s) {
     var server = s.server || {}, loop = server.eventLoop || {}, pool = s.upstreamPool || {};
     details('serverInfo', [['Proxy uptime', server.uptimeSeconds == null ? null : fmtIn(server.uptimeSeconds)], ['Proxy port', server.port], ['Event loop lag', loop.lastLagMs == null ? null : loop.lastLagMs + ' ms'], ['Worst lag', loop.maxLagMs == null ? null : loop.maxLagMs + ' ms'], ['Active upstream requests', pool.active], ['Queued upstream requests', pool.queued]]);
@@ -902,6 +962,7 @@ ${SHARED_HELPERS}
     if (!visible.length) acc.appendChild(el('div', 'empty', query ? 'No matching accounts.' : 'No accounts configured on the proxy.'));
     renderOverview(s);
     renderDiagnostics(s);
+    renderResets(s);
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
