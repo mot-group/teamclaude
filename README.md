@@ -25,7 +25,9 @@ This is the [MOT fork](https://github.com/mot-group/teamclaude) of [KarpelesLab/
 
 ## Quick start
 
-Node.js 20+ required. For a new source checkout of this fork:
+Node.js 20+ required. The runtime uses Node built-ins only, so no `npm install` step is needed to run a source checkout. Install development dependencies only if you need the lint tooling.
+
+For a new source checkout of this fork:
 
 ```bash
 git clone https://github.com/mot-group/teamclaude.git
