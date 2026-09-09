@@ -85,6 +85,33 @@ function oauthAccount(name, token, extra = {}) {
   return { name, type: 'oauth', accessToken: token, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
 }
 
+test('MITM h2: Fable depletion preference uses the shared selector and keeps families separate', T, async () => {
+  const certs = generateCertChain('localhost');
+  const upstream = makeUpstream(req => ({ headers: { 'x-saw-auth': req.headers.authorization }, body: 'ok' }));
+  const upPort = await listen(upstream);
+  const am = new AccountManager([oauthAccount('capable', 'A'), oauthAccount('depleted', 'B')], 0.98,
+    { preferFableDepletedAccounts: true, ramp: { enabled: false } });
+  am.applyUsageData(1, { sevenDayFable: { utilization: 0.99, resetAt: Date.now() + 3600_000 } });
+  const proxy = makeProxy(am, upPort, certs);
+  const proxyPort = await listen(proxy);
+  const sock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, certs.caCertPem, ['h2']);
+  const client = http2.connect('https://localhost', { createConnection: () => sock });
+  try {
+    for (const [model, auth] of [['opus', 'B'], ['claude-sonnet-4-6', 'B'], ['claude-haiku-4-5', 'B'], ['claude-fable-5-1', 'A']]) {
+      const req = client.request({ ':method': 'POST', ':path': '/v1/messages', 'content-type': 'application/json' });
+      let response;
+      req.on('response', headers => { response = headers; });
+      req.resume();
+      req.end(JSON.stringify({ model, messages: [] }));
+      await once(req, 'close');
+      assert.equal(response['x-saw-auth'], `Bearer ${auth}`);
+      assert.equal(am.currentIndex, 0);
+    }
+  } finally {
+    client.destroy(); sock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
 test('MITM h2: authorization injected, x-api-key dropped, quota observed, body relayed', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = makeUpstream((req, _body) => ({

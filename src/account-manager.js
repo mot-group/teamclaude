@@ -261,7 +261,7 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferFableDepletedAccounts = false } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -269,6 +269,8 @@ export class AccountManager {
     this._refreshFn = refreshFn;
     this._codexRefreshFn = codexRefreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
+    this.preferFableDepletedAccounts = preferFableDepletedAccounts === true;
+    this._confirmedFable = new WeakSet();
     this.currentIndex = 0;
     // Session awareness (issue #109). The tracker is always on (passive — it just
     // observes the x-claude-code-session-id header for the status readout).
@@ -494,6 +496,12 @@ export class AccountManager {
     if (account && this.ramp.enabled) account.rampStartedAt = Date.now();
   }
 
+  _joinPolicyRamp(account) {
+    if (account && (account.rampStartedAt == null || Date.now() >= account.rampStartedAt + this.ramp.windowMs)) {
+      this._beginRamp(account);
+    }
+  }
+
   /**
    * Move the cursor, and only the cursor. A reading is taken where a request
    * finds traffic resting, never where a selection aims it, so no caller of
@@ -678,11 +686,15 @@ export class AccountManager {
     // field the caller reads afterwards — the failover hop runs after an
     // upstream round trip, by which time another request has selected.
     this._selectionDecision = decision;
+    this._selectionNow = Date.now();
+    this._selectionCursorKey = this._cursorKey(model, advisorModel, provider);
     try {
       account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
+      this._selectionNow = null;
+      this._selectionCursorKey = null;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
       if (borrowed) this.currentIndex = saved;
@@ -712,7 +724,13 @@ export class AccountManager {
    * provider partition, the expiry band. Returns the account or null.
    */
   pickAlternate(exclude, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
-    return this._pickBestAvailable(this._excludeOtherProviders(exclude, provider), model, advisorModel);
+    return this._withSelectionTime(() => this._pickBestAvailable(this._excludeOtherProviders(exclude, provider), model, advisorModel));
+  }
+
+  _withSelectionTime(select) {
+    const previous = this._selectionNow;
+    this._selectionNow = previous ?? Date.now();
+    try { return select(); } finally { this._selectionNow = previous; }
   }
 
   /**
@@ -762,7 +780,9 @@ export class AccountManager {
     // on every request so the behaviour holds without the TUI render loop.
     // The empty set marks this call as a request's, since a poll hands none.
     // Allocated fresh: a set handed out once is one a later reader could add to.
-    this.refreshExpiredQuotas(model, this.expiryRouting.enabled ? (exclude ?? new Set()) : exclude);
+    this.refreshExpiredQuotas(model,
+      this.expiryRouting.enabled || this._usesFablePreference(model, advisorModel) ? (exclude ?? new Set()) : exclude,
+      advisorModel);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
     // account. Only when enabled, only for a real session, and only outside a
@@ -822,6 +842,10 @@ export class AccountManager {
       if (next) { current.requalify = false; return next; }
     }
     if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
+      const preemptor = this._preemptedBy(current, model, advisorModel, exclude);
+      if (this._policyMove(current, preemptor, model, advisorModel)) {
+        return this._divertedFor(model, advisorModel, exclude) || this._selectNext(exclude, model, advisorModel);
+      }
       // Rollover preemption (expiry routing): the current account's governing
       // window rolled over, so it is now the freshest and furthest-dated choice.
       // Re-rank rather than stay parked on it until a switch threshold that
@@ -899,6 +923,13 @@ export class AccountManager {
       // while this account was out of reach is still there to be found when
       // traffic returns to it.
       if (!this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      const preemptor = this._preemptedBy(pinned, model, advisorModel, exclude);
+      if (this._policyMove(pinned, preemptor, model, advisorModel)) {
+        const next = this._pickLeastLoaded(exclude, model, advisorModel);
+        this._joinPolicyRamp(next);
+        console.log(`[TeamClaude] Session pin on "${pinned.name}" released for Fable depletion preference; routing to "${next.name}"`);
+        return next;
+      }
       // Rollover preemption (expiry routing): this candidate rolled over its
       // governing window, so staying would burn the week it just gained while
       // sooner-expiring quota goes unspent — the only pressure-driven force on a
@@ -924,8 +955,7 @@ export class AccountManager {
       }
       // Mirror _select's priority preemption so an operator's priority order
       // still wins over a session's stickiness.
-      const betterExists = this.accounts.some(a =>
-        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+      const betterExists = this._preemptedBy(pinned, model, advisorModel, exclude);
       if (!betterExists) return pinned;
     }
     // No pin was usable, so this is a placement. Placing is aiming: it takes no
@@ -1342,15 +1372,22 @@ export class AccountManager {
    * the walk this mirrors, so a distributed session can be routed elsewhere.
    * It decides nothing: no reading is taken and no cursor moves.
    */
-  previewRouteIndex(model) {
-    const pinned = this._pinnedAccountForModel(model);
-    if (pinned && this._isAvailable(pinned, model)) return pinned.index;
+  previewRouteIndex(model, advisorModel = null) {
+    return this._withSelectionTime(() => this._previewRouteIndex(model, advisorModel));
+  }
+
+  _previewRouteIndex(model, advisorModel = null) {
+    const pinned = this._pinnedAccountForModel(model, advisorModel);
+    if (pinned && this._isAvailable(pinned, model, advisorModel)) return pinned.index;
     const current = this.accounts[this.currentIndex];
-    if (current && this._isAvailable(current, model)) {
+    if (current && this._isAvailable(current, model, advisorModel)) {
       // Mirror getActiveAccount's priority preemption: a strictly higher-priority
       // available account wins over a healthy current one; same tier stays put.
-      const better = this.accounts.some(a =>
-        this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
+      const better = this._preemptedBy(current, model, advisorModel);
+      if (this._policyMove(current, better, model, advisorModel)) {
+        const diverted = this._divertedFor(model, advisorModel);
+        if (diverted) return diverted.index;
+      }
       const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
       if (!better && !rolled) return current.index;
@@ -1358,11 +1395,11 @@ export class AccountManager {
     // Mirror _select's diversion cursor, so the preview names the account a
     // diverted family will actually land on rather than the one a fresh walk
     // would pick.
-    if (this._currentBarredOnlyFor(model)) {
-      const diverted = this._divertedFor(model);
+    if (this._currentBarredOnlyFor(model, advisorModel)) {
+      const diverted = this._divertedFor(model, advisorModel);
       if (diverted) return diverted.index;
     }
-    const best = this._pickBestAvailable(null, model);
+    const best = this._pickBestAvailable(null, model, advisorModel);
     return best ? best.index : null;
   }
 
@@ -1496,10 +1533,48 @@ export class AccountManager {
    * folded in twice. A reader seeing two similar helpers diverge may wonder
    * whether one was missed: it was not. */
   _modelWeeklyExhausted(account, model) {
-    const q = account.quota;
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return false;
-    return q[key] != null && q[key] >= this.thresholdFor(key);
+    return this._familySpent(account, key);
+  }
+
+  _familySpent(account, key) {
+    return account.quota[key] != null && account.quota[key] >= this.thresholdFor(key);
+  }
+
+  _usesFablePreference(model, advisorModel = null) {
+    return this.preferFableDepletedAccounts === true
+      && ['opus', 'sonnet', 'haiku'].includes(modelFamily(model))
+      && (!advisorModel || ['opus', 'sonnet', 'haiku'].includes(modelFamily(advisorModel)));
+  }
+
+  _fableEvidence(account, now = this._selectionNow ?? Date.now()) {
+    const q = account.quota;
+    if (!Number.isFinite(q.unified7dFable) || q.unified7dFable < 0
+        || !Number.isFinite(q.unified7dFableSeenAt) || q.unified7dFableSeenAt <= 0
+        || q.unified7dFableSeenAt > now || now >= q.unified7dFableSeenAt + this.familyStaleMs
+        || !Number.isFinite(q.unified7dFableReset) || q.unified7dFableReset <= now) return 'unknown';
+    return this._confirmedFable.has(account) ? 'confirmed' : 'unconfirmed';
+  }
+
+  _fablePreferred(account, model, advisorModel = null, now = this._selectionNow ?? Date.now()) {
+    return !!account && this._usesFablePreference(model, advisorModel)
+      && providerOf(account) === DEFAULT_PROVIDER && isSubscriptionAccount(account)
+      && this._fableEvidence(account, now) === 'confirmed'
+      && this._familySpent(account, 'unified7dFable');
+  }
+
+  _outranks(candidate, account, model, advisorModel, now) {
+    const priority = candidate.priority || 0;
+    const incumbent = account.priority || 0;
+    return priority < incumbent || (priority === incumbent
+      && this._fablePreferred(candidate, model, advisorModel, now)
+      && !this._fablePreferred(account, model, advisorModel, now));
+  }
+
+  _policyMove(account, next, model, advisorModel = null) {
+    return !!account && !!next && (account.priority || 0) === (next.priority || 0)
+      && this._fablePreferred(next, model, advisorModel) && !this._fablePreferred(account, model, advisorModel);
   }
 
   /**
@@ -1633,16 +1708,17 @@ export class AccountManager {
   }
 
   /**
-   * The available account that would preempt `account` under the priority rule,
-   * or null. A strictly lower priority value wins; within the same tier we stay
-   * put, so the common case (every account at the default priority 0) never
-   * thrashes. Shared by _select, which enforces it, and eligibility(), which
-   * reports it — one predicate so the answer cannot drift from the behaviour.
+   * The available account that outranks `account`, or null. Numeric priority
+   * wins first, followed by the opt-in Fable preference. Equal-tier affinity
+   * stays put. Selection and status share this comparison.
    */
   _preemptedBy(account, model = null, advisorModel = null, exclude = null) {
-    return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
+    const now = this._selectionNow ?? Date.now();
+    for (const a of this.accounts) this._clearExpiredQuotas(a, now);
+    const candidates = this.accounts.filter(a => this._isAvailable(a, model, advisorModel)
       && !exclude?.has(a.index)
-      && (a.priority || 0) < (account.priority || 0)) || null;
+      && this._outranks(a, account, model, advisorModel, now));
+    return candidates.reduce((best, a) => !best || this._outranks(a, best, model, advisorModel, now) ? a : best, null);
   }
 
   /**
@@ -1753,6 +1829,13 @@ export class AccountManager {
     for (const idx of candidates) {
       const pinned = this.accounts[idx];
       if (!pinned || !this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      const preemptor = this._preemptedBy(pinned, model, advisorModel, exclude);
+      if (this._policyMove(pinned, preemptor, model, advisorModel)) {
+        const next = this._pickBestAvailable(exclude, model, advisorModel);
+        this._joinPolicyRamp(next);
+        console.log(`[TeamClaude] Draining session pin on "${pinned.name}" released for Fable depletion preference; routing to "${next.name}"`);
+        return next;
+      }
       // A governing-window rollover ends the drain, which trades expiring quota
       // for a warm cache priced on the window the account had when it started
       // and is otherwise unbounded: an active session renews its own idle
@@ -1760,8 +1843,7 @@ export class AccountManager {
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) break;
       // Mirror _select's priority preemption, as _selectForSession does.
-      const betterExists = this.accounts.some(a =>
-        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+      const betterExists = this._preemptedBy(pinned, model, advisorModel, exclude);
       if (!betterExists) return pinned;
     }
     // The pin is gone or no longer usable: this session has to move anyway, so
@@ -1814,11 +1896,16 @@ export class AccountManager {
    */
   _cursorKey(model, advisorModel = null, provider = this._selectingProvider || DEFAULT_PROVIDER) {
     const own = this._routeForModel(model)?.name || (model ? this._weeklyBucketFor(model) : '');
-    const base = (() => {
+    let base = (() => {
       if (!advisorModel) return own;
       const adv = this._routeForModel(advisorModel)?.name || this._weeklyBucketFor(advisorModel);
       return adv === own ? own : `${own}+${adv}`;
     })();
+    if (this.preferFableDepletedAccounts && ['opus', 'sonnet', 'haiku'].includes(modelFamily(model))) {
+      // A broad route or shared bucket can also carry unknown or Fable models.
+      // Their requests must not overwrite a policy diversion's cursor.
+      base += `\u0000${modelFamily(model)}+${modelFamily(advisorModel)}`;
+    }
     // Namespaced by provider so a diversion recorded for one provider is never
     // read back as another's. Model names do not have to differ between
     // providers, and a bucket key certainly does not — an unprefixed key would
@@ -1851,7 +1938,7 @@ export class AccountManager {
    */
   _divertedFor(model, advisorModel = null, exclude = null) {
     if (!model) return null;
-    const idx = this.routeCursors.get(this._cursorKey(model, advisorModel));
+    const idx = this.routeCursors.get(this._selectionCursorKey ?? this._cursorKey(model, advisorModel));
     const account = idx != null ? this.accounts[idx] : null;
     if (!account || account.index === this.currentIndex || exclude?.has(account.index)) return null;
     if (!this._isAvailable(account, model, advisorModel)) return null;
@@ -1866,7 +1953,7 @@ export class AccountManager {
    * route's account was never this route's position, so moving off it is not a
    * rotation. */
   _previousCursor(model, advisorModel = null) {
-    const recorded = this.routeCursors.get(this._cursorKey(model, advisorModel));
+    const recorded = this.routeCursors.get(this._selectionCursorKey ?? this._cursorKey(model, advisorModel));
     if (recorded != null) return recorded;
     const current = this.accounts[this.currentIndex];
     return current && this._routeAllows(current, model) ? current.index : null;
@@ -2052,9 +2139,16 @@ export class AccountManager {
    * both selection loops so they cannot disagree on the candidate set.
    */
   _bandedCandidates(exclude = null, model = null, advisorModel = null) {
-    return this._topPressureBand(
-      this.accounts.filter(a => !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel)),
-      model);
+    const now = this._selectionNow ?? Date.now();
+    for (const account of this.accounts) this._clearExpiredQuotas(account, now);
+    let candidates = this.accounts.filter(a => !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel));
+    if (this._usesFablePreference(model, advisorModel) && candidates.length) {
+      const priority = Math.min(...candidates.map(a => a.priority || 0));
+      candidates = candidates.filter(a => (a.priority || 0) === priority);
+      const preferred = candidates.filter(a => this._fablePreferred(a, model, advisorModel, now));
+      if (preferred.length) candidates = preferred;
+    }
+    return this._topPressureBand(candidates, model);
   }
 
   /**
@@ -2538,9 +2632,9 @@ export class AccountManager {
    * "reset" log fires at most once per window.
    * @returns {{changed: boolean, session: boolean}} what was cleared.
    */
-  _clearExpiredQuotas(account) {
+  _clearExpiredQuotas(account, now = this._selectionNow ?? Date.now()) {
     const q = account.quota;
-    const now = Date.now();
+    if (this._fableEvidence(account, now) === 'unknown') this._confirmedFable.delete(account);
     let changed = false;
     let session = false;
 
@@ -2580,6 +2674,7 @@ export class AccountManager {
       changed = true;
     }
     if (q.unified7dFable != null && q.unified7dFableReset && now >= q.unified7dFableReset) {
+      this._confirmedFable.delete(account);
       q.unified7dFable = null;
       q.unified7dFableReset = null;
       q.unified7dFableSeenAt = null;
@@ -2608,12 +2703,17 @@ export class AccountManager {
       // Unknown age (restored from an older state file, or set by a path that
       // predates the stamp): start the clock now rather than clearing at once,
       // so a reading is never discarded before it has had a window to prove out.
-      if (!q[seenField]) { q[seenField] = now; continue; }
+      if (!q[seenField]) {
+        if (key === 'unified7dFable') this._confirmedFable.delete(account);
+        q[seenField] = now;
+        continue;
+      }
       if (now < q[seenField] + this.familyStaleMs) continue;
       console.log(`[TeamClaude] Account "${account.name}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
       q[key] = null;
       q[`${key}Reset`] = null;
       q[seenField] = null;
+      if (key === 'unified7dFable') this._confirmedFable.delete(account);
       changed = true;
     }
 
@@ -2676,19 +2776,20 @@ export class AccountManager {
     for (const account of this.accounts) this._clearExpiredQuotas(account);
   }
 
-  refreshExpiredQuotas(model = null, exclude = null) {
+  refreshExpiredQuotas(model = null, exclude = null, advisorModel = null) {
     let changed = false;
+    const scopedRouting = this.expiryRouting.enabled || this._usesFablePreference(model, advisorModel);
     // Gated here rather than at the switch call, because the pending flag is read
     // against it too: with the feature off every reset is consumed on sight.
-    const scope = this.expiryRouting.enabled ? exclude : null;
+    const scope = scopedRouting ? exclude : null;
     // THE EXCLUSION SET IS WHAT MARKS A CALL AS A REQUEST'S: the request path
     // hands one on every call, empty included, and the TUI loop, getQuotaSummary
     // and selectActiveAccount hand none. The tests below are the switch's own.
     const canRouteTo = account => account != null
-      && !scope.has(account.index) && this._isAvailable(account, model);
+      && !scope.has(account.index) && this._isAvailable(account, model, advisorModel);
     // The cursor's account is one end of every comparison the switch makes, so a
     // request that cannot be sent there settles nothing and leaves the event too.
-    const spends = !this.expiryRouting.enabled
+    const spends = !scopedRouting
       || (scope != null && canRouteTo(this.accounts[this.currentIndex]));
     const sessionReset = [];
     for (const account of this.accounts) {
@@ -2713,7 +2814,7 @@ export class AccountManager {
     // off: threading one in would make the disabled path's candidate filter
     // model-scoped, a live routing change on the path that promises none.
     if (sessionReset.length) {
-      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope);
+      this._switchOnSessionReset(sessionReset, scopedRouting ? model : null, scope, advisorModel);
     }
     return changed;
   }
@@ -2723,7 +2824,7 @@ export class AccountManager {
    * weekly limit expires soonest — but only if that is sooner than the current
    * account's weekly limit and the account still has weekly quota to spend.
    */
-  _switchOnSessionReset(candidates, model = null, exclude = null) {
+  _switchOnSessionReset(candidates, model = null, exclude = null, advisorModel = null) {
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone. Read through
@@ -2748,7 +2849,9 @@ export class AccountManager {
       // ignores the model can install one the model's own picker would refuse.
       // The caller pre-filters on this only with the feature on. With it off,
       // this line alone keeps an account whose weekly is spent out of the switch.
-      if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
+      if (!this._isAvailable(acc, model, advisorModel)) continue; // enough session & weekly quota left
+      if (this._usesFablePreference(model, advisorModel)
+          && (this._preemptedBy(acc, model, advisorModel, exclude) || this._policyMove(current, acc, model, advisorModel))) continue;
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
       const weekly = this._rankingReset(acc, model);
@@ -2781,7 +2884,7 @@ export class AccountManager {
     // says this switch leaves no strictly better account behind, which
     // membership does not claim once a lower tier passes through unbanded. Both
     // are drawn over what this request can be sent to.
-    if (this.expiryRouting.enabled && !this._bandedCandidates(exclude, model).includes(best)) return;
+    if (this.expiryRouting.enabled && !this._bandedCandidates(exclude, model, advisorModel).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
@@ -2897,6 +3000,10 @@ export class AccountManager {
   _selectNext(exclude = null, model = null, advisorModel = null) {
     const best = this._pickBestAvailable(exclude, model, advisorModel);
     if (best) {
+      const current = this.accounts[this.currentIndex];
+      const policy = !exclude?.has(current?.index) && this._isAvailable(current, model, advisorModel)
+        && this._policyMove(current, best, model, advisorModel);
+      const scoped = policy || this._currentBarredOnlyFor(model, advisorModel, exclude);
       const previous = this._previousCursor(model, advisorModel);
       const switched = previous != null && previous !== best.index;
       // A model-scoped exclusion — the current account serves everything but
@@ -2910,15 +3017,16 @@ export class AccountManager {
       // rollover baseline and ramp bookkeeping the expiry machinery reads.
       // Read before the move: the diversion log names the account being diverted
       // FROM, and _setCurrent would already have changed it.
-      const current = this.accounts[this.currentIndex];
-      const scoped = this._currentBarredOnlyFor(model, advisorModel, exclude);
       if (!scoped) this._setCurrent(best);
       // If we switched to an account whose weekly quota is still unknown, flag
       // it so we re-evaluate once that quota is learned (see updateQuota).
       best.probing = best.quota.unified7dReset == null;
       if (switched) {
-        this._beginRamp(best);
-        console.log(scoped
+        if (policy) this._joinPolicyRamp(best);
+        else this._beginRamp(best);
+        console.log(policy
+          ? `[TeamClaude] Diverting "${safeLine(model, 64)}" to "${best.name}" for Fable depletion preference (confirmed)`
+          : scoped
           ? `[TeamClaude] Diverting "${safeLine(model, 64)}" to "${best.name}" — "${current.name}" cannot serve it`
           : `[TeamClaude] Switched to account "${best.name}"`);
       }
@@ -3081,6 +3189,10 @@ export class AccountManager {
     }
     const r7dOi = resetHeaderMs(headers['anthropic-ratelimit-unified-7d_oi-reset']);
     if (r7dOi != null) account.quota.unified7dFableReset = r7dOi;
+    if (!isNaN(u7dOi)) {
+      if (this._fableEvidence(account) !== 'unknown') this._confirmedFable.add(account);
+      else this._confirmedFable.delete(account);
+    }
 
     // We switched to this account to discover its weekly quota; now that we
     // know it, flag for re-evaluation so selection can pick the best account.
@@ -3290,11 +3402,16 @@ export class AccountManager {
         q[key] = bucket.utilization;
         q[`${key}Reset`] = bucket.resetAt ?? null;
         q[`${key}SeenAt`] = now;
+        if (key === 'unified7dFable') {
+          if (this._fableEvidence(account, now) !== 'unknown') this._confirmedFable.add(account);
+          else this._confirmedFable.delete(account);
+        }
         observed.add(key);
       } else if (!bucket && usage.scopedWeeklyListed) {
         q[key] = null;
         q[`${key}Reset`] = null;
         q[`${key}SeenAt`] = null;
+        if (key === 'unified7dFable') this._confirmedFable.delete(account);
       } else {
         continue;
       }
@@ -3629,6 +3746,7 @@ export class AccountManager {
     for (const account of this.accounts) {
       const match = saved.find(s => sameIdentity(s, account));
       if (!match || !match.quota) continue;
+      this._confirmedFable.delete(account);
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
       }
@@ -3649,6 +3767,20 @@ export class AccountManager {
   // operator turns on proxy.sessionDetail: the rows name every session id,
   // client and dimension value to anyone who can read status, and on a shared
   // proxy that is every key holder.
+  _fableRoutingStatus(model) {
+    const index = this.previewRouteIndex(model);
+    const account = index == null ? null : this.accounts[index];
+    let reason = 'normal-selection';
+    if (!this.preferFableDepletedAccounts) reason = 'policy-disabled';
+    else if (!account) reason = 'no-eligible-account';
+    else if (this._pinnedAccountForModel(model)?.index === index) reason = 'manual-route-pin';
+    else if (this._fablePreferred(account, model)) reason = 'fable-depleted';
+    else if (this.accounts.some(a => this._fablePreferred(a, model) && this._isAvailable(a, model)
+      && (a.priority || 0) > (account.priority || 0))) reason = 'numeric-priority';
+    else if (this.accounts.some(a => this._fablePreferred(a, model) && !this._routeAllows(a, model))) reason = 'route-restriction';
+    return { model, target: account?.name ?? null, reason, evidence: account ? this._fableEvidence(account) : 'unknown' };
+  }
+
   getStatus({ sessionDetail = false } = {}) {
     // Sweep first: nothing else on the read path does, so an idle server kept
     // reporting a window whose reset had already passed — at its old percentage,
@@ -3671,6 +3803,10 @@ export class AccountManager {
       // The knob as the server resolved it, defaults and clamps applied, so an
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
+      fableDepletionRouting: {
+        enabled: this.preferFableDepletedAccounts === true,
+        models: ['claude-opus-5', 'claude-sonnet-4-6', 'claude-haiku-4-5'].map(model => this._fableRoutingStatus(model)),
+      },
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
       // Empty outside adaptive mode, so the renderer needs no mode check of its
@@ -3684,6 +3820,7 @@ export class AccountManager {
         disabled: a.disabled || false,
         maxUsage: a.maxUsage ?? null,
         status: a.status,
+        fableEvidence: this._fableEvidence(a),
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).

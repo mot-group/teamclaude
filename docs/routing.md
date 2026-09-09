@@ -91,6 +91,45 @@ Advisor requests (Claude Code's `/advisor`) carry a **second** model nested in t
 
 Unwanted models can be rejected outright with [`blockedModels`](configuration.md#fields) instead of being forwarded — a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline.
 
+## Prefer accounts with depleted Fable quota
+
+Set `"preferFableDepletedAccounts": true` in the config and reload to prefer
+subscription accounts with depleted Fable quota for recognized Opus, Sonnet and
+Haiku requests. The package default is false. Account names have no effect.
+
+Eligibility and retry exclusions apply first, followed by the lowest numeric
+priority. Within that priority, this preference comes before automatic session
+affinity, expiry pressure and load. Eligible manual route pins and explicit
+request pins keep their existing authority. Exclusive routes still restrict
+selection. A preferred account that cannot serve the request is skipped, and a
+Fable-capable account remains a legal retry destination.
+
+Depletion uses the actual `unified7dFable` bucket and its configured threshold,
+normally 0.98. Shared quota, budget caps, errors and route bucket overrides do
+not establish Fable depletion. The reading must have a finite utilization, a
+valid observation time within the existing 30-minute family freshness window,
+and a future reset. Headers or a successful usage probe must confirm it during
+this process. Restored readings and synthesized legacy timestamps do not qualify.
+A failed probe adds no confirmation. Reset, stale, cleared and replaced readings
+lose confirmation. A config reload retains confirmation only for an unchanged
+reading on the same running account.
+
+A pass that requires a Fable executor or advisor does not use the preference.
+When no account can serve both models, the existing logged executor-only
+degradation may prefer a depleted account for Opus, Sonnet or Haiku. Upstream can
+still reject the advisor operation.
+
+Automatic non-Fable pins move on their next request. Fable pins and in-flight
+streams keep their account. Policy diversions keep the global cursor unchanged
+and join the destination's active storm ramp without extending it. Moving can
+cost one cold prompt cache. Equal-tier pins remain in place after quota recovers.
+
+`/teamclaude/status` reports `fableDepletionRouting`, including model targets and
+reasons such as `fable-depleted`, `numeric-priority` and `manual-route-pin`.
+Each account reports `fableEvidence` as `confirmed`, `unconfirmed` or `unknown`.
+The global current-account marker alone does not describe these model diversions.
+Disable the flag and reload to restore the previous routing behavior.
+
 ## Model routes
 
 Per-model quota is respected automatically, so most setups need nothing here. To go further you can pin model patterns to an **exclusive** set of accounts with a `routes` table. Each route matches the request's `model` id against shell-style globs (`*` is the only wildcard) and, on the **first matching** route, restricts the request to the listed accounts:
