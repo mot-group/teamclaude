@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { mkdtemp, symlink, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createDashboardServer, hashPassword } from '../src/dashboard-server.js';
 
 const credential = await hashPassword('test-dashboard-password');
@@ -89,4 +95,30 @@ test('a restart invalidates sessions and a missing proxy reports an outage', asy
   const failed = await fetch(other + '/teamclaude/status', { headers });
   assert.equal(failed.status, 502);
   assert.equal((await fetch(url + '/teamclaude/status', { headers: { cookie } })).status, 200);
+});
+
+
+test('the CLI runs through the deployment symlink and creates a password hash', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-dashboard-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const current = join(dir, 'current');
+  await symlink(fileURLToPath(new URL('../', import.meta.url)), current, 'dir');
+  const passwordFile = join(dir, 'password.json');
+  const { stdout } = await promisify(execFile)(process.execPath, [join(current, 'src/dashboard-server.js'), '--init-password'], {
+    env: { ...process.env, TEAMCLAUDE_DASHBOARD_PASSWORD_FILE: passwordFile },
+  });
+  assert.match(stdout.trim(), /^[A-Za-z0-9_-]{32}$/);
+  const saved = JSON.parse(await readFile(passwordFile, 'utf8'));
+  assert.match(saved.salt, /^[a-f0-9]{32}$/);
+  assert.match(saved.hash, /^[a-f0-9]{128}$/);
+});
+
+test('IPv6 host literals match unbracketed configured addresses', async t => {
+  const server = createDashboardServer({ credential, hosts: ['::1'] });
+  const url = await listen(server);
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const status = await new Promise(resolve => {
+    http.get(url, { headers: { host: '[::1]:3457' } }, res => { res.resume(); resolve(res.statusCode); });
+  });
+  assert.equal(status, 200);
 });

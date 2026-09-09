@@ -2,7 +2,8 @@ import http from 'node:http';
 import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
@@ -32,6 +33,7 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
   if (!/^[a-f0-9]{32}$/.test(credential?.salt) || !/^[a-f0-9]{128}$/.test(credential?.hash)) throw new Error('Invalid dashboard password file');
   const upstream = new URL(proxyUrl);
   if (upstream.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(upstream.hostname)) throw new Error('Dashboard proxy URL must use HTTP on loopback');
+  const allowedHosts = new Set(hosts.map(host => host.replace(/^\[|\]$/g, '').toLowerCase()));
   const sessions = new Map();
   const attempts = new Map();
   let checking = 0;
@@ -46,7 +48,7 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
     try {
       let origin;
       try { origin = new URL(`${secure ? 'https' : 'http'}://${req.headers.host}`); } catch { reply(400, { error: 'Invalid host' }); return; }
-      if (!hosts.includes(origin.hostname) || origin.host !== req.headers.host) { reply(403, { error: 'Unknown dashboard host' }); return; }
+      if (!allowedHosts.has(origin.hostname.replace(/^\[|\]$/g, '').toLowerCase()) || origin.host !== req.headers.host) { reply(403, { error: 'Unknown dashboard host' }); return; }
       if (req.method === 'GET' && ['/', '/teamclaude/dashboard'].includes(req.url)) {
         reply(200, page, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': dashboardCsp(page) }); return;
       }
@@ -136,6 +138,6 @@ async function main() {
   });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   main().catch(err => { console.error(err.message); process.exitCode = 1; });
 }
