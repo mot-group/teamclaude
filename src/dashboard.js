@@ -961,6 +961,8 @@ ${SHARED_HELPERS}
       recordActivity(s); render(s);
       if (!timer) timer = setInterval(poll, POLL_MS);
     } catch (e) {
+      if (generation !== authGeneration) return;
+      if (!lastStatus) showKeybox();
       document.getElementById('connection').textContent = 'Disconnected';
       var err = document.getElementById('err'); err.style.display = 'block';
       err.textContent = 'Cannot reach the proxy. Displayed values may be stale. ' + e.message;
