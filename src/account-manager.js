@@ -3458,6 +3458,25 @@ export class AccountManager {
     }
   }
 
+  applyCodexUsageData(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || providerOf(account) !== 'codex' || !usage || usage.error) return;
+    const q = account.quota;
+    for (const [field, bucket] of [['unified5h', 'fiveHour'], ['unified7d', 'sevenDay']]) {
+      if (Object.hasOwn(usage, bucket)) {
+        q[field] = usage[bucket]?.utilization ?? null;
+        q[`${field}Reset`] = usage[bucket]?.resetAt ?? null;
+      }
+    }
+    this.applyUsageData(accountIndex, { fiveHour: usage.fiveHour, sevenDay: usage.sevenDay });
+    if (usage.planType) q.planType = safeLine(usage.planType, 64);
+    if (usage.modelBuckets) {
+      q.codexModelBuckets = Object.fromEntries(usage.modelBuckets.slice(0, MAX_CODEX_MODEL_BUCKETS).map(bucket => [
+        bucket.slug, { name: bucket.name, utilization: bucket.utilization, resetAt: bucket.resetAt, seenAt: Date.now() },
+      ]));
+    }
+  }
+
   /** Apply subscription metadata learned from the OAuth profile endpoint. */
   applyProfileData(accountIndex, profile) {
     const account = this.accounts[accountIndex];

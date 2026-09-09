@@ -159,3 +159,14 @@ Set it in the config file (`~/.config/teamclaude.json`):
 `teamclaude run` automatically raises `API_TIMEOUT_MS` on the spawned Claude Code process to `holdSeconds + 60` seconds, so the client-side timeout covers the full hold window. No manual Claude Code configuration is needed.
 
 Useful for overnight or unattended runs: rather than waking up to a stopped task, the session resumes silently once a quota window opens.
+
+
+### Codex subscription probes
+
+The existing `quotaProbeSeconds` schedule also reads Codex subscription usage from `https://chatgpt.com/backend-api/wham/usage`, the read-only endpoint used by the Codex CLI. It sends the selected account's OpenAI access token and `ChatGPT-Account-Id`. It does not generate a completion or count as a client request.
+
+The probe maps windows by their duration. A primary window can be weekly, so it is not assumed to be a five-hour limit. It also reads model-specific weekly limits and the subscription plan. Successful snapshots replace absent account windows with unknown values. Failed probes keep the previous quota and report an error.
+
+Expired tokens refresh through the Codex OAuth flow. A 401 triggers one forced refresh and retry. Disabled accounts, accounts with rejected refresh tokens, API-key accounts, and custom-upstream Codex accounts are excluded. Anthropic usage and profile endpoints never receive Codex credentials.
+
+The dashboard shows the resulting quota bars and the latest probe status and timestamp. Accounts require a Codex account ID. A missing ID produces a probe error without sending the token upstream. The request has a ten-second timeout and refuses redirects.
