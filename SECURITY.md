@@ -1,4 +1,6 @@
-# Security Policy
+# Security policy
+
+This repository is the [MOT source fork](https://github.com/mot-group/teamclaude). The policy below is retained from upstream and describes upstream releases and reporting channels. MOT additions and the boundary between repository changes and local deployment guards are recorded in [fork changes](docs/fork-changes.md).
 
 ## Reporting a vulnerability
 
