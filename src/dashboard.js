@@ -591,8 +591,8 @@ ${SHARED_HELPERS}
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     var q = a.quota || {};
     if (q.unified5h != null || q.unified7d != null) {
-      card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
-      card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
+      if (q.unified5h != null) card.appendChild(quotaRow('5-hour', q.unified5h, q.unified5hReset));
+      if (q.unified7d != null) card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
       // Model-scoped weekly buckets are learned from the usage endpoint rather
       // than declared, so hard-coding the two families that have dedicated
       // fields drew an incomplete picture the moment upstream metered a third.
@@ -602,6 +602,11 @@ ${SHARED_HELPERS}
     } else {
       card.appendChild(el('div', 'usage', 'Quota not reported by the proxy.'));
     }
+    Object.keys(q.codexModelBuckets || {}).forEach(function (slug) {
+      var bucket = q.codexModelBuckets[slug];
+      card.appendChild(quotaRow(bucket.name + ' weekly', bucket.utilization, bucket.resetAt));
+    });
+    if (q.planType) card.appendChild(el('div', 'usage', 'Codex plan: ' + q.planType));
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
     if (q.spend) { var spend = q.spend; card.appendChild(el('div', 'usage', 'Extra usage: ' + (spend.enabled ? 'enabled' : 'disabled') + ' · ' + (spend.currency || 'USD') + ' ' + ((spend.usedMinor || 0) / Math.pow(10, spend.exponent == null ? 2 : spend.exponent)).toFixed(2) + ' spent this month')); }

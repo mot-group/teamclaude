@@ -1,13 +1,14 @@
 // Opt-in background quota probe.
 //
 // DISABLED BY DEFAULT. When enabled (config.quotaProbeSeconds > 0), periodically
-// reads an OAuth account's quota zero-spend /api/oauth/usage endpoint so idle
+// reads each subscription provider's usage endpoint so idle
 // accounts' utilization/reset stay fresh without waiting to rotate onto them.
 // A sanctioned active-upstream feature (the other is the opt-in keep-warm
 // scheduler, warmer.js); the proxy is otherwise passive. Unlike keep-warm, this
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
+import { fetchCodexUsage } from './codex-usage.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 
 // Node's timers take a 32-bit signed delay: anything above 2^31-1 ms is
@@ -21,10 +22,11 @@ function clampInterval(ms) {
 }
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
+    this.codexProbeFn = codexProbeFn;
     this.profileFn = profileFn;
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
@@ -75,7 +77,7 @@ export class Prober {
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
       const accounts = this.am.accounts.filter(account =>
-        this._probeable(account) && (this._isProbeTarget(account) || this._isBackendTarget(account)));
+        this._probeable(account) && (this._isProbeTarget(account) || this._isCodexTarget(account) || this._isBackendTarget(account)));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -95,7 +97,13 @@ export class Prober {
    * this line (warmer.js `_isWarmTarget`); the probe did not.
    */
   _isProbeTarget(account) {
-    return !!account && account.type === 'oauth' && !!account.credential && !account.upstream;
+    return !!account && account.type === 'oauth' && !!account.credential && !account.upstream
+      && (account.provider == null || account.provider === 'anthropic');
+  }
+
+  _isCodexTarget(account) {
+    return !!account && account.provider === 'codex' && account.type === 'oauth'
+      && !!account.credential && !account.upstream;
   }
 
   /** A third-party backend that publishes a quota of its own. The provider
@@ -119,18 +127,25 @@ export class Prober {
   }
 
   async probeAccount(account) {
+    if (!this._probeable(account)) return;
+    const codex = this._isCodexTarget(account);
+    const backend = this._isBackendTarget(account);
+    if (!codex && !backend && !this._isProbeTarget(account)) return;
+    const readUsage = () => codex
+      ? this.codexProbeFn(account, { timeoutMs: this.timeoutMs })
+      : this.probeFn(account.credential);
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
     // A third-party backend has no Anthropic usage to read; it publishes its own
     // figure, or none. Same schedule, same status row, different source.
-    if (this._isBackendTarget(account)) return this._probeBackend(account, startedAt);
+    if (backend) return this._probeBackend(account, startedAt);
     try {
       await this.am.ensureTokenFresh(account.index);
-      let usage = await this._withTimeout(this.probeFn(account.credential));
+      let usage = await this._withTimeout(readUsage());
       if (usage?.status === 401) {
         // Token rejected: force refresh and retry once.
         await this.am.ensureTokenFresh(account.index, true);
-        usage = await this._withTimeout(this.probeFn(account.credential));
+        usage = await this._withTimeout(readUsage());
       }
 
       if (!usage || usage.error) {
@@ -145,10 +160,11 @@ export class Prober {
         return;
       }
 
-      this.am.applyUsageData(account.index, usage);
+      if (codex) this.am.applyCodexUsageData(account.index, usage);
+      else this.am.applyUsageData(account.index, usage);
       const missingTier = !account.rateLimitTier && !account.seatTier
         && account.hasClaudeMax == null && account.hasClaudePro == null;
-      if (missingTier && this.profileFn) {
+      if (!codex && missingTier && this.profileFn) {
         const profile = await this._withTimeout(this.profileFn(account.credential));
         this.am.applyProfileData(account.index, profile);
       }
@@ -198,7 +214,7 @@ export class Prober {
         const status = this.accountStatus.get(account.name);
         return {
           name: account.name,
-          status: (this._isProbeTarget(account) || this._isBackendTarget(account))
+          status: (this._isProbeTarget(account) || this._isCodexTarget(account) || this._isBackendTarget(account))
             ? (status?.status || 'never') : 'not-applicable',
           lastProbedAt: iso(status?.finishedAt),
           startedAt: iso(status?.startedAt),
