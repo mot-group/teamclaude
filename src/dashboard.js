@@ -161,9 +161,9 @@ export function switchRequest(name, key) {
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
 export function switchOutcome(res) {
-  if (!res || !res.ok) return { kind: 'error', text: 'switch failed' + (res && res.error ? ': ' + res.error : '') };
-  if (res.eligible === false) return { kind: 'warn', text: 'switched to ' + res.account + ', but rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
-  return { kind: 'ok', text: 'switched to ' + res.account };
+  if (!res || !res.ok) return { kind: 'error', text: 'Selection failed' + (res && res.error ? ': ' + res.error : '') };
+  if (res.eligible === false) return { kind: 'warn', text: 'Starting account recorded: ' + res.account + '. Rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
+  return { kind: 'ok', text: 'Starting account recorded: ' + res.account + '. Normal routing still applies.' };
 }
 
 // One row per route the server reports — each model family the fleet meters
@@ -334,10 +334,12 @@ export function problems(status) {
 export function quotaDisplay(ratio, mode = 'spent') {
   if (typeof ratio !== 'number' || !Number.isFinite(ratio)) return null;
   var spent = Math.max(0, Math.min(1, ratio));
-  return Math.round((mode === 'left' ? 1 - spent : spent) * 100);
+  // Reserve full exhaustion for a fully spent limit, and keep the two views complementary.
+  var percentage = spent === 1 ? 100 : Math.min(99, Math.round(spent * 100));
+  return mode === 'left' ? 100 - percentage : percentage;
 }
 
-export function accountQuotaGroups(account) {
+export function accountQuotaGroups(account = {}) {
   var q = account.quota || {};
   var shared = [];
   if (q.unified7d != null) shared.push({ label: 'Weekly', ratio: q.unified7d, resetAt: q.unified7dReset });
@@ -546,7 +548,7 @@ const PAGE = `<!doctype html>
     <section data-section="activity" hidden class="section-body">
       <div id="overview" class="stats"></div><div class="split"><section><h2>Request activity</h2><div class="card"><p class="usage">Requests observed while this page is open</p><div class="history" id="history" role="img" aria-label="Request activity"></div><p class="history-label" id="historyLabel">Collecting the first sample...</p></div></section><section><h2>Token accounting</h2><div class="card" id="tokens"></div></section></div>
       <div id="clientsWrap"><h2>Clients</h2><div class="card"><table id="clients"></table></div></div><div id="dimensionsWrap"></div>
-      <section id="sessionsWrap"><h2>Claude session activity</h2><p class="sub" id="sessionActivity"></p><p class="usage">Counts only requests carrying a Claude session ID. A session remains recent for two minutes after a request, or while a request is running. Codex and requests without a session ID are not included. This does not count open apps or terminals.</p><div class="card"><div class="filters"><label>Project <select id="fProject"></select></label><label>Client <select id="fClient"></select></label><span class="hint" id="sessionCount"></span></div><table id="sessions"></table></div></section>
+      <section id="sessionsWrap"><h2>Claude session activity</h2><p class="sub" id="sessionActivity"></p><p class="usage" id="sessionKnown"></p><p class="usage">Counts only requests carrying a Claude session ID. A session remains recent for two minutes after a request, or while a request is running. Codex and requests without a session ID are not included. This does not count open apps or terminals.</p><div class="card"><div class="filters"><label>Project <select id="fProject"></select></label><label>Client <select id="fClient"></select></label><span class="hint" id="sessionCount"></span></div><table id="sessions"></table></div></section>
     </section>
     <section data-section="routing" hidden class="section-body"><div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div></div></section>
     <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Usage resets</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><p class="usage">Historical percentages always show quota spent.</p><div id="resetEvents"></div></section>
@@ -570,6 +572,7 @@ const PAGE = `<!doctype html>
   var history = [];
   var previousSample = null;
   var polling = false;
+  var pollAgain = false;
   var authGeneration = 0;
   var POLL_MS = 5000;
   var timer = null;
@@ -622,17 +625,6 @@ ${SHARED_HELPERS}
     if (s < 3600) return Math.round(s / 60) + 'm';
     if (s < 86400) return (s / 3600).toFixed(1) + 'h';
     return (s / 86400).toFixed(1) + 'd';
-  }
-
-  // Absolute wall-clock of a future timestamp: "17:30" today, "Wed 09:00"
-  // beyond 24h — the countdown says how long, this says when.
-  function fmtClock(ts) {
-    var d = new Date(ts);
-    var time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    if (ts - Date.now() >= 86400000) {
-      return d.toLocaleDateString([], { weekday: 'short' }) + ' ' + time;
-    }
-    return time;
   }
 
   function quotaRow(label, ratio, resetAt) {
@@ -732,10 +724,12 @@ ${SHARED_HELPERS}
     if (!a) { wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
     document.getElementById('accountDialogTitle').textContent = a.name;
     wrap.appendChild(accountBadge(a));
+    if (!connected) { var warning = el('p', 'warnt', 'Connection lost. These quota values may be stale.'); warning.setAttribute('role', 'status'); wrap.appendChild(warning); }
     wrap.appendChild(el('p', 'usage', providerName(a) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
     var groups = accountQuotaGroups(a);
     groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q.label, q.ratio, q.resetAt)); });
     var q = a.quota || {}, u = a.usage || {};
+    if (a.provider === 'anthropic') wrap.appendChild(el('p', 'usage', 'Recent Claude session IDs: ' + (typeof a.sessions === 'number' ? a.sessions : 'not reported') + '. Only IDs active within two minutes or with a request in flight are counted.'));
     if (q.planType) wrap.appendChild(el('p', 'usage', 'Plan: ' + q.planType));
     wrap.appendChild(el('p', 'usage', (u.totalRequests || 0) + ' requests · ' + fmtNum(accountTokens(u)) + ' tokens reported. Cumulative account counters.'));
     wrap.appendChild(el('p', 'usage', u.lastUsed ? 'Last request ' + fmtAgo(u.lastUsed) : 'No requests recorded.'));
@@ -814,6 +808,7 @@ ${SHARED_HELPERS}
   function renderSessions(sessions) {
     var wrap = document.getElementById('sessionsWrap');
     document.getElementById('sessionActivity').textContent = sessionActivityText(sessions);
+    document.getElementById('sessionKnown').textContent = sessions && typeof sessions.known === 'number' ? 'The tracker remembers ' + sessions.known + ' session IDs. Idle IDs expire after one hour.' : '';
     if (!sessions || !sessions.items) { wrap.style.display = ''; document.querySelector('#sessionsWrap .filters').style.display = 'none'; emptyTable('sessions', 'Session details are disabled on the proxy. The count above still covers only recent Claude session IDs.'); return; }
     wrap.style.display = '';
 
@@ -1145,14 +1140,14 @@ ${SHARED_HELPERS}
       var r = switchRequest(name, SESSION_AUTH ? '' : localStorage.getItem(KEY));
       var res = await fetch(r.url, Object.assign({}, r.init, { signal: AbortSignal.timeout(12000) }));
       if (generation !== authGeneration) return;
-      if (res.status === 401) { showKeybox(); return; }
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       var json = await res.json();
       if (generation !== authGeneration) return;
       var out = switchOutcome(json);
       result.className = 'dialog-result ' + out.kind;
-      result.textContent = out.kind === 'ok' ? 'Starting account recorded: ' + json.account + '. Normal routing still applies.' : out.text;
+      result.textContent = out.text;
       note(out.kind, result.textContent);
-      await poll();
+      await poll(true);
     } catch (e) {
       if (generation !== authGeneration) return;
       result.className = 'dialog-result error'; result.textContent = 'Could not confirm the selection. Refresh status before retrying. ' + e.message;
@@ -1180,8 +1175,8 @@ ${SHARED_HELPERS}
     document.getElementById('key').focus();
   }
 
-  async function poll() {
-    if (polling) return;
+  async function poll(force) {
+    if (polling) { if (force === true) pollAgain = true; return; }
     polling = true;
     var generation = authGeneration;
     try {
@@ -1194,7 +1189,7 @@ ${SHARED_HELPERS}
       document.getElementById('keybox').style.display = 'none';
       document.getElementById('app').style.display = '';
       document.getElementById('err').style.display = 'none';
-      connected = true; lastUpdated = Date.now(); document.getElementById('app').classList.remove('stale');
+      connected = true; lastUpdated = Date.now(); document.body.classList.remove('stale');
       document.getElementById('manualSelection').disabled = false;
       document.getElementById('connection').textContent = 'Connected · 5s refresh';
       recordActivity(s); render(s);
@@ -1202,14 +1197,18 @@ ${SHARED_HELPERS}
     } catch (e) {
       if (generation !== authGeneration) return;
       if (!lastStatus) showKeybox();
-      connected = false; document.getElementById('app').classList.add('stale');
+      connected = false; document.body.classList.add('stale');
       document.getElementById('manualSelection').disabled = true;
       document.getElementById('accountManual').disabled = true; updateSwitchHelp();
+      if (document.getElementById('accountDialog').open) renderAccountDetails();
       document.getElementById('connection').textContent = 'Disconnected';
       var err = document.getElementById('err'); err.style.display = 'block';
       err.textContent = 'Connection lost. ' + (lastUpdated ? 'Showing status received ' + fmtAgo(lastUpdated) + '. Routing and quota may have changed. ' : '') + e.message;
       document.getElementById('loginError').textContent = 'Cannot reach the proxy. Try again shortly.';
-    } finally { polling = false; }
+    } finally {
+      polling = false;
+      if (pollAgain) { pollAgain = false; if (generation === authGeneration) poll(); }
+    }
   }
 
   function start() {

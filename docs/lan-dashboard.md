@@ -72,7 +72,7 @@ The Usage resets section records detected resets and banked Codex reset credits 
 
 Overview combines the model routing forecast with an account comparison table. Accounts shows the same limits on their own. Activity contains request counters, token accounting, clients, dimensions, and Claude session activity. Routing keeps the configured-route details. Resets and Diagnostics retain reset inventory, history, probes, warmup, and server measurements. The navigation stays available on phones.
 
-The Spent / Left control changes both percentages and bar lengths for current account quota, including account details. The browser remembers the choice. For example, 81% spent becomes 19% left. An unknown reading stays unknown in either mode. Historical reset events always show quota spent, and routing configuration is unaffected.
+The Spent / Left control changes both percentages and bar lengths for current account quota, including account details. The browser remembers the choice. For example, 81% spent becomes 19% left. An unknown reading stays unknown in either mode. Rounded percentages always add to 100, and only a fully spent limit displays 100% spent or 0% left. Historical reset events always show quota spent, and routing configuration is unaffected.
 
 ## Model routing summary
 
@@ -88,4 +88,4 @@ Account badges describe reported quota or an account block, not a guarantee that
 
 The dashboard header does not show a global active-session count. The tracker sees only requests carrying Claude's session ID header. A tracked session counts as recent for two minutes after a request, or while a request is still in flight. It is not a count of open apps or terminals. Codex traffic and requests without that header do not contribute.
 
-Activity says "No recent Claude session IDs observed" when that count is zero. Missing tracker data says "Session tracking unavailable". Request counters, token totals, and upstream requests in progress are separate measurements that include traffic outside the session tracker. Detailed rows still require `proxy.sessionDetail: true`.
+Activity says "No recent Claude session IDs observed" when that count is zero. Missing tracker data says "Session tracking unavailable". Request counters, token totals, and upstream requests in progress are separate measurements that include traffic outside the session tracker. Account Details retains each Claude account's recent tracked session count, and Activity shows the number of remembered IDs. Detailed rows still require `proxy.sessionDetail: true`.

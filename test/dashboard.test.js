@@ -130,15 +130,15 @@ test('filter options are unique, sorted, and drop the unlabelled', () => {
 });
 
 test('switchOutcome separates the choice being recorded from traffic following it', () => {
-  assert.deepEqual(switchOutcome({ ok: true, account: 'b', eligible: true }), { kind: 'ok', text: 'switched to b' });
+  assert.deepEqual(switchOutcome({ ok: true, account: 'b', eligible: true }), { kind: 'ok', text: 'Starting account recorded: b. Normal routing still applies.' });
   // A spent or disabled target is still switched to (that is the TUI's behaviour),
   // but saying "done" would hide that rotation skips it on the very next request.
   assert.deepEqual(
     switchOutcome({ ok: true, account: 'b', eligible: false, reason: 'disabled by operator' }),
-    { kind: 'warn', text: 'switched to b, but rotation will not use it: disabled by operator' },
+    { kind: 'warn', text: 'Starting account recorded: b. Rotation will not use it: disabled by operator' },
   );
-  assert.deepEqual(switchOutcome({ ok: false, error: 'no such account "x"' }), { kind: 'error', text: 'switch failed: no such account "x"' });
-  assert.deepEqual(switchOutcome(null), { kind: 'error', text: 'switch failed' });
+  assert.deepEqual(switchOutcome({ ok: false, error: 'no such account "x"' }), { kind: 'error', text: 'Selection failed: no such account "x"' });
+  assert.deepEqual(switchOutcome(null), { kind: 'error', text: 'Selection failed' });
 });
 
 test('the switch button\'s request passes the same-origin gate and moves the current account', async () => {
@@ -457,7 +457,7 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods take th
 
 test('quota display reverses spent and left without turning unknown values into capacity', async () => {
   const { quotaDisplay } = await import('../src/dashboard.js');
-  for (const [ratio, spent, left] of [[0, 0, 100], [0.81, 81, 19], [1, 100, 0], [1.2, 100, 0], [-0.1, 0, 100]]) {
+  for (const [ratio, spent, left] of [[0, 0, 100], [0.81, 81, 19], [1, 100, 0], [1.2, 100, 0], [-0.1, 0, 100], [0.005, 1, 99], [0.015, 2, 98], [0.996, 99, 1]]) {
     assert.equal(quotaDisplay(ratio, 'spent'), spent);
     assert.equal(quotaDisplay(ratio, 'left'), left);
   }
@@ -483,6 +483,7 @@ test('comparison groups preserve every model limit and independent reset', async
     { label: 'Sonnet weekly', ratio: 0.4, resetAt: 300 },
     { label: 'Spark weekly', ratio: 0.3, resetAt: 500 },
   ]);
+  assert.deepEqual(accountQuotaGroups(), { shared: [], session: [], models: [] });
   assert.deepEqual(accountQuotaGroups({}), { shared: [], session: [], models: [] });
   assert.equal(accountQuotaGroups({ quota: { tokensLimit: 0, tokensRemaining: 0 } }).shared[0].ratio, null);
   assert.equal(accountQuotaGroups({ quota: { tokensLimit: 100, tokensRemaining: 25 } }).shared[0].ratio, 0.75);
