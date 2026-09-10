@@ -454,3 +454,45 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods take th
     upstream.close();
   }
 });
+
+test('quota display reverses spent and left without turning unknown values into capacity', async () => {
+  const { quotaDisplay } = await import('../src/dashboard.js');
+  for (const [ratio, spent, left] of [[0, 0, 100], [0.81, 81, 19], [1, 100, 0], [1.2, 100, 0], [-0.1, 0, 100]]) {
+    assert.equal(quotaDisplay(ratio, 'spent'), spent);
+    assert.equal(quotaDisplay(ratio, 'left'), left);
+  }
+  for (const missing of [undefined, null, NaN, Infinity, '0.5']) {
+    assert.equal(quotaDisplay(missing, 'spent'), null);
+    assert.equal(quotaDisplay(missing, 'left'), null);
+  }
+});
+
+test('comparison groups preserve every model limit and independent reset', async () => {
+  const { accountQuotaGroups } = await import('../src/dashboard.js');
+  const groups = accountQuotaGroups({ quota: {
+    unified7d: 0.2, unified7dReset: 100,
+    unified5h: 0.1, unified5hReset: 200,
+    scopedWeekly: { sonnet: { utilization: 0.4, resetAt: 300 } },
+    unified7dFable: 1, unified7dFableReset: 400,
+    codexModelBuckets: { spark: { name: 'Spark', utilization: 0.3, resetAt: 500 } },
+  } });
+  assert.deepEqual(groups.shared, [{ label: 'Weekly', ratio: 0.2, resetAt: 100 }]);
+  assert.deepEqual(groups.session, [{ label: '5-hour', ratio: 0.1, resetAt: 200 }]);
+  assert.deepEqual(groups.models, [
+    { label: 'Fable weekly', ratio: 1, resetAt: 400 },
+    { label: 'Sonnet weekly', ratio: 0.4, resetAt: 300 },
+    { label: 'Spark weekly', ratio: 0.3, resetAt: 500 },
+  ]);
+  assert.deepEqual(accountQuotaGroups({}), { shared: [], session: [], models: [] });
+  assert.equal(accountQuotaGroups({ quota: { tokensLimit: 0, tokensRemaining: 0 } }).shared[0].ratio, null);
+  assert.equal(accountQuotaGroups({ quota: { tokensLimit: 100, tokensRemaining: 25 } }).shared[0].ratio, 0.75);
+});
+
+test('session activity copy distinguishes no observations from unavailable tracking', async () => {
+  const { sessionActivityText } = await import('../src/dashboard.js');
+  assert.equal(sessionActivityText({ active: 0 }), 'No recent Claude session IDs observed');
+  assert.equal(sessionActivityText({ active: 1 }), '1 recent Claude session ID');
+  assert.equal(sessionActivityText({ active: 3 }), '3 recent Claude session IDs');
+  assert.equal(sessionActivityText(), 'Session tracking unavailable');
+  assert.equal(sessionActivityText({}), 'Session tracking unavailable');
+});

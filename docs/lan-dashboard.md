@@ -68,12 +68,24 @@ Unknown quota means the proxy has not reported that quota. It does not mean an a
 
 The Usage resets section records detected resets and banked Codex reset credits across server restarts. See [reset tracking](reset-tracking.md) for detection rules and Google Chat configuration.
 
+## Dashboard views
+
+Overview combines the model routing forecast with an account comparison table. Accounts shows the same limits on their own. Activity contains request counters, token accounting, clients, dimensions, and Claude session activity. Routing keeps the configured-route details. Resets and Diagnostics retain reset inventory, history, probes, warmup, and server measurements. The navigation stays available on phones.
+
+The Spent / Left control changes both percentages and bar lengths for current account quota, including account details. The browser remembers the choice. For example, 81% spent becomes 19% left. An unknown reading stays unknown in either mode. Historical reset events always show quota spent, and routing configuration is unaffected.
+
 ## Model routing summary
 
-The header shows separate Claude and Codex routing previews. Models that share an account are grouped together. Different model targets produce a "Multiple targets" summary; blocked or unavailable models appear explicitly. Account cards name their provider and use "ready" for an available status. The "Prefer" button sets a runtime account preference, subject to model routes and request pins.
+The header groups representative Claude and Codex models by their server-reported target. Blocked models and models with no eligible account have explicit labels. This forecast does not identify a native desktop login or promise which account every running request uses. Request pins, existing session assignments, distribution, advisor constraints, and retries can produce a different destination. Model IDs appear below each target.
 
-These previews describe representative models and configured route patterns. Hover a preview row to see its sample model IDs. They do not identify the native desktop login or promise which account every running request uses. Request pins, existing session assignments, distribution, advisor constraints, and retries can produce a different destination. The detailed routing table shows a provider-specific preview for each configured pattern, rather than a single global fallback account. Unknown model patterns are previewed under both request providers.
+Manual selection records a starting account for rotation. It does not set a persistent preference, change priority, or pin a model. The dialog reports whether the server recorded the choice and whether rotation will skip it. The dashboard refreshes the server forecast after selection. A disconnected dashboard disables manual selection until status is available again.
 
 The server applies provider subscription boundaries, route restrictions, pins, priority, quota availability, and the live model blocklist to these previews. Reading status does not move account or route cursors, trigger a quota probe, or send a model request. Older proxies without provider summaries show an unavailable-summary message instead of reusing the global current-account field.
 
-Session counts reflect requests carrying Claude's session header. Codex session counts are unavailable in this tracker. A zero count does not mean Codex is idle or its remote target is offline. Codex requests and token usage still contribute to the proxy's traffic totals.
+Account badges describe reported quota or an account block, not a guarantee that every model can use the account. Each limit has its own reset date and countdown. Probe timestamps identify the last probe attempt and mark failed attempts. They do not claim that every quota bucket was measured at that time.
+
+## Session activity scope
+
+The dashboard header does not show a global active-session count. The tracker sees only requests carrying Claude's session ID header. A tracked session counts as recent for two minutes after a request, or while a request is still in flight. It is not a count of open apps or terminals. Codex traffic and requests without that header do not contribute.
+
+Activity says "No recent Claude session IDs observed" when that count is zero. Missing tracker data says "Session tracking unavailable". Request counters, token totals, and upstream requests in progress are separate measurements that include traffic outside the session tracker. Detailed rows still require `proxy.sessionDetail: true`.
