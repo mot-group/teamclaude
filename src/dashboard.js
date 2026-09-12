@@ -576,6 +576,7 @@ const PAGE = `<!doctype html>
   .account-table td { padding-top:20px; padding-bottom:20px; }
   .reset-table td { padding:12px 16px; }
   .reset-table th:first-child { white-space:nowrap; }
+  .reset-table td small { display:block; font-size:11px; margin-top:3px; }
   #resetAccounts .card p { margin-top:8px; }
   #resetAccounts .card p.usage { margin-top:6px; line-height:1.5; }
   .account-name { font-size:13px; font-weight:600; display:block; overflow-wrap:anywhere; margin-bottom:7px; }
@@ -1296,11 +1297,13 @@ ${SHARED_HELPERS}
         ['What happened', row.what, row.kind === 'warn' ? 'warnt' : row.kind === 'dim' ? 'dim' : ''],
         ['Spent before → after', row.before + '% → ' + row.after + '%', '']].forEach(function (cell) {
         var td = el('td', cell[2], cell[1]); td.setAttribute('data-label', cell[0]); tr.appendChild(td);
+        // The probe pair that bounds the detection, visible rather than hover-only.
+        if (cell[0] === 'When') td.appendChild(el('small', 'dim', 'probes ' + shortDate(row.observed[0]) + ' and ' + shortDate(row.observed[1])));
       });
       body.appendChild(tr);
     });
     history.appendChild(body);
-    note.textContent = 'Resets are inferred from probe readings, so a small drop or a long gap between probes can be missed. Hover a row for the exact probe times.'
+    note.textContent = 'Resets are inferred from probe readings, so a small drop or a long gap between probes can be missed.'
       + ((data.events || []).length >= 500 ? ' Showing the latest 500 events; the account counts include older ones.' : '');
   }
 
@@ -1608,7 +1611,7 @@ ${SHARED_HELPERS}
     document.getElementById(mode === 'spent' ? 'quotaSpent' : 'quotaLeft').addEventListener('click', function () {
       quotaMode = mode;
       try { localStorage.setItem('teamclaude-quota-display', mode); } catch {}
-      if (lastStatus) { renderAccounts(lastStatus); if (document.getElementById('accountDialog').open) renderAccountDetails(); }
+      if (lastStatus) { renderAccounts(lastStatus); renderResets(lastStatus); if (document.getElementById('accountDialog').open) renderAccountDetails(); }
     });
   });
   document.querySelectorAll('[data-close]').forEach(function (button) { button.addEventListener('click', function () { document.getElementById(button.getAttribute('data-close')).close(); }); });
