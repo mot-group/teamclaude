@@ -9,6 +9,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
+import { normalizeRoutes, routeMembers, configuredPinId } from './routes.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
@@ -218,6 +219,26 @@ switch (command) {
 
 // ── server ──────────────────────────────────────────────────
 
+/**
+ * Why the row the caller was looking at is no longer the row on disk, or null.
+ *
+ * Compared against the NORMALISED route, which is what every reader is shown:
+ * `match` exactly (order is the operator's), the resolved member names as a set
+ * (fleet order is ours, not an edit), and the persisted override as a whole.
+ */
+function expectedMismatch(expected, route, accounts) {
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!same(expected.match, route.match)) return 'the route\'s model globs changed';
+  const members = routeMembers(route, accounts).map(a => a.name);
+  if (!same([...expected.accounts].map(String).sort(), [...members].sort())) return 'the route\'s member accounts changed';
+  const persisted = route.override ? { account: route.override.account, whenSpent: route.override.whenSpent } : null;
+  const read = expected.persisted
+    ? { account: expected.persisted.account, whenSpent: expected.persisted.whenSpent }
+    : null;
+  if (!same(read, persisted)) return 'the override changed';
+  return null;
+}
+
 async function serverCommand() {
   // Installed first: the server is the long-lived process, it runs under a TUI
   // that repaints over anything Node prints on the way out, and a crash here
@@ -284,6 +305,9 @@ async function serverCommand() {
     process.exit(1);
   }
   const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferFableDepletedAccounts: config.preferFableDepletedAccounts, adaptive });
+  for (const warning of accountManager.routeWarnings) {
+    console.error(`[TeamClaude] ${warning}`);
+  }
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -390,7 +414,9 @@ async function serverCommand() {
     }
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
-    accountManager.setRoutes(config.routes);
+    for (const warning of accountManager.setRoutes(config.routes)) {
+      console.error(`[TeamClaude] ${warning}`);
+    }
     // Pick up a distributeSessions change (hand edit or another writer) the same
     // way routes, sx, probe and warmup are picked up below.
     // Not coerced to a boolean: 'adaptive' is a third mode, and !! would flatten
@@ -445,6 +471,65 @@ async function serverCommand() {
     return added;
   };
 
+  // One in-process chain for everything that republishes the routing table.
+  // saveOverride writes the file and then reloads; a bare reload (the TUI's 'R'
+  // key, POST /teamclaude/reload, the CLI's notify after add/change) republishes
+  // the whole table on its own. Interleaved, a reload that read disk before a
+  // write can finish after it and publish a table the file no longer holds — so
+  // they take turns. Nothing here is cross-process: a CLI writing the config
+  // while this server writes it is still the two of them racing, and
+  // atomicConfigUpdate's re-read plus the endpoint's precondition are what make
+  // that race visible rather than silent.
+  let controlChain = Promise.resolve();
+  const queued = (fn) => {
+    const result = controlChain.then(fn, fn);
+    controlChain = result.then(() => {}, () => {});
+    return result;
+  };
+  const reloadQueued = () => queued(reloadAccounts);
+
+  const fail = (code, message) => Object.assign(new Error(message), { code });
+
+  // Write one configured route's `override` to the config, then apply it.
+  //
+  // Preconditioned on `expected`, the normalised row the caller last read: the
+  // dashboard is always looking at a poll that is a few seconds old, and the
+  // CLI, the TUI editor and a hand edit write the same table. Rejecting a stale
+  // Apply is the whole reason this is not a plain write.
+  const saveOverride = ({ route: name, expected, override }) => queued(async () => {
+    await atomicConfigUpdate(async diskConfig => {
+      const list = Array.isArray(diskConfig.routes) ? diskConfig.routes : [];
+      // Normalised for the comparison only: that is the table every reader is
+      // shown, so it is the one `expected` describes.
+      const { routes } = normalizeRoutes(list, accountManager.accounts);
+      const row = routes.find(r => r.name === name);
+      if (!row) throw fail('no-such-route', `no route named "${name}"`);
+      const stale = expectedMismatch(expected, row, accountManager.accounts);
+      if (stale) throw fail('changed-elsewhere', stale);
+      // Edited on the DISK row, not the normalised copy: the normaliser fills in
+      // defaults and drops what it cannot use, and writing that back would
+      // rewrite the operator's file on every force. An unnamed route is named by
+      // its position there, so the same rule finds it here.
+      const at = list.findIndex((r, i) => (typeof r?.name === 'string' && r.name ? r.name : `route-${i + 1}`) === name);
+      if (at < 0) throw fail('no-such-route', `no route named "${name}"`);
+      if (override) list[at].override = { ...override, since: Date.now() };
+      else delete list[at].override;
+    });
+    // The file has stopped forcing the route, but the running pin has not — and
+    // if the reload below fails, nothing else would release it. Drop it here so
+    // a half-applied clear errs towards normal routing rather than towards a
+    // force nothing on disk explains.
+    if (!override) accountManager.clearAnyPin(configuredPinId(name));
+    try {
+      await reloadAccounts();
+    } catch (err) {
+      // The write landed; only the apply did not. The caller needs to know the
+      // difference — one needs a retry, the other a reload.
+      throw fail('reload-failed', err.message);
+    }
+    return { warnings: accountManager.routeWarnings || [] };
+  });
+
   let tui = null;
   let hooks = {};
 
@@ -471,10 +556,12 @@ async function serverCommand() {
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
         if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
         if (config.sessionTitles != null) diskConfig.sessionTitles = config.sessionTitles;
-        // Persist the route table (edited from the TUI routes screen).
-        if (config.routes != null) diskConfig.routes = config.routes;
+        // Routes are NOT written here. The editor writes each edit through disk
+        // itself (_routeSave / _routeDelete), so a whole-table stencil from this
+        // hook would undo whatever another writer — the CLI, the force endpoint
+        // — committed since the last reload.
       }),
-      syncAccounts: reloadAccounts,
+      syncAccounts: reloadQueued,
       // `p` key: on-demand fleet-wide quota refresh. The prober is constructed
       // after the TUI, so this is a thunk over the closure variable.
       probeQuota: () => prober?.probeAll(),
@@ -535,7 +622,12 @@ async function serverCommand() {
   }
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
-  hooks.reload = reloadAccounts;
+  // Queued, like every other republish of the routing table.
+  hooks.reload = reloadQueued;
+  // The dashboard's Force dialog. Set for both branches: the TUI is not
+  // reachable on the background-service deployment the dashboard serves, and
+  // the queue is the same one either way.
+  hooks.saveOverride = saveOverride;
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
@@ -1841,7 +1933,11 @@ async function routeCommand() {
       const accts = (r.accounts && r.accounts.length) ? r.accounts.join(', ') : '(all accounts)';
       const bucket = r.bucket ? `  bucket=${r.bucket}` : '';
       const color = r.color ? `  color=${r.color}` : '';
-      console.log(`${r.name || '(unnamed)'}: ${match} → ${accts}${bucket}${color}`);
+      // A forced route ignores every other member until the force is cleared,
+      // so the list says it rather than showing a member set nothing uses.
+      const forced = r.override?.account
+        ? `  forced → ${r.override.account} (${r.override.whenSpent})` : '';
+      console.log(`${r.name || '(unnamed)'}: ${match} → ${accts}${bucket}${color}${forced}`);
     }
     return;
   }
@@ -1864,11 +1960,14 @@ async function routeCommand() {
     for (const a of accounts) {
       if (!known.has(a) && !/^\d+$/.test(a)) console.error(`Warning: no account named "${a}" (yet)`);
     }
-    const route = { name, match };
-    if (accounts.length) route.accounts = accounts;
-    if (bucket) route.bucket = bucket;
-    if (color) route.color = color.toLowerCase();
     const at = config.routes.findIndex(r => r.name === name);
+    // Spread the row as loaded: `add` on an existing name is an edit, and
+    // rebuilding the route from the flags alone silently dropped everything the
+    // flags cannot express — an `override` above all.
+    const route = { ...(at >= 0 ? config.routes[at] : {}), name, match };
+    if (accounts.length) route.accounts = accounts; else delete route.accounts;
+    if (bucket) route.bucket = bucket; else delete route.bucket;
+    if (color) route.color = color.toLowerCase(); else delete route.color;
     if (at >= 0) { config.routes[at] = route; console.log(`Updated route "${name}"`); }
     else { config.routes.push(route); console.log(`Added route "${name}"`); }
     await saveConfig(config);
