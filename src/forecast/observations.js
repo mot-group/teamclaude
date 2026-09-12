@@ -3,6 +3,11 @@ import { createHash } from 'node:crypto';
 export const HOUR = 3600_000;
 export const DAY = 24 * HOUR;
 export const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+export function windowClass(durationMs) {
+  if (Math.abs(durationMs - 5 * HOUR) <= HOUR / 2) return 'fiveHour';
+  if (Math.abs(durationMs - 7 * DAY) <= 0.7 * DAY) return 'sevenDay';
+  return null;
+}
 const number = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
 const label = value => typeof value === 'string' ? value.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 120) : null;
 
@@ -28,7 +33,7 @@ export function codexWindows(data) {
     }
   };
   add(data?.rate_limit, 'shared', 'shared');
-  for (const [i, limit] of (data?.additional_rate_limits || []).entries()) {
+  for (const [i, limit] of (Array.isArray(data?.additional_rate_limits) ? data.additional_rate_limits : []).entries()) {
     const scope = label(limit?.metered_feature);
     add(limit?.rate_limit, scope ? `model:${scope}` : 'unknown', scope ? `model:${scope}` : `unknown:${i}`);
   }
@@ -46,7 +51,7 @@ export function claudeWindows(data, normalize) {
   add('shared:fiveHour', 'shared', 5 * HOUR, data?.five_hour);
   add('shared:sevenDay', 'shared', 7 * DAY, data?.seven_day);
   for (const [key, value] of Object.entries(data || {})) {
-    if (key.startsWith('seven_day_') && value) {
+    if (key.startsWith('seven_day_') && value && typeof value === 'object' && !Array.isArray(value)) {
       const family = label(key.slice(10));
       add(`family:${family}`, `family:${family}`, 7 * DAY, value);
     }
@@ -64,7 +69,8 @@ export function claudeWindows(data, normalize) {
       }
       continue;
     }
-    const family = label(limit?.scope?.model?.display_name?.trim().toLowerCase());
+    const rawFamily = limit?.scope?.model?.display_name;
+    const family = label(typeof rawFamily === 'string' ? rawFamily.trim().toLowerCase() : null);
     const duration = limit?.group === 'weekly' ? 7 * DAY : null;
     const scope = family ? `family:${family}` : 'unknown';
     const key = family && duration ? scope : `unknown:${i}`;
@@ -107,7 +113,7 @@ export function estimateWindow(samples, bucket, now, intervalMs) {
     resetAt: last?.resetAt ?? null, observedAt: last?.at ?? null, utilization: last?.utilization ?? null,
     durationMs: last?.durationMs ?? null, scope: last?.scope ?? 'unknown', intervals: Math.max(0, segment.length - 1) });
   if (!last) return unavailable('Insufficient history');
-  const maxAge = last.durationMs === 5 * HOUR ? 15 * 60_000 : last.durationMs === 7 * DAY ? HOUR : null;
+  const maxAge = windowClass(last.durationMs) === 'fiveHour' ? 15 * 60_000 : windowClass(last.durationMs) === 'sevenDay' ? HOUR : null;
   if (!maxAge || last.scope === 'unknown') return unavailable('Unsupported window semantics');
   if (last.resetAt !== null && last.resetAt <= now) return unavailable('Awaiting reset observation');
   const baseAge = intervalMs > 0 ? Math.min(3 * intervalMs, maxAge) : maxAge;

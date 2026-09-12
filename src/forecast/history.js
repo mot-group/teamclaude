@@ -46,7 +46,13 @@ export class ForecastHistory {
   load(since) { return this.call('load', { since }); }
   compact(now) { return this.call('compact', { now }); }
   async close() {
-    if (!this.error) await this.call('close').catch(() => {});
+    let timer;
+    if (!this.error) await Promise.race([
+      this.call('close').catch(() => {}),
+      new Promise(resolve => { timer = setTimeout(resolve, 1000); }),
+    ]);
+    clearTimeout(timer);
+    this.fail('History closed');
     await this.worker.terminate();
   }
 }

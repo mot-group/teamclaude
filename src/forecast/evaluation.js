@@ -30,7 +30,7 @@ export function predictions(snapshot, records, intervalMs) {
         baselineLastValue: window.utilization,
         baselineLinear: linearRate > 0 ? Math.min(1, window.utilization + linearRate * elapsed) : null,
         plan: points.at(-1)?.plan ?? null, semantics: points.at(-1)?.semantics ?? null,
-        policyVersion: snapshot.coverage.policyVersion, algorithm: snapshot.algorithm });
+        policyVersion: account.policyVersion, algorithm: snapshot.algorithm });
     }
   }
   return result;

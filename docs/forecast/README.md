@@ -20,7 +20,7 @@ After deploying the reviewed code, set this block in the existing TeamClaude con
 }
 ```
 
-Keep the existing `quotaProbeSeconds` value. An owner proxy that is offline or asleep cannot observe remote burn. Missing current coverage makes the forecast unavailable. No process or service changes its polling automatically.
+Keep the existing `quotaProbeSeconds` value. An owner proxy that is offline or asleep cannot observe remote burn. Missing current coverage makes the forecast unavailable. Intervals longer than 15 minutes cannot keep five-hour windows continuously fresh; intervals longer than 60 minutes cannot keep weekly windows continuously fresh. A cadence change requires a separate operator decision. No process or service changes its polling automatically.
 
 `alternatives` is a list of user-approved `{ "from": "exact-model-id", "to": "exact-model-id" }` pairs. An empty list produces no model-switch recommendation. Advice can explain that an alternative avoids a model-scoped constraint only after two fresh provider observations confirm the relevant limits. All shared limits, known model limits, disabled accounts, held routes, blocklists, and hard account caps still apply. Advice concerns new or restartable work at this proxy and does not promise that an existing pinned session can move.
 
@@ -32,7 +32,7 @@ The forecast owner is the proxy process serving the primary Ubuntu dashboard. It
 
 SQLite operations run in a worker. Node versions with `node:sqlite` use the built-in driver. Node 20 uses an existing `sqlite3` executable through the same worker. The feature does not install that executable. If neither backend is available, history is unavailable and normal proxy service continues. This preserves the repository's zero-runtime-dependency package and Node 20 proxy support. The Node 20 fallback and Node 24 built-in path are covered by the history tests.
 
-Fine observations remain for 30 days. Five-minute historical samples and ordinary forecast records remain for 90 days. Pending predictions and scored evaluation records retain the prediction inputs needed to audit them. They are not automatically promoted into a confidence claim. SQLite limits disk allocation; a storage fault disables history-dependent results and preserves the file for inspection. It does not replace a corrupt database.
+Fine observations remain for 30 days. Five-minute historical samples and ordinary forecast records remain for 90 days. Pending predictions and scored evaluation records retain the prediction inputs needed to audit them. They are not automatically promoted into a confidence claim. The 250 MB disk budget reserves half for SQLite rollback files. Before the database fills, compaction removes ordinary history first, then pending evaluation evidence if necessary. `coverage.historyEvictions` records affected subscriptions and counts, and defers evaluation promotion after evidence loss. A storage fault disables history-dependent results and preserves the file for inspection. It does not replace a corrupt database.
 
 Records are deduplicated by stable source event and subscription keys. Rate fitting uses at most one observation per probe interval, with a minimum five-minute interval. Missing identity excludes the entry from the confirmed pool. Claude identity requires both account UUID and organization UUID. Codex uses its subscription account ID. Email, config order, access tokens, and account names are not history keys.
 
@@ -44,7 +44,7 @@ Records are deduplicated by stable source event and subscription keys. Rate fitt
 
 ## Evaluation and remaining work
 
-Half-hourly snapshots save 30-minute, two-hour, and eight-hour same-window predictions when evidence supports them. Each freezes a last-value and recent-hour linear baseline at the same cutoff. The next eligible provider observation scores the prediction. Changed policy, corrections, resets, and observation gaps produce excluded outcomes. Each outcome contains its subscription-window cluster key. The displayed diagnostic means are not independent-event statistics or a promotion decision.
+Half-hourly snapshots save 30-minute, two-hour, and eight-hour same-window predictions when evidence supports them. Each freezes a last-value and recent-hour linear baseline at the same cutoff. The next eligible provider observation scores the prediction. Changed policy, corrections, resets, and observation gaps produce excluded outcomes. Each outcome contains its subscription-window cluster key. Evaluation checks policy changes for the affected subscription, excluding unrelated fleet throttles. The displayed diagnostic means are not independent-event statistics or a promotion decision.
 
 This release delivers account-level measurement and constraint-based model advice. It does not claim full delivery of the broader PRD's pooled workload simulator, numeric model-switch gains, per-machine continuity, or calibrated probabilities. Those require measured workload transfer, accepted model alternatives, production-policy replay, and the PRD's evidence gates. Local request collectors are not necessary for current account-level depletion forecasts.
 

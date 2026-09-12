@@ -1356,7 +1356,7 @@ ${SHARED_HELPERS}
     var timing = function (t) { return date(t) + (t > Date.now() ? ', in ' + ((t - Date.now()) / 3600000).toFixed(1) + ' hours' : ''); };
     document.getElementById('forecastSummary').textContent = f.status + ' · Target ' + date(end);
     var coverage = f.coverage || {};
-    document.getElementById('forecastCoverage').textContent = 'Unique subscriptions: ' + (coverage.subscriptionCount || 0) + '. ' + (coverage.remoteConsumption || 'History begins after forecast collection is enabled.') + (f.observedThrough ? '. Oldest account reading: ' + date(f.observedThrough) : '');
+    document.getElementById('forecastCoverage').textContent = 'Unique subscriptions: ' + (coverage.subscriptionCount || 0) + '. ' + (coverage.remoteConsumption || 'History begins after forecast collection is enabled.') + (f.observedThrough ? '. Oldest account reading: ' + date(f.observedThrough) : '') + (coverage.historyEvictions ? '. History reached its disk budget and lost evidence; evaluation remains unproven.' : '') + (coverage.limitReached ? '. Displayed history is limited to the most recent retained samples.' : '');
     document.getElementById('forecastAssumptions').textContent = 'Experimental current-pace scenario. Each subscription keeps its observed total workload. Future resets are conditional. Account percentages and times are not added into a pooled balance.';
     var root = document.getElementById('forecastAccounts'); root.replaceChildren();
     (f.accounts || []).forEach(function (a) {

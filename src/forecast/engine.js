@@ -1,11 +1,17 @@
-import { estimateWindow, HOUR, DAY, hash } from './observations.js';
+import { estimateWindow, HOUR, DAY, hash, windowClass } from './observations.js';
 import { modelFamily, resolveMaxUsage } from '../model.js';
 
 export function bucketKey(window) {
-  if (window.scope === 'shared') return window.durationMs === 5 * HOUR ? 'unified5h' : 'unified7d';
+  if (window.scope === 'shared') return windowClass(window.durationMs) === 'fiveHour' ? 'unified5h'
+    : windowClass(window.durationMs) === 'sevenDay' ? 'unified7d' : window.bucket;
   if (window.scope === 'family:fable') return 'unified7dFable';
   if (window.scope === 'family:sonnet') return 'unified7dSonnet';
   return window.scope?.startsWith('family:') ? `scoped:${window.scope.slice(7)}` : window.bucket;
+}
+
+export function evaluationPolicyVersion(policy) {
+  return hash([policy.subscription, policy.provider, policy.disabled, policy.credentialAvailable,
+    policy.maxUsage, policy.thresholds, policy.models]);
 }
 
 function scopedWindows(account, model, modelScopes) {
@@ -14,9 +20,9 @@ function scopedWindows(account, model, modelScopes) {
   const windows = account.windows.filter(w => w.scope === 'shared' || w.scope === `family:${family}`
     || w.scope === 'unknown' || (modelScopes[model] || []).some(scope => w.scope === `model:${scope}`));
   const complete = known && account.enumeration && !account.truncated
-    && windows.some(w => w.scope === 'shared' && w.durationMs === 5 * HOUR)
-    && windows.some(w => w.scope === 'shared' && w.durationMs === 7 * DAY)
-    && windows.every(w => w.scope !== 'unknown' && [5 * HOUR, 7 * DAY].includes(w.durationMs));
+    && windows.some(w => w.scope === 'shared' && windowClass(w.durationMs) === 'fiveHour')
+    && windows.some(w => w.scope === 'shared' && windowClass(w.durationMs) === 'sevenDay')
+    && windows.every(w => w.scope !== 'unknown' && windowClass(w.durationMs));
   return { windows, complete };
 }
 
@@ -40,7 +46,7 @@ function currentEligibility(account, model, policy, modelScopes, now) {
     firstConstraint: windows.filter(w => w.limitAt !== null).sort((a, b) => a.limitAt - b.limitAt)[0]?.bucket ?? null };
 }
 
-export function buildForecast({ records, policies, intervalMs, collector, alternatives = [], modelScopes = {}, now = Date.now(), storageError = null }) {
+export function buildForecast({ records, policies, intervalMs, collector, alternatives = [], modelScopes = {}, now = Date.now() }) {
   const bySubscription = new Map();
   for (const r of records) {
     if (r.source !== 'probe' || r.collector !== collector || r.at > now || r.at < now - 30 * DAY) continue;
@@ -71,7 +77,8 @@ export function buildForecast({ records, policies, intervalMs, collector, altern
         resetConditional: true, numericProbability: null };
     });
     const account = { name: policy.name, subscription: policy.subscription, provider: policy.provider,
-      disabled: policy.disabled, enumeration: last?.enumeration === true, truncated: last?.truncated === true,
+      disabled: policy.disabled, policyVersion: evaluationPolicyVersion(policy),
+      enumeration: last?.enumeration === true, truncated: last?.truncated === true,
       observedAt: last?.at ?? null, windows, models: [],
       continuity: null, continuityReason: 'Account pace does not establish service after workload moves between accounts' };
     account.models = policy.models.map(m => currentEligibility(account, m.model, policy, modelScopes, now));
@@ -113,17 +120,17 @@ export function buildForecast({ records, policies, intervalMs, collector, altern
     observedThrough: observed.length === accounts.length && observed.length ? Math.min(...observed) : null,
     horizonEnd: now + 8 * HOUR, scenario: { type: 'current-account-pace', horizonHours: 8,
       assumption: 'Each subscription keeps its observed total workload, including other machines' },
-    status: storageError ? 'History unavailable' : !enabled ? 'Global observation coverage unavailable'
+    status: !enabled ? 'Global observation coverage unavailable'
       : accounts.some(a => a.windows.some(w => w.ratePerHour !== null)) ? 'Experimental account forecasts' : 'Insufficient history',
     firstShortfall: null, firstShortfallReason: 'Pool continuity needs measured workload transfer and policy replay',
     perModel: accounts.flatMap(a => a.models.map(m => ({ ...m, account: a.name, provider: a.provider }))),
-    accounts, recommendations: enabled && !storageError ? recommendations : [],
+    accounts, recommendations: enabled ? recommendations : [],
     events: accounts.flatMap(a => a.windows.filter(w => w.resetAt > now).map(w => ({ account: a.name,
       bucket: w.bucket, at: w.resetAt, type: 'reported-reset', conditional: true }))),
     coverage: { subscriptionCount: accounts.length, exclusions, source: 'provider-global probes',
       continuousSourceConfigured: enabled, intervalSeconds: intervalMs / 1000, topology: 'This proxy only',
       remoteConsumption: 'Included in provider quota changes; attribution unknown',
-      numericModelGains: false, completePool: false, storageError,
+      numericModelGains: false, completePool: false, storageError: null,
       adviceReason: alternatives.length ? 'Only confirmed eligible alternatives are suggested' : 'No acceptable alternatives configured',
       evaluation: { windowErrors: null, independentExhaustions: 0, calibrated: false },
       policyVersion: hash(policies), alternativesVersion: hash(alternatives) } };

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ForecastHistory } from './history.js';
-import { buildForecast } from './engine.js';
+import { buildForecast, evaluationPolicyVersion } from './engine.js';
 import { subscriptionKey, observation, HOUR, DAY, hash } from './observations.js';
 import { modelGlobMatches } from '../model.js';
 import { predictions, scorePrediction } from './evaluation.js';
@@ -35,6 +35,7 @@ export class ForecastService {
     this.predictions = [];
     this.outcomes = [];
     this.error = null;
+    this.calculationError = null;
     this.running = false;
     this.closing = false;
     this.history = history || new ForecastHistory(file);
@@ -43,6 +44,7 @@ export class ForecastService {
       this.records = records;
       this.predictions = await this.history.call('pending');
       this.outcomes = await this.history.call('scores');
+      this.coverageLoss = await this.history.call('coverage');
       this.recompute();
     }).catch(() => { this.error = 'History unavailable'; this.snapshot = this.unavailable(this.error); });
     this.timer = setInterval(() => this.recompute(), 30_000);
@@ -64,8 +66,12 @@ export class ForecastService {
       if (this.error) return;
       this.records.push(record);
       this.records = this.records.filter(r => r.at >= this.now() - 30 * DAY).slice(-20000);
+      const models = [...new Set((this.snapshot.perModel || []).map(m => m.model))];
+      let policy;
+      try { policy = forecastPolicy(this.manager, this.config, models).find(p => p.subscription === record.subscription); }
+      catch { this.calculationError = 'Forecast calculation failed'; this.recompute(); return; }
       for (const prediction of [...this.predictions]) {
-        const outcome = scorePrediction(prediction, record, this.snapshot.coverage?.policyVersion);
+        const outcome = scorePrediction(prediction, record, policy ? evaluationPolicyVersion(policy) : null);
         if (!outcome) continue;
         this.predictions = this.predictions.filter(p => p.id !== prediction.id);
         await this.history.call('settle', { record: outcome });
@@ -91,6 +97,7 @@ export class ForecastService {
           .filter(([, v]) => Array.isArray(v)).map(([k, v]) => [text(k), v.slice(0, 30).map(text).filter(Boolean)]));
         this.snapshot = buildForecast({ records: this.records, policies, collector: this.collector,
           intervalMs: (this.config.quotaProbeSeconds || 0) * 1000, alternatives, modelScopes, now: this.now() });
+        this.calculationError = null;
         const eligible = this.outcomes.filter(o => o.eligible);
         const mean = key => {
           const values = eligible.map(o => o[key]).filter(Number.isFinite);
@@ -100,9 +107,9 @@ export class ForecastService {
           excludedOutcomes: this.outcomes.length - eligible.length,
           meanAbsoluteError: mean('error'), lastValueError: mean('lastValueError'), linearError: mean('linearError'),
           independentExhaustions: 0, calibrated: false, experimental: true };
+        this.snapshot.coverage.historyEvictions = this.coverageLoss || null;
         if (this.manager.accounts.length > 100 || this.records.length >= 20000) {
           this.snapshot.coverage.limitReached = true;
-          this.snapshot.status = 'Coverage limited by history or account bound';
         }
         const period = Math.floor(this.now() / (30 * 60_000));
         if (period !== this.lastPeriod) {
@@ -113,11 +120,12 @@ export class ForecastService {
           const pending = predictions(snapshot, this.records, (this.config.quotaProbeSeconds || 0) * 1000);
           this.predictions.push(...pending);
           this.history.call('appendMany', { records: pending }).catch(() => { this.error = 'History storage failed'; });
-          this.history.compact(this.now()).catch(() => { this.error = 'History storage failed'; });
+          this.history.compact(this.now()).then(() => this.history.call('coverage'))
+            .then(loss => { this.coverageLoss = loss; }).catch(() => { this.error = 'History storage failed'; });
         }
       } catch {
-        this.error = 'Forecast calculation failed';
-        this.snapshot = this.unavailable(this.error);
+        this.calculationError = 'Forecast calculation failed';
+        this.snapshot = this.unavailable(this.calculationError);
       } finally { this.running = false; }
     });
   }
@@ -127,9 +135,12 @@ export class ForecastService {
     const horizon = Number.isFinite(hours) && hours > 0 && hours <= 168 ? hours : 8;
     snapshot.horizonEnd = snapshot.generatedAt + horizon * HOUR;
     snapshot.scenario = { ...snapshot.scenario, horizonHours: horizon };
-    if (this.error || this.now() - snapshot.generatedAt > 60_000 || !(this.config.quotaProbeSeconds > 0)) {
-      snapshot.status = this.error || 'Global observation coverage unavailable';
+    const staleCalculation = this.now() - snapshot.generatedAt > 60_000;
+    if (this.error || this.calculationError || staleCalculation || !(this.config.quotaProbeSeconds > 0)) {
+      snapshot.status = this.error || this.calculationError || (staleCalculation ? 'Forecast recalculation stale' : 'Global observation coverage unavailable');
       snapshot.recommendations = [];
+      for (const m of snapshot.perModel || []) { m.eligible = false; m.reason = snapshot.status; }
+      for (const a of snapshot.accounts) for (const m of a.models || []) { m.eligible = false; m.reason = snapshot.status; }
       for (const account of snapshot.accounts) for (const w of account.windows) {
         w.lastEstimate = w.limitAt ? { limitAt: w.limitAt, observedAt: w.observedAt } : w.lastEstimate;
         w.limitAt = null;
@@ -145,7 +156,6 @@ export class ForecastService {
   async close() {
     this.closing = true;
     clearInterval(this.timer);
-    await this.ready;
     await this.history.close();
   }
 }
