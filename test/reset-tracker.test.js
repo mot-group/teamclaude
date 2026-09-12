@@ -41,6 +41,27 @@ test('scheduled rollover can include more usage and never counts as an extra res
   assert.equal(status(tracker).notifications.pending, 0);
 });
 
+test('a window that ends on schedule while the account is idle is a scheduled rollover once it restarts', () => {
+  const tracker = new ResetTracker();
+  const end = start + 300000;
+  tracker.observe(a, usage(.30, end), { at: start });
+  // Expired: the endpoint reports no live window, then echoes the past reset time, for hours.
+  tracker.observe(a, { sevenDay: { utilization: 0, resetAt: null } }, { at: start + 600000 });
+  tracker.observe(a, usage(.30, end), { at: start + 900000 });
+  tracker.observe(a, {}, { at: start + 4 * 3600000 });
+  assert.equal(status(tracker).events.length, 0);
+  assert.equal(status(tracker).accounts[0].windows.sevenDay.at, start);
+  tracker.observe(a, usage(.02, reset), { at: start + 5 * 3600000 });
+  assert.equal(status(tracker).events.length, 1);
+  assert.equal(status(tracker).events[0].timing, 'scheduled');
+  assert.equal(status(tracker).events[0].windows[0].before.at, start);
+  assert.equal(status(tracker).accounts[0].totals.scheduled, 1);
+  assert.equal(status(tracker).accounts[0].pending.length, 0);
+  assert.equal(status(tracker).accounts[0].windows.sevenDay.resetAt, reset);
+  tracker.observe(a, usage(.03, reset), { at: start + 5 * 3600000 + 300000 });
+  assert.equal(status(tracker).events.length, 1);
+});
+
 test('corrections, missing windows, out-of-order probes, and long observation gaps do not count', () => {
   for (const sequence of [
     [[.94, 0], [.9, 300000], [.91, 600000]],
