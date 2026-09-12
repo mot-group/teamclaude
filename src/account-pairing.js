@@ -146,9 +146,21 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
         if (Object.hasOwn(diskAcct, key)) merged[key] = diskAcct[key];
         else delete merged[key];
       }
+      // Same rule as the ordinary merge below, and for the same reason: this
+      // branch also spreads the in-memory entry over the disk row, so without it
+      // a save that drops `models` resurrects the claim whenever the same save
+      // changes importFrom or accountId.
+      if (!Object.hasOwn(diskAcct, 'models')) delete merged.models;
       return merged;
     }
-    return diskAcct ? { ...diskAcct, ...live } : live;
+    if (!diskAcct) return live;
+    const merged = { ...diskAcct, ...live };
+    // `models` is the one deprecated field an operator clears to migrate to a
+    // route, and the in-memory entry keeps whatever it was built with. Spreading
+    // it back wrote the claim to disk again on the next save, so the migration
+    // undid itself and forcing a route stayed refused for good.
+    if (!Object.hasOwn(diskAcct, 'models')) delete merged.models;
+    return merged;
   });
 
   // Carry over rows that exist on disk and not in memory. The list used to be

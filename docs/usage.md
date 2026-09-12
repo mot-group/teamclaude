@@ -188,6 +188,23 @@ The **Model routing** header separates Claude and Codex and groups representativ
 Each account card has a **Prefer** button that records an account preference (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to sessions already running depends on `distributeSessions` — with it on, a session pinned to another account keeps it until it goes idle, so the preference can change before that session moves; with it off (the default), every session follows the switch on its next request. The page reports whether rotation will actually use the target: a disabled, errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
 
 
+### Force a route onto one account
+
+The **Configured routes** table, under Routing in the sidebar, carries a **Force…** button on every configured route. It opens a dialog listing that route's accounts with how much of each weekly window is already spent and when the rest comes back, preselecting the one that resets soonest, and asks what should happen when the forced account runs out: fall back to automatic routing over the route's other members, or hold the route on it, in which case matching requests get a 429 with a retry-after instead of moving. A forced route shows a chip beside its target saying what the override is doing right now, not merely that one exists, and swaps its button for **Change…** plus **Clear force**. Clear asks once on the row before it sends anything. Auto-detected rows have no button, and every Force button is off while an account still carries the deprecated per-account `models` setting, with a line under the table explaining why. See [overrides](routing.md#overrides-force-a-route-onto-one-account) for what the field does to routing.
+
+The dialog posts to `POST /teamclaude/routes/override`, behind the same key and same-origin gate as `/teamclaude/switch`:
+
+```json
+{ "route": "codex-default",
+  "expected": { "match": ["gpt-*", "*codex*"], "accounts": ["factorlin codex", "codex-2"], "persisted": null },
+  "account": "factorlin codex", "whenSpent": "fallback" }
+```
+
+`{ "route": "codex-default", "expected": { … }, "clear": true }` removes the override and any runtime pin on the same route.
+
+`expected` is the route's definition as the page last saw it. The server re-reads the config inside the write and compares; anything that moved answers `409` with the current row instead of applying a change to a route that now means something else, and the dialog offers **Use current** to adopt it. The reply reports writing the config (`persisted`) separately from the running router picking the change up (`applied`), because a failed reload leaves those two disagreeing until the next one, and the page says so rather than reporting a bare "done".
+
+
 ```
 http://localhost:3456/teamclaude/dashboard
 ```

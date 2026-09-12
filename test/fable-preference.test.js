@@ -59,7 +59,7 @@ test('numeric priorities, route restrictions and manual route pins win', t => {
   assert.equal(am.getActiveAccount(null, OPUS).index, 0);
   assert.equal(am.getStatus().fableDepletionRouting.models[0].reason, 'route-restriction');
   am.setRoutes([{ name: 'opus', match: '*opus*', accounts: ['a0', 'a1'] }]);
-  am.routePins.set('opus', 0);
+  am.setRoutePin('configured:opus', 0);
   assert.equal(am.getActiveAccount(null, OPUS).index, 0);
   assert.equal(am.getStatus().fableDepletionRouting.models[0].reason, 'manual-route-pin');
 });

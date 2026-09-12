@@ -80,7 +80,7 @@ test('an advisor request skips accounts whose advisor family bucket is spent', (
 
 test('an advisor request honors the advisor model route pin when the executor has none', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
-  am.setRoutePin('fable', 1); // auto family pin
+  am.setRoutePin('auto:fable', 1); // auto family pin
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8').name, 'a');
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', 'claude-fable-5').name, 'b');
 });
@@ -89,8 +89,8 @@ test('the executor route pin wins over the advisor model pin', () => {
   const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98, {
     routes: [{ name: 'main', match: ['*opus*'] }],
   });
-  am.setRoutePin('main', 2);  // executor pinned to c
-  am.setRoutePin('fable', 1); // advisor pinned to b
+  am.setRoutePin('configured:main', 2);  // executor pinned to c
+  am.setRoutePin('auto:fable', 1); // advisor pinned to b
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', 'claude-fable-5').name, 'c');
 });
 

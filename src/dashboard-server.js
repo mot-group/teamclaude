@@ -88,7 +88,8 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
       }
       const allowed = req.method === 'GET' && ['/teamclaude/status', '/teamclaude/quota'].includes(req.url);
       const switching = req.method === 'POST' && req.url === '/teamclaude/switch';
-      if (!allowed && !switching) { reply(404, { error: 'Not found' }); return; }
+      const forcing = req.method === 'POST' && req.url === '/teamclaude/routes/override';
+      if (!allowed && !switching && !forcing) { reply(404, { error: 'Not found' }); return; }
       let payload;
       if (switching) {
         if (!String(req.headers['content-type']).startsWith('application/json')) { reply(415, { error: 'Use JSON' }); return; }
@@ -96,12 +97,42 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
         if (typeof data.account !== 'string' || !data.account || data.account.length > 256) { reply(400, { error: 'Account name required' }); return; }
         payload = JSON.stringify({ account: data.account });
       }
+      if (forcing) {
+        if (!String(req.headers['content-type']).startsWith('application/json')) { reply(415, { error: 'Use JSON' }); return; }
+        const data = await body(req);
+        // Checked here as well as on the proxy, and re-serialised field by field
+        // like the switch above: this is the server reachable from the LAN, and
+        // it forwards nothing it has not named itself. The duplication is
+        // deliberate — importing the proxy's validator would pull its whole
+        // module graph (MITM certs, upstream pool) into this process.
+        const name = v => typeof v === 'string' && v.length > 0 && v.length <= 256;
+        const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+        const expected = data.expected;
+        const shaped = name(data.route)
+          && (data.clear === true || (name(data.account) && ['fallback', 'hold'].includes(data.whenSpent)))
+          && object(expected) && Array.isArray(expected.match) && Array.isArray(expected.accounts)
+          && (expected.persisted === null || object(expected.persisted));
+        if (!shaped) { reply(400, { error: 'Route override request is malformed' }); return; }
+        payload = JSON.stringify({
+          route: data.route,
+          expected: { match: expected.match, accounts: expected.accounts, persisted: expected.persisted },
+          ...(data.clear === true ? { clear: true } : { account: data.account, whenSpent: data.whenSpent }),
+        });
+      }
       const response = await fetch(new URL(req.url, upstream), {
         method: req.method, headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         body: payload, signal: AbortSignal.timeout(10000), redirect: 'error',
       });
-      if (!response.ok) { reply(response.status === 401 ? 502 : response.status, { error: 'Proxy request failed' }); return; }
-      reply(200, await response.json());
+      // The force endpoint answers its refusals in the body — which field was
+      // rejected, and the row as it is now for a 409 — and the dialog needs them
+      // to say anything useful. They name routes and accounts this signed-in
+      // session already reads from /teamclaude/status.
+      // 500 included: the endpoint answers a failed reload with
+      // `{ persisted: true, applied: false }`, and swapping that for the generic
+      // error told the operator nothing changed after the config write landed.
+      const explained = forcing && [400, 404, 409, 500].includes(response.status);
+      if (!response.ok && !explained) { reply(response.status === 401 ? 502 : response.status, { error: 'Proxy request failed' }); return; }
+      reply(response.status, await response.json());
     } catch (err) {
       if (!res.headersSent && !res.destroyed) reply(err instanceof SyntaxError || err.message === 'Request too large' ? 400 : 502, { error: 'Request failed. Check the proxy service.' });
     }

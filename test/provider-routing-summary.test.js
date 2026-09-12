@@ -47,7 +47,7 @@ test('preview mirrors provider cursor and priority without changing routing stat
 
 test('manual route pins, disabled pins, foreign pins, and exhausted pools are reflected', () => {
   const am = new AccountManager(pool(), .98, { routes: [{ name: 'gpt', match: ['gpt-*'] }] });
-  am.setRoutePin('gpt', 3);
+  am.setRoutePin('configured:gpt', 3);
   assert.equal(am.getRoutes()[0].target, 'codex-b');
   am.accounts[3].disabled = true;
   const row = routeRows(am.getStatus())[0];
@@ -56,7 +56,7 @@ test('manual route pins, disabled pins, foreign pins, and exhausted pools are re
   am.accounts[2].quota.unified7d = 1;
   am.accounts[2].quota.unified7dReset = Date.now() + hour;
   assert.equal(am.getRoutes()[0].target, null);
-  am.setRoutePin('gpt', 0);
+  am.setRoutePin('configured:gpt', 0);
   assert.equal(am.getRoutes()[0].target, null, 'a foreign subscription pin must not appear usable');
   assert.equal(routingCards(am.getStatus())[1].headline, 'Unavailable');
 });

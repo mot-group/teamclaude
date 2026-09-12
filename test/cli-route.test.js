@@ -62,3 +62,45 @@ test('route add with an unknown color rejects it without touching the config', a
   assert.doesNotMatch(res.stdout + res.stderr, /ReferenceError/);
   assert.equal(await readFile(configPath, 'utf8'), before, 'a refused add must not write the config');
 });
+
+// `route add` on a name that already exists is an edit, and the fields the flags
+// cannot express have to survive it — an `override` written by the dashboard
+// above all, since losing it silently un-forces a route.
+async function writeRoutesConfig(routes) {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-route-'));
+  const path = join(dir, 'config.json');
+  await writeFile(path, JSON.stringify({
+    proxy: { port: 0, apiKey: 'tc-test' },
+    upstream: 'https://api.anthropic.com',
+    upstreamProxy: false,
+    accounts: [{ name: 'a@example.com', type: 'apikey', apiKey: 'k1' }],
+    routes,
+  }));
+  return path;
+}
+
+test('route add over an existing route keeps its override and drops cleared flags', async () => {
+  const configPath = await writeRoutesConfig([{
+    name: 'bulk', match: ['*opus*'], accounts: ['a@example.com'], bucket: 'unified7d', color: 'red',
+    override: { account: 'a@example.com', whenSpent: 'hold', since: 17 },
+  }]);
+  const res = await runCli(configPath, ['route', 'add', 'bulk', '--match', '*opus*,*sonnet*']);
+  assert.equal(res.code, 0, res.stderr);
+
+  const written = JSON.parse(await readFile(configPath, 'utf8')).routes;
+  assert.deepEqual(written, [{
+    name: 'bulk', match: ['*opus*', '*sonnet*'],
+    override: { account: 'a@example.com', whenSpent: 'hold', since: 17 },
+  }], 'the override survives; the flags that were not given clear their fields');
+});
+
+test('route list names the account a forced route is pinned to', async () => {
+  const configPath = await writeRoutesConfig([
+    { name: 'bulk', match: ['*opus*'], override: { account: 'a@example.com', whenSpent: 'fallback' } },
+    { name: 'plain', match: ['*haiku*'] },
+  ]);
+  const res = await runCli(configPath, ['route', 'list']);
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /bulk: \*opus\* → \(all accounts\)\s+forced → a@example\.com \(fallback\)/);
+  assert.doesNotMatch(res.stdout.split('\n').find(l => l.startsWith('plain:')), /forced/);
+});

@@ -9,6 +9,7 @@ import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
+import { configuredPinId, parsePinId, WHEN_SPENT } from './routes.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
@@ -402,6 +403,95 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Force endpoint — write one configured route's `override` to the config
+      // and apply it, the dashboard's Force dialog. Unlike /switch this changes
+      // the FILE, so the caller sends `expected`: the row it was looking at.
+      // The CLI, the TUI editor and a hand edit write the same table, and a
+      // dashboard that polls every few seconds is always looking at a snapshot
+      // — without the precondition, an Apply would silently overwrite whatever
+      // landed in between. Auto rows are not on disk and answer 404.
+      if (req.method === 'POST' && req.url === '/teamclaude/routes/override') {
+        if (!hooks.saveOverride) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'route override not supported' }));
+          return;
+        }
+        let payload;
+        try {
+          payload = JSON.parse(await readControlBody(req) || '{}');
+        } catch (err) {
+          // Same rule as /switch: say which of the two it was, never echo the
+          // parser's own message back to the caller.
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            errors: [{ field: 'body', message: tooLarge ? 'request body too large' : 'invalid request body' }],
+          }));
+          return;
+        }
+        const errors = overrideBodyErrors(payload);
+        // A deprecated per-account `models` claim makes membership depend on the
+        // request's model, which is the one thing an override cannot express, so
+        // a new force is refused while one exists. Clearing stays available: it
+        // only ever removes a constraint.
+        if (!errors.length && payload.clear !== true && accountManager.hasOwnershipClaims()) {
+          errors.push({
+            field: 'route',
+            message: 'forcing is off while accounts still claim models with the deprecated "models" setting — replace it with a route',
+          });
+        }
+        if (errors.length) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, errors }));
+          return;
+        }
+        // The row as the next poll would report it: the answer is what the page
+        // renders, so it must be the same shape /teamclaude/status carries.
+        const rowFor = name => accountManager
+          .getRoutes({ blockedModels: config.blockedModels || [] })
+          .find(r => r.id === configuredPinId(name)) || null;
+        try {
+          const result = await hooks.saveOverride({
+            route: payload.route,
+            expected: payload.expected,
+            override: payload.clear === true ? null : { account: payload.account, whenSpent: payload.whenSpent },
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true, row: rowFor(payload.route), persisted: true, applied: true, warnings: result?.warnings || [],
+          }));
+        } catch (err) {
+          if (err.code === 'no-such-route') {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'no such route' }));
+            return;
+          }
+          if (err.code === 'changed-elsewhere') {
+            // With the row as it is NOW, so the dialog can offer to adopt it
+            // instead of making the operator reload the page.
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'changed elsewhere', row: rowFor(payload.route) }));
+            return;
+          }
+          // Anything else is ours, and the reason names config paths and account
+          // details — the log is the place for it, not a reply this endpoint
+          // hands to anyone holding a client key. `persisted` is the part the
+          // operator has to act on: a write that landed and then failed to apply
+          // needs a reload, a write that never landed needs a retry.
+          const persisted = err.code === 'reload-failed';
+          console.error(`[TeamClaude] Route override failed${persisted ? ' to apply' : ''}:`, err.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            persisted,
+            applied: false,
+            error: persisted ? 'reload failed; see the proxy log' : 'could not save the override; see the proxy log',
+          }));
+        }
+        return;
+      }
+
       return forward(req, res);
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -482,6 +572,40 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   });
 
   return server;
+}
+
+/**
+ * What is wrong with a POST /teamclaude/routes/override body, field by field.
+ * Empty when it is usable. Shape only — whether the route exists, and whether
+ * `expected` still describes it, is the writer's answer (404 / 409), because
+ * only the writer sees the table on disk.
+ *
+ * The 256-character cap is the same one the switch endpoint's account name gets:
+ * these are config identifiers, and anything longer is a mistake or a probe.
+ */
+export function overrideBodyErrors(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return [{ field: 'body', message: 'expected a JSON object' }];
+  }
+  const errors = [];
+  const name = v => typeof v === 'string' && v.length > 0 && v.length <= 256;
+  if (!name(body.route)) errors.push({ field: 'route', message: 'route must be a name of 1 to 256 characters' });
+  // Clear carries no target: it removes the override rather than replacing it.
+  if (body.clear !== true) {
+    if (!name(body.account)) errors.push({ field: 'account', message: 'account must be a name of 1 to 256 characters' });
+    if (!WHEN_SPENT.includes(body.whenSpent)) errors.push({ field: 'whenSpent', message: `whenSpent must be ${WHEN_SPENT.join(' or ')}` });
+  }
+  const expected = body.expected;
+  if (!expected || typeof expected !== 'object' || Array.isArray(expected)) {
+    errors.push({ field: 'expected', message: 'expected must name the row you read' });
+    return errors;
+  }
+  if (!Array.isArray(expected.match)) errors.push({ field: 'expected.match', message: 'expected.match must be an array of model globs' });
+  if (!Array.isArray(expected.accounts)) errors.push({ field: 'expected.accounts', message: 'expected.accounts must be an array of account names' });
+  if (expected.persisted !== null && (typeof expected.persisted !== 'object' || Array.isArray(expected.persisted))) {
+    errors.push({ field: 'expected.persisted', message: 'expected.persisted must be an object or null' });
+  }
+  return errors;
 }
 
 /**
@@ -1747,6 +1871,19 @@ export function exhaustedMessage(accountManager, model, retryAfter) {
   return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
 }
 
+/**
+ * The 429 for a route held on one account. Names the route and the account,
+ * because the fix is a person's decision — wait for that account, or clear the
+ * force — and neither is guessable from "no account can serve this request".
+ */
+export function heldMessage(accountManager, model, retryAfter) {
+  const entry = accountManager._pinFor?.(model);
+  const route = parsePinId(entry?.id)?.name || 'this route';
+  const account = accountManager.accounts[entry?.pin.index]?.name || 'its account';
+  return `Route "${route}" is held on account "${account}", which cannot serve this request right now.`
+    + ` A held route refuses every other account. Retry in ${retryAfter}s, or clear the force from the dashboard.`;
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -1879,6 +2016,34 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         res.end(JSON.stringify({
           type: 'error',
           error: { type: 'rate_limit_error', message: 'Pinned account is unavailable (rate-limited, errored, or already tried). Retry shortly.' },
+        }));
+      }
+      return;
+    }
+    // A route held on one account (`override.whenSpent: "hold"`) concerns that
+    // account alone: no other member may serve it, by the operator's own
+    // instruction. So the fleet-wide retry-after would be measuring windows this
+    // request can never use, and the holdSeconds wait would sit on the
+    // connection waiting for accounts that are barred from answering it. Reply
+    // now, with the forced account's own next known movement.
+    // Asked of the pin, not of the timestamps: a forced account that is disabled,
+    // errored or excluded has no future stamp to compute a retry-after from, and
+    // the route is held all the same — keying off the stamp dropped exactly those
+    // requests into the fleet-wide wait the hold contract rules out.
+    if (accountManager.heldRouteFor?.(ctx.model)) {
+      const heldMs = accountManager.holdRetryAfterMs(ctx.model);
+      // Ceil, floor 1: a sub-second retry-after reads as "immediately" and would
+      // put a client straight back into the same refusal. Nothing known to move
+      // (a disabled account waits on a person) is a minute: an interval to ask
+      // again on, not a promise that anything will have changed.
+      const retryAfter = heldMs == null ? 60 : Math.max(1, Math.ceil(heldMs / 1000));
+      ctx.status = 429;
+      ctx.account = '(route held)';
+      if (!res.headersSent) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: heldMessage(accountManager, ctx.model, retryAfter) },
         }));
       }
       return;

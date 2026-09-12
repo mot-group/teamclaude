@@ -193,6 +193,14 @@ export function routeRows(status) {
   var s = status || {};
   if (Array.isArray(s.providerRouting)) {
     return (s.routes || []).flatMap(function (route) {
+      // `members` is the route's resolved membership: index references already
+      // resolved to names, and an unrestricted route resolved to every account,
+      // which is the list the endpoint compares against. A preview's accounts
+      // are filtered by provider, so they are only the fallback for a server
+      // that does not send it. `id`, `override` and `persisted` below default
+      // to null for the same reason.
+      var members = Array.isArray(route.members) ? route.members
+        : (((route.previews || [])[0] || {}).accounts || route.accounts || []);
       return (route.previews || []).map(function (preview) {
         var accounts = preview.accounts || [];
         return { kind: 'route', name: route.name,
@@ -201,6 +209,10 @@ export function routeRows(status) {
           target: preview.target || null, pinned: preview.pinned || null,
           pinMismatch: !!preview.pinned && preview.pinned !== preview.target,
           blocked: !!preview.blocked, autocreated: !!route.autocreated,
+          id: route.id || null, override: route.override || null, persisted: route.persisted || null,
+          globs: route.match || [],
+          members: members.map(function (a) { return typeof a === 'string' ? a : (a || {}).name; }),
+          accounts: (route.accounts || []).map(function (a) { return typeof a === 'string' ? a : (a || {}).name; }),
           eligible: accounts.filter(function (a) { return a.eligible; }).map(function (a) { return a.name; }),
           ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }) };
       });
@@ -230,6 +242,10 @@ export function routeRows(status) {
       // shipped to the page.
       blocked: match.length > 0 && match.every(function (g) { return blockedModels.indexOf(g) !== -1; }),
       autocreated: !!r.autocreated,
+      id: r.id || null, override: r.override || null, persisted: r.persisted || null,
+      globs: match,
+      members: (Array.isArray(r.members) ? r.members : accounts).map(function (a) { return typeof a === 'string' ? a : (a || {}).name; }),
+      accounts: accounts.map(function (a) { return typeof a === 'string' ? a : (a || {}).name; }),
       eligible: accounts.filter(function (a) { return a.eligible; }).map(function (a) { return a.name; }),
       ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }),
     };
@@ -248,6 +264,102 @@ export function routeRows(status) {
     });
   }
   return rows;
+}
+
+// The override as one chip after the target. `state` is the server's own
+// answer to whether the forced account is actually serving the route, so the
+// page never re-derives it from quota bars: `unavailable` means traffic is
+// going elsewhere while the force stands, `holding` means requests are being
+// refused on purpose, and those two read very differently to an operator.
+export function chipFor(row) {
+  var r = row || {};
+  var o = r.override || null;
+  if (!o || !o.account) return null;
+  var x = o.account;
+  var why = o.reason || 'not available';
+  var out;
+  if (o.state === 'unavailable') out = { kind: 'warn', text: 'forced to ' + x + ' · ' + x + ' is ' + why + ' · serving from ' + (r.target || 'nothing') };
+  else if (o.state === 'holding') out = { kind: 'bad', text: 'held on ' + x + ' · ' + x + ' is ' + why + ' · requests get 429' };
+  else if (o.state === 'no-target') out = { kind: 'bad', text: 'forced to ' + x + ' · nothing can serve right now' };
+  else out = { kind: 'accent', text: o.whenSpent === 'hold' ? 'forced · held' : 'forced · falls back when spent' };
+  // A TUI pin is memory only. Saying so on the chip is the whole difference
+  // between "this survives a reload" and "this is gone at the next restart".
+  if (o.source === 'tui') out.text += ' · from the TUI, until restart';
+  return out;
+}
+
+// Which member the Force dialog offers first: the one whose weekly window
+// refills soonest, because spending it is what the fleet's own ranking already
+// prefers. A member whose reset upstream never reported sorts last rather than
+// first, because an unknown reset is not an early one.
+export function forceDefaultAccount(row, accounts) {
+  var members = ((row || {}).members || []).map(function (m) { return typeof m === 'string' ? m : (m || {}).name; })
+    .filter(function (name) { return !!name; });
+  var byName = {};
+  (accounts || []).forEach(function (a) { if (a && a.name) byName[a.name] = a; });
+  var best = null, bestAt = null;
+  members.forEach(function (name) {
+    var reset = ((byName[name] || {}).quota || {}).unified7dReset;
+    var at = typeof reset === 'number' && isFinite(reset) ? reset : null;
+    if (best === null) { best = name; bestAt = at; return; }
+    if (at !== null && (bestAt === null || at < bestAt)) { best = name; bestAt = at; }
+  });
+  return best;
+}
+
+// The row's definition as the page last saw it. The endpoint compares this
+// against a fresh read of the config inside its transaction and answers 409
+// when anything moved, so a Force applied to a stale table is refused instead
+// of landing on a route that now means something else. Membership goes over as
+// the server's resolved `members`, which is what it compares against: the raw
+// config list can say "3" or say nothing at all and mean every account.
+export function expectedFor(row) {
+  var r = row || {};
+  var p = r.persisted || null;
+  var match = Array.isArray(r.match) ? r.match : (r.globs || []);
+  return {
+    match: match.slice(),
+    accounts: (Array.isArray(r.members) ? r.members : (r.accounts || []))
+      .map(function (a) { return typeof a === 'string' ? a : (a || {}).name; })
+      .filter(function (name) { return !!name; }),
+    persisted: p ? { account: p.account, whenSpent: p.whenSpent } : null,
+  };
+}
+
+// The request the Force dialog sends. Pure, like switchRequest, so the test
+// suite can put exactly this through a real proxy.
+export function overrideRequest(payload, key) {
+  return {
+    url: '/teamclaude/routes/override',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    },
+  };
+}
+
+// What to tell the operator afterwards. The endpoint reports writing the config
+// and applying it to the running router separately, and the difference matters:
+// `persisted` without `applied` means the next reload will pick the override up
+// while the live fleet is still routing the old way.
+export function overrideOutcome(res) {
+  var r = res || {};
+  if (r.ok) {
+    var o = (r.row || {}).override || null;
+    var text = o && o.account
+      ? 'Forced to ' + o.account + (o.whenSpent === 'hold' ? ', held on it.' : ', falling back when it is spent.')
+      : 'Force cleared. Normal routing applies.';
+    var warnings = (r.warnings || []).join(' ');
+    if (r.applied === false) return { kind: 'warn', row: r.row || null, text: text + ' Saved, but the router did not reload; see the proxy log.' };
+    return { kind: 'ok', row: r.row || null, text: warnings ? text + ' ' + warnings : text };
+  }
+  if (r.error === 'changed elsewhere') {
+    return { kind: 'warn', conflict: true, row: r.row || null, text: 'This route changed elsewhere, so nothing was applied.' };
+  }
+  var detail = (r.errors || []).map(function (e) { return e.message; }).join('; ') || r.error || 'no reason given';
+  if (r.persisted === true) return { kind: 'warn', row: r.row || null, text: 'Saved to the config, but not applied: ' + detail };
+  return { kind: 'error', row: null, text: 'Nothing changed: ' + detail };
 }
 
 // Consecutive client requests that ended with nothing usable. Claude Code has
@@ -364,6 +476,7 @@ export function sessionActivityText(sessions) {
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, problems, quotaDisplay, accountQuotaGroups, sessionActivityText,
+  chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The threshold rides along: `problems` closes over it, so a page without it
@@ -509,6 +622,13 @@ const PAGE = `<!doctype html>
   .explain { background:#202631; border:1px solid #354050; border-radius:8px; padding:14px 17px; color:#c5cedd; font-size:12px; margin:18px 0; }
   .explain ul { margin:9px 0 0; padding-left:18px; }
   .explain li+li { margin-top:8px; }
+  fieldset { border:1px solid var(--line); border-radius:8px; margin:20px 0 0; padding:6px 15px 14px; }
+  legend { color:var(--dim); font-size:12px; padding:0 6px; }
+  .force-modes label { display:flex; align-items:center; gap:9px; margin:10px 0 0; font-size:13px; }
+  .force-modes input { width:16px; height:16px; padding:0; flex:0 0 auto; accent-color:#c0cfff; }
+  .force-modes p { margin:5px 0 0 25px; }
+  #routes td .act+.act { margin-left:12px; }
+  #routes .chip { display:inline-block; }
   .dialog-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:23px; }
   .dialog-result { font-size:13px; padding:13px 0; }
   #accountDetails .quota { margin:18px 0; }
@@ -550,7 +670,7 @@ const PAGE = `<!doctype html>
       <div id="clientsWrap"><h2>Clients</h2><div class="card"><table id="clients"></table></div></div><div id="dimensionsWrap"></div>
       <section id="sessionsWrap"><h2>Claude session activity</h2><p class="sub" id="sessionActivity"></p><p class="usage" id="sessionKnown"></p><p class="usage">Counts only requests carrying a Claude session ID. A session remains recent for two minutes after a request, or while a request is running. Codex and requests without a session ID are not included. This does not count open apps or terminals.</p><div class="card"><div class="filters"><label>Project <select id="fProject"></select></label><label>Client <select id="fClient"></select></label><span class="hint" id="sessionCount"></span></div><table id="sessions"></table></div></section>
     </section>
-    <section data-section="routing" hidden class="section-body"><div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div></div></section>
+    <section data-section="routing" hidden class="section-body"><div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
     <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Usage resets</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><p class="usage">Historical percentages always show quota spent.</p><div id="resetEvents"></div></section>
     <section data-section="diagnostics" hidden class="section-body" id="diagnostics"><h2>Server diagnostics</h2><div class="split"><div class="card" id="serverInfo"></div><div class="card" id="routingInfo"></div></div><h2>Quota probes and warmup</h2><div class="card"><table id="jobs"></table></div></section>
     <footer id="foot"></footer>
@@ -558,6 +678,7 @@ const PAGE = `<!doctype html>
 </div>
 <dialog id="accountDialog" aria-labelledby="accountDialogTitle"><div class="dialog-head"><h2 id="accountDialogTitle">Account details</h2><button data-close="accountDialog" aria-label="Close account details">×</button></div><div id="accountDetails"></div><div class="dialog-actions"><button data-close="accountDialog">Close</button><button id="accountManual">Manual selection</button></div></dialog>
 <dialog id="switchDialog" aria-labelledby="switchTitle"><div class="dialog-head"><div><div class="eyebrow">Routing control</div><h2 id="switchTitle">Select starting account</h2></div><button data-close="switchDialog" aria-label="Close manual selection">×</button></div><p class="dialog-help">Rotation continues from the selected account. Eligibility and model routes can select another account immediately.</p><label for="switchAccount">Account</label><select id="switchAccount"></select><div class="explain"><strong>What changes</strong><ul><li>The router records this starting account for rotation.</li><li>It does not pin a model or change account priority.</li><li>Existing sessions, model routes, and request pins still apply.</li></ul></div><p id="switchHelp" class="dialog-help"></p><div id="switchResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="switchDialog">Close</button><button id="applySwitch" class="primary" disabled>Set starting account</button></div></dialog>
+<dialog id="forceDialog" aria-labelledby="forceTitle"><div class="dialog-head"><div><div class="eyebrow">Routing control</div><h2 id="forceTitle">Force a route to one account</h2></div><button data-close="forceDialog" aria-label="Close force route">×</button></div><p class="dialog-help" id="forceRouteHelp"></p><label for="forceAccount">Account</label><select id="forceAccount"></select><fieldset class="force-modes"><legend>When it runs out of usage</legend><label for="forceFallback"><input type="radio" name="forceWhenSpent" id="forceFallback" value="fallback" checked>Fall back to automatic routing</label><p class="dialog-help">The other members of this route serve it until the forced account is eligible again.</p><label for="forceHold"><input type="radio" name="forceWhenSpent" id="forceHold" value="hold">Hold on it</label><p class="dialog-help">No other member serves this route. Requests get a 429 with a retry-after until the forced account is eligible again.</p></fieldset><div class="explain"><strong>What changes</strong><ul><li>Every request matching this route goes to the selected account.</li><li>It stays forced until you clear it. There is no timer.</li><li>Sessions pinned with TC_ACCT bypass routes and are not affected.</li></ul></div><p id="forceHelp" class="dialog-help"></p><div id="forceResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="forceDialog">Cancel</button><button id="forceUseCurrent" hidden>Use current</button><button id="applyForce" class="primary" disabled>Apply</button></div></dialog>
 <script>
 (function () {
   'use strict';
@@ -567,6 +688,15 @@ const PAGE = `<!doctype html>
   try { if (localStorage.getItem('teamclaude-quota-display') === 'left') quotaMode = 'left'; } catch {}
   var detailAccount = null;
   var switchPending = false;
+  var forceRoute = null;
+  var forceOpener = null;
+  var forceBaseline = null;
+  var forcePending = false;
+  var forceConflictRow = null;
+  var forceFocusRoute = null;
+  var clearConfirmRoute = null;
+  var clearConfirmFocus = false;
+  var restoreClearFocus = null;
   var connected = false;
   var lastUpdated = null;
   var history = [];
@@ -904,26 +1034,51 @@ ${SHARED_HELPERS}
     });
   }
 
+  var CHIP_CLASS = { accent: 'pin', warn: 'warnt', bad: 'badt' };
+
   // Provider-specific samples use the server's targets and eligibility.
   function renderRoutes(s) {
     var wrap = document.getElementById('routesWrap');
     var rows = routeRows(s);
+    var blockedNote = document.getElementById('forceBlocked');
+    var forceBlocked = !!(s || {}).forceBlocked;
+    blockedNote.hidden = !forceBlocked;
+    blockedNote.textContent = forceBlocked
+      ? 'Forcing is off while accounts still use the deprecated models setting. Replace it with a route.' : '';
     if (!rows.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
     var table = document.getElementById('routes');
     table.textContent = '';
     var hr = el('tr');
-    ['Route / sample', 'Target preview', 'Can serve sample'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    ['Route / sample', 'Target preview', 'Can serve sample', 'Force'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
     table.appendChild(hr);
+    // A route with two globs previews twice. The override belongs to the route,
+    // not the sample, so its controls go on the route's first row only.
+    var controlled = Object.create(null);
     rows.forEach(function (r) {
       var tr = el('tr');
       var fam = el('td', '', r.label + (r.match ? ' ' : ''));
       if (r.match) fam.appendChild(el('span', 'tag', r.match));
       if (r.sampleModel) fam.title = 'Representative model: ' + r.sampleModel;
+      var configured = r.kind === 'route' && !r.autocreated;
+      var first = configured && !controlled[r.name];
+      if (first) controlled[r.name] = true;
+      if (first && r.override && r.override.account) {
+        fam.appendChild(el('div', 'hint', 'Stays forced until you clear it. Sessions pinned with TC_ACCT are not affected.'));
+      }
       tr.appendChild(fam);
       var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
       if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
       if (r.pinMismatch) to.appendChild(el('span', 'warnt', ' (not eligible)'));
+      var chip = chipFor(r);
+      if (chip) {
+        var chipEl = el('span', 'chip ' + (CHIP_CLASS[chip.kind] || ''), ' · ' + chip.text);
+        chipEl.tabIndex = -1;
+        to.appendChild(chipEl);
+        // After a successful Apply the page moves the reader to the answer:
+        // what the router now says about the route it just changed.
+        if (first && forceFocusRoute === r.name) { forceFocusRoute = null; chipEl.focus(); }
+      }
       if (r.kind === 'default' && r.target !== r.current) {
         to.appendChild(el('span', 'warnt', r.currentUnavailable
           ? ' · current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
@@ -939,8 +1094,56 @@ ${SHARED_HELPERS}
         if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.join(', ')));
       }
       tr.appendChild(can);
+      tr.appendChild(forceCell(r, first, forceBlocked));
       table.appendChild(tr);
     });
+  }
+
+  function forceCell(r, first, forceBlocked) {
+    var cell = el('td');
+    if (!first) return cell;
+    var forced = !!(r.override && r.override.account);
+    if (clearConfirmRoute === r.name) {
+      cell.appendChild(el('div', 'hint', 'Clear force on ' + r.name + '?'));
+      var yes = el('button', 'act', 'Clear');
+      yes.addEventListener('click', function () {
+        clearConfirmRoute = null;
+        sendOverride(r.name, expectedFor(r), { clear: true }, null);
+      });
+      var keep = el('button', 'act', 'Keep');
+      keep.addEventListener('click', function () {
+        clearConfirmRoute = null; restoreClearFocus = r.name;
+        if (lastStatus) renderRoutes(lastStatus);
+      });
+      cell.appendChild(yes); cell.appendChild(keep);
+      if (clearConfirmFocus) { clearConfirmFocus = false; yes.focus(); }
+      return cell;
+    }
+    var open = el('button', 'act', forced ? 'Change…' : 'Force…');
+    open.setAttribute('aria-haspopup', 'dialog');
+    open.setAttribute('aria-label', (forced ? 'Change the forced account for route ' : 'Force route ') + r.name);
+    // Ownership claims make membership depend on the request's model, so the
+    // server refuses to force a route while any account still carries one.
+    open.disabled = !connected || forceBlocked;
+    open.addEventListener('click', function () { showForce(r.name, open); });
+    cell.appendChild(open);
+    // A cleared route has no chip to move to, and the button the confirm
+    // replaced is gone, so focus lands here instead of on the document.
+    if (forceFocusRoute === r.name) { forceFocusRoute = null; open.focus(); }
+    if (forced) {
+      // Clearing is exempt from the ownership-claim refusal: a route that
+      // cannot be un-forced would be a trap.
+      var clear = el('button', 'act', 'Clear force');
+      clear.setAttribute('aria-label', 'Clear force on route ' + r.name);
+      clear.disabled = !connected;
+      clear.addEventListener('click', function () {
+        clearConfirmRoute = r.name; clearConfirmFocus = true;
+        if (lastStatus) renderRoutes(lastStatus);
+      });
+      cell.appendChild(clear);
+      if (restoreClearFocus === r.name) { restoreClearFocus = null; clear.focus(); }
+    }
+    return cell;
   }
 
   // Top of the page and only when something is wrong: a banner that is always
@@ -1089,6 +1292,7 @@ ${SHARED_HELPERS}
     renderAccounts(s);
     if (document.getElementById('accountDialog').open) renderAccountDetails();
     if (document.getElementById('switchDialog').open) updateSwitchHelp();
+    if (document.getElementById('forceDialog').open) updateForceHelp();
     renderOverview(s);
     renderDiagnostics(s);
     renderResets(s);
@@ -1154,6 +1358,118 @@ ${SHARED_HELPERS}
     } finally { switchPending = false; updateSwitchHelp(); }
   }
 
+  function forceRowFor(name) {
+    return routeRows(lastStatus || {}).filter(function (r) {
+      return r.kind === 'route' && !r.autocreated && r.name === name;
+    })[0] || null;
+  }
+
+  // Each member with what the operator is choosing between: how much of its
+  // weekly window is gone and when the rest comes back.
+  function memberOption(name, accounts) {
+    var a = accounts.filter(function (x) { return x.name === name; })[0] || {};
+    var q = a.quota || {};
+    var used = quotaDisplay(q.unified7d, 'spent');
+    var reset = parseTs(q.unified7dReset);
+    var option = el('option', '', name + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
+      + (isNaN(reset) ? 'reset time not reported'
+        : reset > Date.now() ? 'resets in ' + fmtIn((reset - Date.now()) / 1000) : 'reset time passed'));
+    option.value = name;
+    return option;
+  }
+
+  function updateForceHelp() {
+    var row = forceRoute ? forceRowFor(forceRoute) : null;
+    var account = document.getElementById('forceAccount').value;
+    document.getElementById('applyForce').disabled = !row || !account || !connected || forcePending;
+    document.getElementById('forceHelp').textContent = !connected
+      ? 'The proxy is disconnected. Wait for a fresh status before applying.'
+      : !row ? 'This route is no longer in the latest status.'
+      : !account ? 'This route has no members to force it to.'
+      : 'Matching models: ' + (row.globs || []).join(', ') + '. Members: ' + (row.members || []).join(', ') + '.';
+  }
+
+  function showForce(name, opener) {
+    var row = forceRowFor(name);
+    if (!row) return;
+    forceRoute = name; forceOpener = opener || null; forceConflictRow = null;
+    forceBaseline = expectedFor(row);
+    document.getElementById('forceTitle').textContent = 'Force ' + name + ' to one account';
+    document.getElementById('forceRouteHelp').textContent = 'Every request this route matches goes to one account until you clear it.';
+    var accounts = (lastStatus || {}).accounts || [];
+    var members = row.members || [];
+    var select = document.getElementById('forceAccount'); select.textContent = '';
+    members.forEach(function (m) { select.appendChild(memberOption(m, accounts)); });
+    var current = (row.override || {}).account;
+    select.value = current && members.indexOf(current) !== -1 ? current : (forceDefaultAccount(row, accounts) || '');
+    document.getElementById((row.override || {}).whenSpent === 'hold' ? 'forceHold' : 'forceFallback').checked = true;
+    var result = document.getElementById('forceResult'); result.className = 'dialog-result'; result.textContent = '';
+    document.getElementById('forceUseCurrent').hidden = true;
+    updateForceHelp();
+    document.getElementById('forceDialog').showModal();
+  }
+
+  // One path for Apply and for the row's inline Clear. The result argument is
+  // the dialog's status line when the dialog is driving; the row's Clear has
+  // none, so its answer goes to the page note.
+  async function sendOverride(route, expected, extra, result) {
+    if (!connected || forcePending) return;
+    forcePending = true; updateForceHelp();
+    var generation = authGeneration;
+    if (result) { result.className = 'dialog-result'; result.textContent = 'Applying...'; }
+    try {
+      var payload = Object.assign({ route: route, expected: expected }, extra);
+      var r = overrideRequest(payload, SESSION_AUTH ? '' : localStorage.getItem(KEY));
+      var res = await fetch(r.url, Object.assign({}, r.init, { signal: AbortSignal.timeout(12000) }));
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      var json = await res.json();
+      if (generation !== authGeneration) return;
+      var out = overrideOutcome(json);
+      var text = out.text;
+      if (out.conflict) {
+        forceConflictRow = out.row || null;
+        var p = (out.row || {}).persisted || null;
+        text += ' Now: ' + (p && p.account ? 'forced to ' + p.account + ' (' + (p.whenSpent === 'hold' ? 'hold' : 'falls back when spent') + ')' : 'not forced')
+          + '. Matching models: ' + (((out.row || {}).match) || []).join(', ') + '.';
+        if (result) document.getElementById('forceUseCurrent').hidden = !out.row;
+      }
+      if (result) { result.className = 'dialog-result ' + out.kind; result.textContent = text; }
+      note(out.kind, text);
+      if (out.kind === 'ok') {
+        forceFocusRoute = route;
+        if (result) document.getElementById('forceDialog').close();
+      }
+      await poll(true);
+    } catch (e) {
+      if (generation !== authGeneration) return;
+      var failed = 'Could not confirm the change. Refresh status before retrying. ' + e.message;
+      if (result) { result.className = 'dialog-result error'; result.textContent = failed; } else note('error', failed);
+    } finally { forcePending = false; updateForceHelp(); }
+  }
+
+  function applyForce() {
+    var account = document.getElementById('forceAccount').value;
+    if (!forceRoute || !account) return;
+    sendOverride(forceRoute, forceBaseline, {
+      account: account,
+      whenSpent: document.getElementById('forceHold').checked ? 'hold' : 'fallback',
+    }, document.getElementById('forceResult'));
+  }
+
+  // Adopt the row the 409 came back with as the new baseline. The draft the
+  // operator typed is kept; only what the page claims to have seen moves.
+  function useCurrent() {
+    if (!forceConflictRow) return;
+    forceBaseline = expectedFor(forceConflictRow);
+    forceConflictRow = null;
+    document.getElementById('forceUseCurrent').hidden = true;
+    var result = document.getElementById('forceResult');
+    result.className = 'dialog-result';
+    result.textContent = 'Using the route as it is now. Check the account and mode, then apply again.';
+    updateForceHelp();
+  }
+
   function showView() {
     var name = location.hash.slice(1) || 'overview';
     var views = { overview:['Overview','Routing & capacity','Where requests are expected to go. How much quota each account has used.'], accounts:['Accounts','Account capacity','Compare subscription limits and reset times.'], activity:['Activity','Request activity','Requests and usage observed by this proxy.'], routing:['Routing','Model routing','Server-reported targets and configured routing rules.'], resets:['Resets','Usage resets','Observed quota resets and banked reset inventory.'], diagnostics:['Diagnostics','Proxy diagnostics','Connection status, quota probes, and background jobs.'] };
@@ -1199,8 +1515,9 @@ ${SHARED_HELPERS}
       if (!lastStatus) showKeybox();
       connected = false; document.body.classList.add('stale');
       document.getElementById('manualSelection').disabled = true;
-      document.getElementById('accountManual').disabled = true; updateSwitchHelp();
+      document.getElementById('accountManual').disabled = true; updateSwitchHelp(); updateForceHelp();
       if (document.getElementById('accountDialog').open) renderAccountDetails();
+      if (lastStatus) renderRoutes(lastStatus);
       document.getElementById('connection').textContent = 'Disconnected';
       var err = document.getElementById('err'); err.style.display = 'block';
       err.textContent = 'Connection lost. ' + (lastUpdated ? 'Showing status received ' + fmtAgo(lastUpdated) + '. Routing and quota may have changed. ' : '') + e.message;
@@ -1250,6 +1567,14 @@ ${SHARED_HELPERS}
   document.getElementById('accountManual').addEventListener('click', function () { document.getElementById('accountDialog').close(); showSwitch(detailAccount); });
   document.getElementById('switchAccount').addEventListener('change', updateSwitchHelp);
   document.getElementById('applySwitch').addEventListener('click', doSwitch);
+  document.getElementById('forceAccount').addEventListener('change', updateForceHelp);
+  document.getElementById('applyForce').addEventListener('click', applyForce);
+  document.getElementById('forceUseCurrent').addEventListener('click', useCurrent);
+  document.getElementById('forceDialog').addEventListener('close', function () {
+    var opener = forceOpener;
+    forceRoute = null; forceOpener = null; forceConflictRow = null; forceBaseline = null;
+    if (opener && document.contains(opener)) opener.focus();
+  });
   document.getElementById('accountSearch').addEventListener('input', function () { if (lastStatus) render(lastStatus); });
   document.getElementById('logout').addEventListener('click', async function () {
     try {

@@ -21,6 +21,26 @@ async function fixture(t) {
     for await (const part of req) body += part;
     requests.push({ url: req.url, key: req.headers['x-api-key'], body });
     res.setHeader('content-type', 'application/json');
+    if (req.url.endsWith('/routes/override')) {
+      const data = JSON.parse(body);
+      // The proxy answers a stale precondition with the row as it is now, and
+      // the page needs that to offer "use current" — so the refusal is not a
+      // generic failure here either.
+      if (data.route === 'stale') {
+        res.statusCode = 409;
+        res.end(JSON.stringify({ ok: false, error: 'changed elsewhere', row: { name: 'stale' } }));
+        return;
+      }
+      // A write that landed and then failed to apply. The 500 body is the only
+      // place that difference is stated, and the operator has to act on it.
+      if (data.route === 'half-applied') {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ ok: false, persisted: true, applied: false, error: 'reload failed; see the proxy log' }));
+        return;
+      }
+      res.end(JSON.stringify({ ok: true, row: { name: data.route }, persisted: true, applied: true, warnings: [] }));
+      return;
+    }
     res.end(JSON.stringify(req.url.endsWith('/switch') ? { ok: true, account: JSON.parse(body).account } : { accounts: [{ name: 'test-account' }] }));
   });
   const proxyUrl = await listen(proxy);
@@ -121,4 +141,48 @@ test('IPv6 host literals match unbracketed configured addresses', async t => {
     http.get(url, { headers: { host: '[::1]:3457' } }, res => { res.resume(); resolve(res.statusCode); });
   });
   assert.equal(status, 200);
+});
+
+// The Force dialog reaches the proxy through here on a LAN deployment. The
+// forwarded body is rebuilt field by field, like the switch above: this is the
+// server exposed to the LAN, and it relays nothing it has not named itself.
+test('a route override is forwarded field by field, and a malformed one never leaves', async t => {
+  const { url, requests, login } = await fixture(t);
+  const cookie = (await login()).headers.get('set-cookie').split(';')[0];
+  const headers = { cookie, origin: url, 'content-type': 'application/json' };
+  const send = body => fetch(url + '/teamclaude/routes/override', { method: 'POST', headers, body: JSON.stringify(body) });
+  const expected = { match: ['*opus*'], accounts: ['a@example.com'], persisted: null };
+
+  const applied = await send({ route: 'bulk', expected, account: 'a@example.com', whenSpent: 'hold', note: 'dropped' });
+  assert.equal(applied.status, 200);
+  assert.deepEqual(JSON.parse(requests[0].body), { route: 'bulk', expected, account: 'a@example.com', whenSpent: 'hold' });
+  assert.equal((await applied.json()).row.name, 'bulk');
+
+  for (const bad of [
+    { expected, account: 'a@example.com', whenSpent: 'hold' },                          // no route
+    { route: 'bulk', expected, whenSpent: 'hold' },                                     // no account and no clear
+    { route: 'bulk', expected, account: 'a@example.com', whenSpent: 'forever' },
+    { route: 'bulk', account: 'a@example.com', whenSpent: 'hold' },                     // no precondition
+    { route: 'bulk', expected: { match: '*opus*', accounts: [], persisted: null }, clear: true },
+    { route: 'bulk', expected: { match: [], accounts: [] }, clear: true },               // persisted missing
+    { route: 'x'.repeat(257), expected, clear: true },
+  ]) {
+    assert.equal((await send(bad)).status, 400, JSON.stringify(bad));
+  }
+  assert.equal(requests.length, 1, 'nothing malformed was forwarded');
+
+  const conflict = await send({ route: 'stale', expected, clear: true });
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json()).error, 'changed elsewhere');
+  assert.equal(requests.length, 2);
+
+  // A 500 from this endpoint is explained too: replacing it with the generic
+  // error told the operator nothing had changed after the config write landed.
+  const halfApplied = await send({ route: 'half-applied', expected, clear: true });
+  assert.equal(halfApplied.status, 500);
+  assert.deepEqual(await halfApplied.json(),
+    { ok: false, persisted: true, applied: false, error: 'reload failed; see the proxy log' });
+
+  const notJson = await fetch(url + '/teamclaude/routes/override', { method: 'POST', headers: { cookie, origin: url }, body: '{}' });
+  assert.equal(notJson.status, 415);
 });

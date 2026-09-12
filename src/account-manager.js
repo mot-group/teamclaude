@@ -12,6 +12,7 @@ import { decideBand, pressureOf, pressureRank, assertNever } from './band-decisi
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
 import { ROUTING_PROVIDERS, patternPreviews } from './routing-preview.js';
+import { normalizeRoutes, routeMembers, configuredPinId, autoPinId, parsePinId, WHEN_SPENT } from './routes.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -292,10 +293,14 @@ export class AccountManager {
     // Sessions still being drained after distribution was turned off (see
     // setDistributeSessions). null = not draining; a Set of session ids otherwise.
     this._drainingSessions = null;
-    // Ephemeral per-route manual pins (routeName → account index). Not persisted:
-    // like the global manual switch (currentIndex) these are runtime overrides that
-    // bias selection for a route's models and reset on restart. A pinned account
-    // that becomes ineligible is skipped — routing falls back to best-available.
+    // Per-route forces, by pin id (`configured:<name>` / `auto:<family>`) →
+    // { index, whenSpent, source, lastServed }. `source: 'tui'` is ephemeral,
+    // like the global manual switch (currentIndex): a runtime override that
+    // biases selection for a route's models and is gone on restart.
+    // `source: 'config'` mirrors a route's `override` and is re-seeded from the
+    // file on every reload. With `whenSpent: 'fallback'` a pinned account that
+    // becomes ineligible is skipped and routing falls back to best-available;
+    // with `'hold'` nothing else may serve the route at all.
     this.routePins = new Map();
     // Selection cursor per route (routeName → account index; '' when no route
     // matches). A single global cursor reads traffic that alternates between
@@ -704,6 +709,10 @@ export class AccountManager {
     if (account) {
       this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
       this.providerCursors.set(providerOf(account), account.index);
+      // Served from somewhere else: the forced account is away, so its return
+      // counts as a join and gets paced again.
+      const entry = this._pinForRequest(model, advisorModel);
+      if (entry && entry.pin.index !== account.index) entry.pin.lastServed = null;
     }
     return account;
   }
@@ -782,10 +791,13 @@ export class AccountManager {
       advisorModel);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
-    // account. Only when enabled, only for a real session, and only outside a
-    // manual route pin (which must still win). Falls through to the normal walk
+    // account. Only when enabled, only for a real session, and only when no
+    // route pin can take this request — a pin that CAN serve must still win,
+    // but one whose account is spent must not cost the session its affinity
+    // (the walk below honours it). Falls through to the normal walk
     // if nothing session-eligible is found (e.g. the whole tier is exhausted).
-    if (sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
+    const pinEntry = this._pinForRequest(model, advisorModel);
+    if (sessionId && !(pinEntry && this._pinServes(pinEntry.pin, model, advisorModel, exclude))) {
       if (this.distributeSessions) {
         const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
         if (acc) return acc;
@@ -819,8 +831,17 @@ export class AccountManager {
     // A manual per-route pin biases selection for that route's models (independent
     // of the global currentIndex). Honored only while eligible — otherwise we fall
     // through to normal best-available selection so requests keep flowing.
-    const pinned = this._pinnedAccountForModel(model, advisorModel);
-    if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinned.index)) return pinned;
+    const entry = this._pinForRequest(model, advisorModel);
+    if (entry && this._pinServes(entry.pin, model, advisorModel, exclude)) {
+      const account = this.accounts[entry.pin.index];
+      // Returning to the forced account after a spell elsewhere is a failover
+      // burst like any other: pace it once, on the transition only.
+      if (entry.pin.lastServed !== account.index) {
+        this._joinPolicyRamp(account);
+        entry.pin.lastServed = account.index;
+      }
+      return account;
+    }
     const current = this.accounts[this.currentIndex];
     // `model` scopes availability: an account whose Fable weekly bucket is spent
     // is still fully usable for other models, so it is only excluded when THIS
@@ -880,6 +901,13 @@ export class AccountManager {
     if (diverted) return diverted;
     const next = this._selectNext(exclude, model, advisorModel);
     if (next) return next;
+    // A held route concerns exactly one account, and the probe only ever reaches
+    // that account (every other member is barred). Its recovery is already
+    // tracked by time — a quota reset clears itself, a throttle and a cooldown
+    // expire — so probing buys nothing and would send this request upstream
+    // through the very account the hold says cannot serve it. Yield nothing so
+    // the caller answers the immediate 429 the hold contract promises.
+    if (this.heldRouteFor(model)) return null;
     // No account is under the switch threshold. Before refusing locally, allow a
     // throttled probe so a stale/poisoned cached quota can't pin us in a
     // permanent "all exhausted" state — the probe's real response refreshes the
@@ -1871,28 +1899,55 @@ export class AccountManager {
   /**
    * Normalize and store the configurable routing table. A route pins a set of
    * model globs to an exclusive set of accounts (and may override the governing
-   * quota bucket). Called from the constructor and on config reload.
-   *   { name, match: string|string[], accounts?: (name|index)[], bucket? }
+   * quota bucket, or force itself onto one account). Called from the constructor
+   * and on config reload.
+   *   { name, match: string|string[], accounts?: (name|index)[], bucket?,
+   *     override?: { account, whenSpent, since } }
+   * Returns the normaliser's warnings (also kept as `routeWarnings`) so the
+   * caller that has somewhere to put them — server start, reload — can log them.
    */
   setRoutes(routes) {
-    this.routes = (Array.isArray(routes) ? routes : []).map((r, i) => ({
-      name: r.name || `route-${i + 1}`,
-      match: (Array.isArray(r.match) ? r.match : [r.match]).filter(g => typeof g === 'string' && g),
-      accounts: Array.isArray(r.accounts) ? r.accounts.map(String) : [],
-      bucket: r.bucket || null,
-      color: r.color || null, // display-only accent for the route's inline marker
-    })).filter(r => r.match.length);
-    // Drop pins for routes that no longer exist after a reload.
-    if (this.routePins?.size) {
-      const names = new Set(this.routes.map(r => r.name));
-      for (const name of [...this.routePins.keys()]) {
-        if (name !== 'fable' && name !== 'sonnet' && !names.has(name)) this.routePins.delete(name);
-      }
-    }
+    const { routes: normalized, warnings } = normalizeRoutes(routes, this.accounts);
+    this.routes = normalized;
+    this.routeWarnings = warnings;
+    this._reconcileRoutePins();
     // A reload can rename or drop a route, stranding its cursor under a key
     // nothing resolves to. Clearing them costs one extra best-available walk per
     // route and keeps no state that outlives the table it belonged to.
     this.routeCursors?.clear();
+    return warnings;
+  }
+
+  /**
+   * Bring the pin table in line with a freshly normalised routing table.
+   *
+   * Config overrides own their pins: every `'config'` entry is dropped and
+   * re-seeded from the table, so a removed override releases the route and a
+   * changed one is not half-applied. A TUI pin survives its own reload, but
+   * only while its route does, and a config override on the same id replaces
+   * it — the file is the durable statement, the keypress is not.
+   */
+  _reconcileRoutePins() {
+    const names = new Set(this.routes.map(r => r.name));
+    const kept = new Map();
+    for (const [id, pin] of this.routePins || []) {
+      if (pin.source === 'config') continue;
+      const parsed = parsePinId(id);
+      if (parsed?.kind === 'configured' && !names.has(parsed.name)) continue;
+      kept.set(id, pin);
+    }
+    for (const route of this.routes) {
+      const override = route.override;
+      if (!override) continue;
+      const index = this.accounts.findIndex(a => a.name === override.account);
+      // The normaliser already refused an override naming an account that is
+      // not a member, so this only guards a caller that stored a table itself.
+      if (index < 0) continue;
+      kept.set(configuredPinId(route.name), {
+        index, whenSpent: override.whenSpent, source: 'config', lastServed: null,
+      });
+    }
+    this.routePins = kept;
   }
 
   /**
@@ -2497,10 +2552,16 @@ export class AccountManager {
    * `models` ownership claim (deprecated — use `routes` instead). */
   _routeAllows(account, model) {
     const route = this._routeForModel(model);
-    if (route && route.accounts.length) {
-      return route.accounts.includes(account.name) || route.accounts.includes(String(account.index));
-    }
-    return this._accountOwnsModel(account, model);
+    const member = route && route.accounts.length
+      ? route.accounts.includes(account.name) || route.accounts.includes(String(account.index))
+      : this._accountOwnsModel(account, model);
+    if (!member) return false;
+    // A held route is served by its forced account or by nobody: every other
+    // member is barred for this model, which is what turns "no account can
+    // serve" into the synthetic 429 the server answers with. Narrowing only —
+    // hold never admits an account membership already refused.
+    const pin = this._pinFor(model)?.pin;
+    return !pin || pin.whenSpent !== 'hold' || account.index === pin.index;
   }
 
   /** @deprecated Use `routes` with an `accounts` list instead.
@@ -2529,9 +2590,21 @@ export class AccountManager {
     const out = this.routes.map(r => {
       const previews = r.match.flatMap(patternPreviews).map(sample => this._routingPreview(sample, blockedModels));
       const first = previews[0];
+      const id = configuredPinId(r.name);
       return {
         name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
-        pinned: this._pinnedName(r.name), previews,
+        id, pinned: this._pinnedName(id), previews,
+        // The route's resolved membership, by name and in fleet order: index
+        // references resolved, an empty list meaning every account. Distinct
+        // from `accounts` below, which is the first preview's per-provider
+        // eligibility view — provider-filtered, so it cannot be the baseline a
+        // writer compares its `expected` against.
+        members: routeMembers(r, this.accounts).map(a => a.name),
+        // What is forcing this route right now, and whether it is working.
+        override: this._overrideRow(id, r, first?.model || null),
+        // What the file says, straight from the normalised table — never the
+        // pin, which a TUI keypress can have replaced in memory.
+        persisted: r.override ? { account: r.override.account, whenSpent: r.override.whenSpent } : null,
         accounts: first?.accounts || [], target: first?.target || null,
       };
     });
@@ -2546,9 +2619,15 @@ export class AccountManager {
     for (const d of detected) {
       if (this._routeForModel(d.sample)) continue; // already covered by a configured route
       const preview = this._routingPreview({ provider: DEFAULT_PROVIDER, model: d.sample, label: d.match[0] }, blockedModels);
+      const id = autoPinId(d.name);
       out.push({
         name: d.name, match: d.match, bucket: null, color: null, autocreated: true,
-        pinned: this._pinnedName(d.name), previews: [preview],
+        id, pinned: this._pinnedName(id), previews: [preview],
+        // An auto row has no member list at all, so every account is a member.
+        members: this.accounts.map(a => a.name),
+        // An auto row exists only while a family bucket is reported, so nothing
+        // about it is written down: a pin here is always the operator's.
+        override: this._overrideRow(id, null, d.sample), persisted: null,
         accounts: preview.accounts, target: preview.target,
       });
     }
@@ -2563,9 +2642,44 @@ export class AccountManager {
   }
 
   /** The name of the account this route is manually pinned to, or null. */
-  _pinnedName(routeName) {
-    const idx = this.routePins.get(routeName);
-    return idx == null ? null : (this.accounts[idx]?.name ?? null);
+  _pinnedName(id) {
+    const pin = this.routePins.get(id);
+    return pin == null ? null : (this.accounts[pin.index]?.name ?? null);
+  }
+
+  /**
+   * The live force on a row: who it names, and whether the route is actually
+   * being served from there.
+   *
+   *   effective   requests for this route land on the forced account
+   *   unavailable it cannot serve, and `whenSpent: 'fallback'` is serving from
+   *               somewhere else (`reason` says why it cannot)
+   *   holding     it cannot serve and nothing else may — requests get a 429
+   *   no-target   nothing at all can serve this route right now
+   *
+   * Previewed against the forced account's own provider: an Anthropic account
+   * cannot serve a Codex request at all, and previewing across that partition
+   * would report every cross-provider force as broken.
+   */
+  _overrideRow(id, route, sampleModel) {
+    const pin = this.routePins.get(id);
+    const account = pin == null ? null : this.accounts[pin.index];
+    if (!account) return null;
+    const target = sampleModel == null ? null
+      : this.previewRouteIndex(sampleModel, null, providerOf(account));
+    const effective = target === pin.index;
+    return {
+      account: account.name,
+      whenSpent: pin.whenSpent,
+      source: pin.source,
+      // Display only, and only for the entry the file owns: a TUI pin has no
+      // written history, and a config `since` describes the override on disk.
+      since: pin.source === 'config' ? (route?.override?.since ?? null) : null,
+      state: effective ? 'effective'
+        : target == null ? (pin.whenSpent === 'hold' ? 'holding' : 'no-target')
+          : 'unavailable',
+      reason: effective ? null : (this.unavailableReason(account, sampleModel) || 'not-selected'),
+    };
   }
 
   _routingPreview(sample, blockedModels = []) {
@@ -2592,65 +2706,146 @@ export class AccountManager {
     });
   }
 
-  /** A representative model id for a route name (configured or auto fable/sonnet),
-   * used to test route-allowance when pinning. Null for an unknown route. */
-  _routeSample(routeName) {
-    const r = this.routes.find(x => x.name === routeName);
-    if (r) return r.match[0]?.replace(/\*/g, '') || 'model';
-    if (routeName === 'fable') return 'claude-fable-5';
-    if (routeName === 'sonnet') return 'claude-sonnet-4-6';
-    return null;
-  }
-
   /**
-   * Manually pin a route to an account (ephemeral runtime override). Rejects an
-   * account the route's exclusivity/ownership rules disallow. Pinning an account
-   * that is merely near-quota/throttled is allowed — it acts as a preference and
-   * routing falls back to best-available until the pinned account is eligible.
+   * Force a route onto one account. `id` is a pin id — `configured:<name>` or
+   * `auto:<family>` — so a configured route named `fable` and the auto Fable row
+   * cannot share a pin. The account must be a member of the route (any account
+   * for an auto row, which has no member list). Pinning an account that is
+   * merely near-quota/throttled is allowed: with `whenSpent: 'fallback'` the
+   * route serves from elsewhere until it is eligible again, and with `'hold'`
+   * nothing else serves the route at all.
+   *
+   * `source` says who owns the entry: `'config'` for one seeded from the file
+   * (re-seeded on every reload), `'tui'` for a keypress (runtime only).
    * Returns { ok, reason? }.
    */
-  setRoutePin(routeName, accountIndex) {
+  setRoutePin(id, accountIndex, { whenSpent = 'fallback', source = 'tui' } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return { ok: false, reason: 'no such account' };
-    const sample = this._routeSample(routeName);
-    if (sample && !this._routeAllows(account, sample)) {
-      return { ok: false, reason: `route "${routeName}" does not allow "${account.name}"` };
+    if (!WHEN_SPENT.includes(whenSpent)) return { ok: false, reason: `unknown whenSpent "${whenSpent}"` };
+    const parsed = parsePinId(id);
+    if (!parsed) return { ok: false, reason: `not a route id: "${id}"` };
+    if (parsed.kind === 'configured') {
+      const route = this.routes.find(r => r.name === parsed.name);
+      if (!route) return { ok: false, reason: `no route "${parsed.name}"` };
+      if (!routeMembers(route, this.accounts).some(a => a.index === account.index)) {
+        return { ok: false, reason: `route "${parsed.name}" does not allow "${account.name}"` };
+      }
     }
-    this.routePins.set(routeName, accountIndex);
+    this.routePins.set(id, { index: accountIndex, whenSpent, source, lastServed: null });
     return { ok: true };
   }
 
-  clearRoutePin(routeName) { this.routePins.delete(routeName); }
-
-  /** The account a route is pinned to, or null. */
-  getRoutePin(routeName) {
-    const idx = this.routePins.get(routeName);
-    return idx == null ? null : (this.accounts[idx] || null);
+  /**
+   * Release an operator's pin. A config override is not the operator's to
+   * release from here — it is written in the file and the next reload would put
+   * it straight back — so it is refused with the place to clear it.
+   * Returns { ok, reason? }.
+   */
+  clearRoutePin(id) {
+    const pin = this.routePins.get(id);
+    if (pin?.source === 'config') {
+      return { ok: false, reason: 'this route is forced in the config — clear it from the dashboard' };
+    }
+    this.routePins.delete(id);
+    return { ok: true };
   }
 
-  /** The manually-pinned account governing `model`, if any: a configured route's
-   * pin wins, else an auto fable/sonnet family pin (only when no configured route
-   * covers the model). For an advisor request the executor's pin wins (it is the
-   * bulk of the spend); the advisor model's pin applies only when nothing pins
-   * the executor. Returns null when nothing is pinned for this model. */
+  /** Release a pin whatever its source. For the writer that also removes the
+   * override from the file, so the runtime stops forcing before the reload. */
+  clearAnyPin(id) {
+    return { ok: true, cleared: this.routePins.delete(id) };
+  }
+
+  /** The account a route is pinned to, or null. */
+  getRoutePin(id) {
+    const pin = this.routePins.get(id);
+    return pin == null ? null : (this.accounts[pin.index] || null);
+  }
+
+  /** The pin governing `model` as { id, pin }, or null: a configured route's pin
+   * wins, else an auto fable/sonnet family pin (only when no configured route
+   * covers the model). */
+  _pinFor(model) {
+    if (!model || !this.routePins.size) return null;
+    const route = this._routeForModel(model);
+    const ids = route
+      ? [configuredPinId(route.name)]
+      : ['fable', 'sonnet'].filter(f => modelGlobMatches(`*${f}*`, model)).map(autoPinId);
+    for (const id of ids) {
+      const pin = this.routePins.get(id);
+      if (pin && this.accounts[pin.index]) return { id, pin };
+    }
+    return null;
+  }
+
+  /** The pin this request answers to. For an advisor request the executor's pin
+   * wins (it is the bulk of the spend); the advisor model's applies only when
+   * nothing pins the executor. */
+  _pinForRequest(model, advisorModel = null) {
+    return this._pinFor(model) || (advisorModel ? this._pinFor(advisorModel) : null);
+  }
+
+  /** Can this pin take the request? Asked by the pin fast path AND by the
+   * session-distribution bypass, which used to test only that a pin existed and
+   * so skipped affinity even when the forced account could not serve. */
+  _pinServes(pin, model, advisorModel = null, exclude = null) {
+    const account = pin == null ? null : this.accounts[pin.index];
+    return !!account && !exclude?.has(pin.index) && this._isAvailable(account, model, advisorModel);
+  }
+
+  /** The manually-pinned account governing `model`, if any. Returns null when
+   * nothing is pinned for this model. */
   _pinnedAccountForModel(model, advisorModel = null) {
-    return this._pinnedFor(model)
-      || (advisorModel ? this._pinnedFor(advisorModel) : null);
+    const entry = this._pinForRequest(model, advisorModel);
+    return entry ? this.accounts[entry.pin.index] : null;
   }
 
   _pinnedFor(model) {
-    if (!model || !this.routePins.size) return null;
-    const route = this._routeForModel(model);
-    if (route) {
-      const idx = this.routePins.get(route.name);
-      return idx == null ? null : (this.accounts[idx] || null);
-    }
-    for (const name of ['fable', 'sonnet']) {
-      if (this.routePins.has(name) && modelGlobMatches(`*${name}*`, model)) {
-        return this.accounts[this.routePins.get(name)] || null;
-      }
-    }
-    return null;
+    const entry = this._pinFor(model);
+    return entry ? this.accounts[entry.pin.index] : null;
+  }
+
+  /** The live hold pin governing `model` as { id, pin }, or null. Asked instead
+   * of holdRetryAfterMs wherever the question is "is this route held", because a
+   * forced account that is disabled, errored or excluded carries no future
+   * timestamp and the route is held all the same. */
+  heldRouteFor(model) {
+    const entry = this._pinFor(model);
+    return entry?.pin.whenSpent === 'hold' ? entry : null;
+  }
+
+  /**
+   * How long until it is worth re-checking a held route, in ms, or null when
+   * nothing holds `model` or nothing on the forced account is known to move.
+   *
+   * The earliest known future timestamp on the forced account — not a promise
+   * that it can serve then. Hold answers a 429 immediately rather than waiting,
+   * so this is the retry-after the client is given.
+   */
+  holdRetryAfterMs(model, now = Date.now()) {
+    const entry = this.heldRouteFor(model);
+    const account = entry && this.accounts[entry.pin.index];
+    if (!account) return null;
+    const q = account.quota;
+    const weekly = this._windowForBucket(account, this._weeklyBucketFor(model));
+    const stamps = [
+      account.rateLimitedUntil,
+      account.entitlementDeniedUntil,
+      q.resetsAt ? new Date(q.resetsAt).getTime() : null,
+      q.unified5hReset,
+      q.unified7dReset,
+      q[`${weekly}Reset`],
+      q.scopedWeekly?.[modelFamily(model)]?.resetAt,
+    ].filter(t => Number.isFinite(t) && t > now);
+    return stamps.length ? Math.min(...stamps) - now : null;
+  }
+
+  /** Does any account still carry a deprecated per-account `models` claim? Those
+   * make membership depend on the request's model, which is the one thing an
+   * override cannot express — so forcing is refused while one exists. */
+  hasOwnershipClaims() {
+    return this.accounts.some(a => Array.isArray(a.models) && a.models.length > 0);
   }
 
   /**
@@ -3755,9 +3950,13 @@ export class AccountManager {
     }
     // Keep route pins pointing at the right account after the index shift: drop a
     // pin on the removed account, decrement pins that sat above it.
-    for (const [name, idx] of [...this.routePins.entries()]) {
-      if (idx === index) this.routePins.delete(name);
-      else if (idx > index) this.routePins.set(name, idx - 1);
+    for (const [id, pin] of [...this.routePins.entries()]) {
+      if (pin.index === index) { this.routePins.delete(id); continue; }
+      if (pin.index > index) pin.index--;
+      // `lastServed` names an account the same way. Left behind it would name
+      // whichever account inherited the slot and suppress the ramp on a return.
+      if (pin.lastServed === index) pin.lastServed = null;
+      else if (pin.lastServed > index) pin.lastServed--;
     }
     // Same for the selection cursors: a cursor on the removed account is dropped
     // so the route re-picks, and one above it follows the shift.
@@ -3891,6 +4090,10 @@ export class AccountManager {
         models: ['claude-opus-5', 'claude-sonnet-4-6', 'claude-haiku-4-5'].map(model => this._fableRoutingStatus(model)),
       },
       routes: this.getRoutes({ blockedModels }),
+      // Why forcing a route is refused right now, or null. A per-account
+      // `models` claim makes membership depend on the request's model, which an
+      // override cannot express — so the page says so before anything is set.
+      forceBlocked: this.hasOwnershipClaims() ? { reason: 'ownership-claims' } : null,
       providerRouting: this.getProviderRouting({ blockedModels }),
       sessions: { ...sessions, scope: 'claude-session-header', distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
       // Empty outside adaptive mode, so the renderer needs no mode check of its
