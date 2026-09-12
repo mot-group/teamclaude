@@ -256,13 +256,21 @@ test('pending evaluation evidence is retained by age but evicted within the disk
     assert.equal((await history.call('scores')).length, 1, 'pending audit evidence does not expire at 90 days');
     assert.equal((await history.call('summaries')).length, 1);
     assert.equal((await history.load(now - 90 * DAY)).length, 1, 'compaction retains the current observation');
-    for (let i = 0; i < 40; i++) await history.append({ kind: 'outcome', id: `large-${i}`, at: now + i,
-      subscription: key, pending: true, evidence: 'x'.repeat(8000) });
+    for (let i = 0; i < 40; i++) {
+      const prediction = { kind: 'prediction', id: `pred-${i}`, at: now + i, subscription: key, pending: true, evidence: 'x'.repeat(8000) };
+      await history.append(prediction);
+      await history.call('settle', { record: { kind: 'outcome', id: `large-${i}`, at: now + i,
+        subscription: key, pending: true, predictionId: prediction.id, prediction } });
+    }
+    assert.equal((await history.call('pending')).length, 0);
     const coverage = await history.call('coverage');
     assert.ok(coverage.counts.outcome > 0);
     assert.equal(coverage.evaluationGateDeferred, true);
     assert.ok((await stat(file)).size <= 256 * 1024);
     assert.equal((await stat(file)).mode & 0o777, 0o600);
+    for (let i = 0; i < 40; i++) await history.append({ kind: 'prediction', id: `unsettled-${i}`, at: now + i,
+      subscription: key, pending: true, evidence: 'x'.repeat(8000) });
+    assert.ok((await history.call('coverage')).counts.prediction > 0, 'unsettled evidence is also bounded as a last resort');
     await history.append({ kind: 'outcome', id: 'still-writable', at: now + DAY, pending: true });
   } finally { await history.close(); await rm(dir, { recursive: true, force: true }); }
 });

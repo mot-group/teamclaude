@@ -23,7 +23,8 @@ try {
   } catch (err) {
     if (err.code !== 'ERR_UNKNOWN_BUILTIN_MODULE') throw err;
     const run = sql => {
-      const settings = pageLimit ? `.output /dev/null\nPRAGMA max_page_count=${pageLimit}; PRAGMA synchronous=FULL;\n.output stdout\n` : '';
+      const nullOutput = process.platform === 'win32' ? 'NUL' : '/dev/null';
+      const settings = pageLimit ? `.output ${nullOutput}\nPRAGMA max_page_count=${pageLimit}; PRAGMA synchronous=FULL;\n.output stdout\n` : '';
       const result = spawnSync('sqlite3', ['-batch', '-json', workerData.file], {
         input: `.timeout 2000\n${settings}${sql}`, encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024,
       });
@@ -35,8 +36,8 @@ try {
   }
   const pageSize = Object.values(query('PRAGMA page_size;')[0])[0];
   pageLimit = Math.max(1, Math.floor((maxBytes / 2 - 65536) / pageSize));
-  if (fresh) execute('PRAGMA auto_vacuum=INCREMENTAL;');
-  execute(`PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=2000;
+  execute(`${fresh ? 'PRAGMA auto_vacuum=INCREMENTAL;' : ''}
+    PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=2000;
     PRAGMA max_page_count=${pageLimit};
     CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, kind TEXT NOT NULL, at INTEGER NOT NULL,
       subscription TEXT, pending INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL);
@@ -45,7 +46,7 @@ try {
   chmodSync(workerData.file, 0o600);
   const integrity = query('PRAGMA quick_check;');
   if (Object.values(integrity[0] || {})[0] !== 'ok') throw new Error('Corrupt history');
-  const loadRecords = (where, order = 'at DESC') => {
+  const loadRecords = (where, order = 'at DESC, id DESC') => {
     const rows = [];
     for (let offset = 0; offset < 20000; offset += 250) {
       const page = query(`SELECT data FROM records WHERE ${where} ORDER BY ${order} LIMIT 250 OFFSET ${offset};`);
@@ -57,13 +58,14 @@ try {
   const trimBudget = (incomingBytes = 0) => {
     let loss = JSON.parse(query("SELECT data FROM records WHERE id='coverage-loss';")[0]?.data || '{"counts":{},"subscriptions":[]}');
     let changed = false;
-    for (let attempt = 0; attempt < 200; attempt++) {
+    for (let attempt = 0; attempt < 16; attempt++) {
       const pages = Object.values(query('PRAGMA page_count;')[0])[0];
       const free = Object.values(query('PRAGMA freelist_count;')[0])[0];
       if ((pages - free) * pageSize + incomingBytes * 2 < pageLimit * pageSize * 0.8) break;
-      const victims = query(`SELECT id, kind, subscription FROM records WHERE kind IN ('forecast','summary','outcome','observation')
+      const victims = query(`SELECT id, kind, subscription FROM records WHERE kind IN ('forecast','summary','outcome','observation','prediction')
         AND (kind != 'observation' OR at < (SELECT MAX(a.at) FROM records a WHERE a.kind='observation' AND a.subscription=records.subscription))
-        ORDER BY pending, CASE kind WHEN 'forecast' THEN 0 WHEN 'summary' THEN 1 WHEN 'observation' THEN 2 ELSE 3 END, at LIMIT 128;`);
+        ORDER BY pending, CASE WHEN kind='prediction' AND pending=0 THEN 0 WHEN kind='forecast' THEN 1
+          WHEN kind='summary' THEN 2 WHEN kind='observation' THEN 3 WHEN kind='outcome' THEN 4 ELSE 5 END, at LIMIT 512;`);
       if (!victims.length) break;
       for (const row of victims) {
         loss.counts[row.kind] = (loss.counts[row.kind] || 0) + 1;
@@ -97,13 +99,13 @@ try {
       } else if (message.op === 'load') {
         result = loadRecords(`kind='observation' AND at >= ${Math.floor(message.since)}`).reverse();
       } else if (message.op === 'pending') {
-        result = loadRecords("kind='prediction' AND pending=1", 'at');
+        result = loadRecords("kind='prediction' AND pending=1", 'at, id');
       } else if (message.op === 'settle') {
         const r = message.record;
         trimBudget(Buffer.byteLength(JSON.stringify(r)));
         execute(`BEGIN; INSERT OR IGNORE INTO records VALUES (${quote(r.id)},'outcome',${Math.floor(r.at)},
           ${quote(r.subscription)},1,${quote(JSON.stringify(r))});
-          UPDATE records SET pending=0 WHERE id=${quote(r.predictionId)}; COMMIT;`);
+          DELETE FROM records WHERE id=${quote(r.predictionId)} AND kind='prediction'; COMMIT;`);
       } else if (message.op === 'scores') {
         result = loadRecords("kind='outcome'");
       } else if (message.op === 'coverage') {
@@ -117,6 +119,7 @@ try {
             (SELECT MAX(a.at) FROM records a WHERE a.subscription=r.subscription AND a.kind='observation'));
           DELETE FROM records WHERE kind='summary' AND id NOT IN
             (SELECT MIN(id) FROM records WHERE kind='summary' GROUP BY subscription, CAST(at / 300000 AS INTEGER));
+          DELETE FROM records WHERE kind='prediction' AND pending=0;
           DELETE FROM records WHERE pending=0 AND kind != 'observation' AND at < ${Math.floor(message.now - 90 * day)};
           PRAGMA incremental_vacuum;`);
         trimBudget();

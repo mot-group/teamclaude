@@ -108,6 +108,7 @@ export class ForecastService {
           meanAbsoluteError: mean('error'), lastValueError: mean('lastValueError'), linearError: mean('linearError'),
           independentExhaustions: 0, calibrated: false, experimental: true };
         this.snapshot.coverage.historyEvictions = this.coverageLoss || null;
+        this.snapshot.coverage.pendingPredictionLimitReached = this.predictionLimitReached || false;
         if (this.manager.accounts.length > 100 || this.records.length >= 20000) {
           this.snapshot.coverage.limitReached = true;
         }
@@ -119,6 +120,11 @@ export class ForecastService {
             subscription: null, snapshot }).catch(() => { this.error = 'History storage failed'; });
           const pending = predictions(snapshot, this.records, (this.config.quotaProbeSeconds || 0) * 1000);
           this.predictions.push(...pending);
+          if (this.predictions.length > 20000) {
+            this.predictions = this.predictions.slice(-20000);
+            this.predictionLimitReached = true;
+            this.snapshot.coverage.pendingPredictionLimitReached = true;
+          }
           this.history.call('appendMany', { records: pending }).catch(() => { this.error = 'History storage failed'; });
           this.history.compact(this.now()).then(() => this.history.call('coverage'))
             .then(loss => { this.coverageLoss = loss; }).catch(() => { this.error = 'History storage failed'; });

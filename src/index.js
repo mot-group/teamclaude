@@ -804,12 +804,12 @@ async function serverCommand() {
     warmer?.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
-    await forecast?.close();
+    setTimeout(() => process.exit(0), 2000).unref?.();
     await persistQuotaState();
+    await forecast?.close();
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
     // short grace period in case anything still hangs.
-    setTimeout(() => process.exit(0), 2000).unref?.();
     server.closeAllConnections?.();
     server.close(() => process.exit(0));
   }
