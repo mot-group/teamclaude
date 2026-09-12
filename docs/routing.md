@@ -163,6 +163,34 @@ teamclaude route rm fable
 
 **Manual per-route switching (TUI).** Press **`s`** to switch accounts, then **`←`**/**`→`** (or **`Tab`**) to choose *what* you're switching: the global **default** account, or a specific **route**. Pick an account with `↑`/`↓` and **`Enter`** to pin that route to it; `Enter` again on the current pin clears it. Pins are a **runtime preference** — not saved to config — and routing **falls back** to normal best-available selection whenever the pinned account is throttled or over quota, so a pin never stalls requests.
 
+### Overrides: force a route onto one account
+
+A route can carry an `override`, which sends every request the route matches to one account:
+
+```json
+{ "name": "codex-default", "match": ["gpt-*", "*codex*"], "accounts": ["factorlin codex", "codex-2"],
+  "override": { "account": "factorlin codex", "whenSpent": "fallback", "since": 1789189000000 } }
+```
+
+- **`account`** — a member of this route, by name. An account outside `accounts[]`, or one that no longer exists, drops the override on the next load with a warning in the log; the route keeps routing normally.
+- **`whenSpent`** — what happens when the forced account cannot serve, whether it is over its threshold, in a rate-limit hold, in an entitlement cooldown, failing or disabled. `"fallback"` runs the normal walk over the route's other members and comes back to the forced account as soon as it is eligible. `"hold"` lets nobody else serve the route: a request that finds the forced account unavailable gets a 429 straight away, with a retry-after derived from that account's known reset and throttle timestamps. A held route never enters the [`holdSeconds`](quota.md#hold-on-exhaustion) silent wait.
+- **`since`** — epoch milliseconds, written when the override was applied. Display only.
+
+There is no timer. The override stays until you clear it, from the dashboard's Force dialog or by deleting the field from the config. Set and clear it from the [dashboard](usage.md#status-dashboard-browser); the CLI has no `route force`.
+
+Four things are worth knowing before you rely on it.
+
+**Quota probes still reach a held account.** `hold` governs client traffic only. The probe path keeps sending its own request to the spent account, which is how the proxy finds out that it has recovered.
+
+**`TC_ACCT` wins.** An explicit [session pin](#pin-a-session-to-one-account) bypasses routes altogether, so a pinned session ignores the override.
+
+**Per-account `models` claims block forcing.** While any account still carries the deprecated per-account `models` list, route membership depends on the request's model, and the proxy refuses to set an override. Replace the claim with a route and reload. Clearing an override is never refused.
+
+**TUI pins are runtime only.** Pressing `s` in the TUI pins a route for this process; nothing is written to the config, and the next reload replaces the pin with whatever the config says. The dashboard chip marks such a pin "from the TUI, until restart". The TUI refuses to clear a pin that came from the config, and says so; clear that one from the dashboard.
+
+One limit is inherited from every other route writer. `teamclaude route add` runs in a **second process**. The dashboard sends the route's definition as it last saw it and the server refuses the write when a fresh read of the config no longer matches, but a CLI edit landing between that check and the file write is not locked out. Editing routes from two places at the same moment can still lose one of the two edits.
+
+
 ## Session-aware routing
 
 TeamClaude always tracks running Claude Code sessions by their `x-claude-code-session-id` header — the TUI header and `teamclaude status` show how many are **active** (a request in flight right now, or seen in the last ~2 min) and **known** (seen in the last hour; sessions are forgotten after an hour idle, the maximum prompt-cache extension window). A long streaming request keeps its session active and non-expirable for its whole duration, so a multi-minute completion still counts as load. This is passive: it observes, it doesn't change routing.
