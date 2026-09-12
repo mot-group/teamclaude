@@ -14,6 +14,8 @@ import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { pinId } from './routes.js';
+import { atomicConfigUpdate } from './config.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -412,12 +414,17 @@ export class TUI {
     readCredentials = importCredentials, readProfile = fetchProfile,
     // Names the activity column against the session id the client sent. Absent
     // or disabled leaves every row showing the short id.
-    sessionTitles = null }) {
+    sessionTitles = null,
+    // Read-modify-write of the config on disk. The routes editor edits the file
+    // itself rather than the in-memory table, so it needs the serialised
+    // updater; injectable so a test can drive the editor without a real config.
+    updateConfig = atomicConfigUpdate }) {
     this.am = accountManager;
     this.remote = remote;
     this.applySwitch = applySwitch;
     this.config = config;
     this.saveConfig = saveConfig;
+    this.updateConfig = updateConfig;
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
     this.sx = sx;            // sx.org proxy manager (may be null)
@@ -921,7 +928,10 @@ export class TUI {
     else if (k === 'left' && this.selAction === 'switch' && !this.remote) this._cycleSelRoute(-1);
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
-        this._doSwitchSelection();
+        // A refusal (the account is not a member, the pin is the config's)
+        // leaves the picker open so the operator can choose again — the reason
+        // is in the log and the highlighted account is still under the cursor.
+        if (this._doSwitchSelection() === false) return;
       } else if (this.selAction === 'toggle') {
         this._doToggleDisabled(this.selIdx);
       } else {
@@ -946,36 +956,45 @@ export class TUI {
 
   // Apply an Enter in switch mode: with no route selected this sets the global
   // default account; with a route selected it pins/unpins that route to the
-  // highlighted account. On a rejected pin we stay in select mode so the user can
-  // retry, rather than silently returning to normal.
+  // highlighted account. Returns false when the manager refused, and the caller
+  // then leaves select mode open so the user can retry rather than silently
+  // returning to normal.
   _doSwitchSelection() {
     const acct = this.am.accounts[this.selIdx];
     // The list can shrink under the cursor between polls in attach mode. Say so
     // rather than swallowing the keypress.
-    if (!acct) { this.mode = 'normal'; this._addLog('That account is no longer listed'); return; }
+    if (!acct) { this.mode = 'normal'; this._addLog('That account is no longer listed'); return true; }
     // Attach mode: the rotation lives in another process, so this is a request
     // whose result the next poll reflects, not a local assignment.
-    if (this.applySwitch) { this.mode = 'normal'; this._doSwitchRemote(acct); return; }
+    if (this.applySwitch) { this.mode = 'normal'; this._doSwitchRemote(acct); return true; }
     if (this.selRoute === null) {
       this.am.setCurrentAccount(this.selIdx);
       this._addLog(`Switched to "${acct.name}"`);
       this.mode = 'normal';
-      return;
+      return true;
     }
     const name = this.selRoute.name;
-    if (this.am.getRoutePin(name) === acct) {
-      this.am.clearRoutePin(name); // Enter on the current pin toggles it off
+    // Pins are keyed by route identity, not by name: a configured route called
+    // `fable` and the auto Fable row are two rows and must be two pins.
+    const id = pinId(this.selRoute);
+    if (this.am.getRoutePin(id) === acct) {
+      const cleared = this.am.clearRoutePin(id); // Enter on the current pin toggles it off
+      if (!cleared?.ok) {
+        this._addLog(`Can't unpin: ${cleared?.reason || 'refused'}`);
+        return false; // stay in select mode
+      }
       this._addLog(`Unpinned route "${name}"`);
       this.mode = 'normal';
-      return;
+      return true;
     }
-    const res = this.am.setRoutePin(name, this.selIdx);
+    const res = this.am.setRoutePin(id, this.selIdx);
     if (res.ok) {
       this._addLog(`Pinned "${acct.name}" for route "${name}"`);
       this.mode = 'normal';
-    } else {
-      this._addLog(`Can't pin: ${res.reason}`); // stay in select mode to retry
+      return true;
     }
+    this._addLog(`Can't pin: ${res.reason}`);
+    return false; // stay in select mode to retry
   }
 
   // Ask the running server to switch. A failure is reported as one, so the
@@ -1931,39 +1950,71 @@ export class TUI {
     });
   }
 
+  /**
+   * Write one route edit through disk.
+   *
+   * The row on disk is the base and the draft is applied over it, found by the
+   * name the edit STARTED from so a rename still lands on the right row. Fields
+   * the editor owns are deleted when the draft clears them; everything else the
+   * row carries — `override` above all — survives untouched, which it did not
+   * when the editor rebuilt the route from its four known fields. Nothing is
+   * published until the write commits: publishing first left the rotation
+   * running a table that a failed write never put on disk.
+   */
   async _routeSave(draft, orig) {
-    const route = { name: draft.name, match: splitCsv(draft.match) };
+    const origName = orig?.name || null;
+    const name = draft.name;
+    const match = splitCsv(draft.match);
     const accounts = splitCsv(draft.accounts);
-    if (accounts.length) route.accounts = accounts;
-    if (draft.bucket) route.bucket = draft.bucket;
+    let color = null;
     if (draft.color) {
-      if (isRouteColor(draft.color)) route.color = draft.color.toLowerCase();
+      if (isRouteColor(draft.color)) color = draft.color.toLowerCase();
       else this._addLog(`Unknown color "${draft.color}" — using default`);
     }
 
-    this.config.routes = this.config.routes || [];
-    const at = orig ? this.config.routes.indexOf(orig)
-      : this.config.routes.findIndex(r => r.name === route.name);
-    if (at >= 0) this.config.routes[at] = route; else this.config.routes.push(route);
-
-    this.am.setRoutes(this.config.routes); // apply to the running rotation immediately
-    try { await this.saveConfig(this.config); this._addLog(`Route "${route.name}" saved`); }
-    catch (e) { this._addLog(`Failed to save route: ${e.message}`); }
+    let at = -1;
+    try {
+      const committed = await this.updateConfig(async disk => {
+        disk.routes = Array.isArray(disk.routes) ? disk.routes : [];
+        at = disk.routes.findIndex(r => r.name === (origName ?? name));
+        const route = { ...(at >= 0 ? disk.routes[at] : {}), name, match };
+        if (accounts.length) route.accounts = accounts; else delete route.accounts;
+        if (draft.bucket) route.bucket = draft.bucket; else delete route.bucket;
+        if (color) route.color = color; else delete route.color;
+        if (at >= 0) disk.routes[at] = route;
+        else { disk.routes.push(route); at = disk.routes.length - 1; }
+      });
+      this.config.routes = committed.routes || [];
+      this._publishRoutes();
+      this._addLog(`Route "${name}" saved`);
+    } catch (e) {
+      this._addLog(`Failed to save route: ${e.message}`);
+    }
     this.mode = 'routes';
-    this.routeIdx = at >= 0 ? at : this.config.routes.length - 1;
+    this.routeIdx = Math.max(0, at);
     if (this.running) this.render();
   }
 
   async _routeDelete(idx) {
-    const routes = this.config.routes || [];
-    const r = routes[idx];
+    const r = (this.config.routes || [])[idx];
     if (!r) return;
-    routes.splice(idx, 1);
-    this.am.setRoutes(routes);
-    try { await this.saveConfig(this.config); this._addLog(`Route "${r.name}" deleted`); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
-    this.routeIdx = Math.max(0, Math.min(idx, routes.length - 1));
+    try {
+      const committed = await this.updateConfig(async disk => {
+        disk.routes = (Array.isArray(disk.routes) ? disk.routes : []).filter(x => x.name !== r.name);
+      });
+      this.config.routes = committed.routes || [];
+      this._publishRoutes();
+      this._addLog(`Route "${r.name}" deleted`);
+    } catch (e) {
+      this._addLog(`Failed to save: ${e.message}`);
+    }
+    this.routeIdx = Math.max(0, Math.min(idx, (this.config.routes || []).length - 1));
     if (this.running) this.render();
+  }
+
+  /** Hand the committed table to the running rotation, saying what it refused. */
+  _publishRoutes() {
+    for (const warning of this.am.setRoutes(this.config.routes) || []) this._addLog(warning);
   }
 
   _keyBlocklist(k) {

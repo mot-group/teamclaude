@@ -201,7 +201,7 @@ test('previewRouteIndex honors a pin, and falls back when the pin is ineligible'
   const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98);
   const future = Date.now() + 3600_000;
   for (const acc of am.accounts) { acc.quota.unified7dFable = 0.2; acc.quota.unified7dFableReset = future; }
-  am.setRoutePin('fable', 2);                                   // pin c
+  am.setRoutePin('auto:fable', 2);                                   // pin c
   assert.equal(am.accounts[am.previewRouteIndex(FABLE)].name, 'c');
   am.accounts[2].quota.unified7dFable = 1.0;                    // c's Fable now spent
   assert.notEqual(am.accounts[am.previewRouteIndex(FABLE)].name, 'c', 'pin ineligible → fallback');

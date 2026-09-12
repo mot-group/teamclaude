@@ -238,3 +238,38 @@ test('an entry whose account is gone keeps its own credential on a save', async 
   assert.equal(saved[0].accessToken, 't-a', 'no live credential to write, so the entry keeps its own');
   assert.equal(saved[1].accessToken, 't-b', 'and the surviving account still writes to its own entry');
 });
+
+// `models` is the deprecated per-account ownership claim. It is the one field an
+// operator clears to migrate to a route, and the force control refuses to work
+// while any claim is live — so a save that writes a cleared claim back to disk
+// undoes the migration, and a reload that ignores the clearing keeps refusing.
+
+test('a save does not resurrect a models claim that disk no longer has', async () => {
+  const { config, am } = await startup([
+    { name: 'a@example.com', type: 'apikey', apiKey: 'k1', models: ['claude-opus-4'] },
+  ]);
+  const disk = [{ ...config[0] }];
+  delete disk[0].models; // migrated to a route by hand while the server ran
+
+  const saved = mergeAccountsForSave(config, am.accounts, disk);
+  assert.equal(Object.hasOwn(saved[0], 'models'), false);
+  assert.equal(saved[0].apiKey, 'k1', 'the rest of the entry is untouched');
+});
+
+test('a reload picks up a models claim being added and cleared', async () => {
+  const config = [{ name: 'a@example.com', type: 'apikey', apiKey: 'k1' }];
+  const { am } = await startup(config);
+  assert.equal(am.hasOwnershipClaims(), false);
+
+  const disk = [{ ...config[0], models: ['claude-opus-4'] }];
+  await syncAccountsFromDisk({ accounts: disk }, { accounts: config }, am);
+  assert.deepEqual(am.accounts[0].models, ['claude-opus-4']);
+  assert.equal(am.hasOwnershipClaims(), true, 'forcing a route is refused while the claim is live');
+  assert.deepEqual(config[0].models, ['claude-opus-4'], 'mirrored, so the next save keeps it');
+
+  delete disk[0].models;
+  await syncAccountsFromDisk({ accounts: disk }, { accounts: config }, am);
+  assert.equal(am.accounts[0].models, null);
+  assert.equal(am.hasOwnershipClaims(), false, 'the refusal lifts without a restart');
+  assert.equal(Object.hasOwn(config[0], 'models'), false);
+});

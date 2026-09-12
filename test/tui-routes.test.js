@@ -8,28 +8,42 @@ const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 // Minimal AccountManager stand-in for the routes editor: it only needs the
 // surface the editor touches (accounts, setRoutes). render() is stubbed out so
 // these tests exercise the editor state machine, not the terminal renderer.
-function makeTUI({ routes = [] } = {}) {
+// `disk` stands in for the config file: the editor edits it through
+// updateConfig (the real atomicConfigUpdate) rather than writing the in-memory
+// table, so the fixture has to be a file, not a mirror of `config`.
+function makeTUI({ routes = [], disk = null, refuseClear = false } = {}) {
   const applied = { routes: null };
-  const pins = { calls: [], byName: new Map() };
+  const pins = { calls: [], byId: new Map() };
   const am = {
     accounts: [{ name: 'a', index: 0 }, { name: 'b', index: 1 }],
     currentIndex: 0,
     switchThreshold: 0.98,
-    setRoutes(r) { applied.routes = r; },
+    setRoutes(r) { applied.routes = r; return []; },
     getRoutes() { return routes; },
-    setRoutePin(name, idx) { pins.calls.push(['set', name, idx]); pins.byName.set(name, this.accounts[idx]); return { ok: true }; },
-    clearRoutePin(name) { pins.calls.push(['clear', name]); pins.byName.delete(name); },
-    getRoutePin(name) { return pins.byName.get(name) || null; },
+    setRoutePin(id, idx) { pins.calls.push(['set', id, idx]); pins.byId.set(id, this.accounts[idx]); return { ok: true }; },
+    clearRoutePin(id) {
+      pins.calls.push(['clear', id]);
+      if (refuseClear) return { ok: false, reason: 'forced in the config' };
+      pins.byId.delete(id);
+      return { ok: true };
+    },
+    getRoutePin(id) { return pins.byId.get(id) || null; },
   };
   const saved = { routes: null };
-  const config = { proxy: { port: 1 }, routes: [] };
+  const file = disk || { proxy: { port: 1 }, routes: [] };
+  const config = { proxy: { port: 1 }, routes: JSON.parse(JSON.stringify(file.routes || [])) };
   const tui = new TUI({
     accountManager: am, config, sx: null,
     saveConfig: async (c) => { saved.routes = JSON.parse(JSON.stringify(c.routes)); },
+    updateConfig: async (updater) => {
+      await updater(file);
+      saved.routes = JSON.parse(JSON.stringify(file.routes));
+      return JSON.parse(JSON.stringify(file));
+    },
     syncAccounts: async () => 0, onQuit: () => {},
   });
   tui.render = () => {}; // bypass terminal rendering
-  return { tui, config, applied, saved, pins };
+  return { tui, config, applied, saved, pins, file };
 }
 
 const type = (tui, s) => { for (const ch of s) tui._key(ch); };
@@ -88,8 +102,7 @@ test('TUI routes editor: a blank name cancels without creating a route', async (
 });
 
 test('TUI routes editor: edit prefills the pickers from the existing route', async () => {
-  const { tui, config } = makeTUI();
-  config.routes = [{ name: 'fable', match: ['*fable*'], accounts: ['b'] }];
+  const { tui, config } = makeTUI({ disk: { routes: [{ name: 'fable', match: ['*fable*'], accounts: ['b'] }] } });
 
   openRoutes(tui); tui.routeIdx = 0; tui._key('e');
   assert.equal(tui.inputBuf, 'fable');          // name prefilled
@@ -143,7 +156,7 @@ test('TUI switch mode: Tab targets a route and Enter pins the highlighted accoun
   assert.equal(tui.selRoute?.name, 'fable');
   tui._key('down');                    // highlight account b (index 1)
   tui._key('enter');
-  assert.deepEqual(pins.calls, [['set', 'fable', 1]]);
+  assert.deepEqual(pins.calls, [['set', 'auto:fable', 1]]);
   assert.equal(tui.mode, 'normal');
 });
 
@@ -153,12 +166,12 @@ test('TUI switch mode: Enter on the current pin clears it (toggle off)', () => {
     accounts: [{ name: 'a', eligible: true }, { name: 'b', eligible: true }],
   }];
   const { tui, pins } = makeTUI({ routes });
-  pins.byName.set('fable', tui.am.accounts[0]); // a is already pinned
+  pins.byId.set('auto:fable', tui.am.accounts[0]); // a is already pinned
 
   tui._key('s');
   tui._key('tab');                     // target fable
   tui._key('enter');                   // Enter on account a (the current pin)
-  assert.deepEqual(pins.calls, [['clear', 'fable']]);
+  assert.deepEqual(pins.calls, [['clear', 'auto:fable']]);
   assert.equal(tui.mode, 'normal');
 });
 
@@ -228,11 +241,90 @@ test('TUI: the F7 (Fable) marker sits on exactly one account — the routing tar
 });
 
 test('TUI routes editor: delete removes the selected route', async () => {
-  const { tui, config, applied } = makeTUI();
-  config.routes = [{ name: 'fable', match: ['*fable*'] }, { name: 'bulk', match: ['*opus*'] }];
+  const { tui, config, applied } = makeTUI({
+    disk: { routes: [{ name: 'fable', match: ['*fable*'] }, { name: 'bulk', match: ['*opus*'] }] },
+  });
 
   openRoutes(tui); tui.routeIdx = 0; tui._key('d');
   await settle();
   assert.deepEqual(config.routes, [{ name: 'bulk', match: ['*opus*'] }]);
   assert.deepEqual(applied.routes, config.routes);
+});
+
+// ── the editor writes through disk ──────────────────────────
+
+test('TUI routes editor: a rename keeps the force written on the route', async () => {
+  const file = {
+    routes: [{
+      name: 'fable', match: ['*fable*'], accounts: ['b'],
+      override: { account: 'b', whenSpent: 'hold', since: 17 },
+    }],
+  };
+  const { tui, config, applied } = makeTUI({ disk: file });
+
+  openRoutes(tui); tui.routeIdx = 0; tui._key('e');
+  type(tui, '-renamed'); tui._key('enter');   // name: fable-renamed
+  tui._key('enter');                          // glob unchanged
+  tui._key('enter');                          // accounts unchanged
+  tui._key('enter');                          // bucket: auto
+  tui._key('enter');                          // color: default
+  await settle();
+
+  assert.deepEqual(file.routes, [{
+    name: 'fable-renamed', match: ['*fable*'], accounts: ['b'],
+    override: { account: 'b', whenSpent: 'hold', since: 17 },
+  }], 'the row is edited by its original name and everything else survives');
+  assert.deepEqual(config.routes, file.routes);
+  assert.deepEqual(applied.routes, file.routes, 'published after the commit');
+});
+
+test('TUI routes editor: an edit from a stale in-memory table keeps the disk-only route', async () => {
+  const file = { routes: [{ name: 'fable', match: ['*fable*'] }, { name: 'later', match: ['*opus*'] }] };
+  const { tui, config } = makeTUI({ disk: file });
+  config.routes = [{ name: 'fable', match: ['*fable*'] }]; // 'later' arrived after this table was read
+
+  openRoutes(tui); tui.routeIdx = 0; tui._key('e');
+  tui._key('enter'); tui._key('enter'); tui._key('enter'); tui._key('enter'); tui._key('enter');
+  await settle();
+
+  assert.deepEqual(file.routes.map(r => r.name), ['fable', 'later']);
+});
+
+test('TUI routes editor: a failed write publishes nothing', async () => {
+  const { tui, applied } = makeTUI();
+  tui.updateConfig = async () => { throw new Error('disk full'); };
+
+  openRoutes(tui); tui._key('a');
+  type(tui, 'r'); tui._key('enter');
+  type(tui, '*opus*'); tui._key('enter');
+  tui._key('enter'); tui._key('enter'); tui._key('enter');
+  await settle();
+
+  assert.equal(applied.routes, null, 'the rotation never saw a table disk refused');
+  assert.ok(tui.log.some(l => /disk full/.test(l.msg)), 'the failure is reported');
+});
+
+test('TUI routes editor: delete removes the route from disk by name', async () => {
+  const file = { routes: [{ name: 'fable', match: ['*fable*'] }, { name: 'bulk', match: ['*opus*'] }] };
+  const { tui, config } = makeTUI({ disk: file });
+  openRoutes(tui); tui.routeIdx = 0; tui._key('d');
+  await settle();
+  assert.deepEqual(file.routes, [{ name: 'bulk', match: ['*opus*'] }]);
+  assert.deepEqual(config.routes, file.routes);
+});
+
+test('TUI switch mode: a refused unpin stays in switch mode and says why', () => {
+  const routes = [{
+    name: 'bulk', match: ['*opus*'], pinned: 'a',
+    accounts: [{ name: 'a', eligible: true }, { name: 'b', eligible: true }],
+  }];
+  const { tui, pins } = makeTUI({ routes, refuseClear: true });
+  pins.byId.set('configured:bulk', tui.am.accounts[0]);
+
+  tui._key('s');
+  tui._key('tab');
+  tui._key('enter'); // Enter on the pinned account = unpin
+  assert.deepEqual(pins.calls, [['clear', 'configured:bulk']]);
+  assert.equal(tui.mode, 'select', 'the operator can pick again');
+  assert.ok(tui.log.some(l => /Can't unpin/.test(l.msg)));
 });

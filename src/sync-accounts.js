@@ -108,6 +108,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // to the fleet default instead of sticking on the old value.
     mgr.upstream = diskAcct.upstream || null;
     mgr.modelMap = diskAcct.modelMap || null;
+    // The deprecated ownership claim decides which accounts may serve a model,
+    // and selection reads it off this object. Without picking up the edit,
+    // migrating an account to a route needed a restart to take effect — and the
+    // force control, which refuses while any claim is live, stayed refused.
+    mgr.models = diskAcct.models?.length ? diskAcct.models : null;
     // Mirror onto the memConfig entry: the TUI save stencil rebuilds
     // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
     // so a stale key there would win the spread and silently overwrite this
@@ -119,6 +124,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
+      if (diskAcct.models?.length) cfgAcct.models = diskAcct.models; else delete cfgAcct.models;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;

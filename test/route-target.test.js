@@ -18,7 +18,7 @@ test('a route names the account it currently resolves to', () => {
   });
   assert.equal(byName(am.getRoutes(), 'bulk').target, 'a');
 
-  am.setRoutePin('bulk', 1);
+  am.setRoutePin('configured:bulk', 1);
   assert.equal(byName(am.getRoutes(), 'bulk').target, 'b'); // pin moves the target
 });
 

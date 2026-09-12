@@ -260,7 +260,7 @@ test('a route-pinned request does not advance the current account\'s reading ove
   bucket(am, 1, 'unified7d', 0.4, 10);
   serve(am, null, OPUS);
   rollWindow(am, 0);
-  assert.equal(am.setRoutePin('fable', 0).ok, true);
+  assert.equal(am.setRoutePin('auto:fable', 0).ok, true);
   // Route-pinned traffic flows, and the current walk's comparison is untouched.
   serve(am, null, FABLE);
   assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true);
