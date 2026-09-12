@@ -681,7 +681,7 @@ const PAGE = `<!doctype html>
 <div id="app" style="display:none">
   <aside class="sidebar"><a class="brand" href="#overview"><i class="brand-mark" aria-hidden="true"></i>TeamClaude</a>
     <p class="nav-label">Monitor</p>
-    <nav aria-label="Dashboard sections"><a href="#overview" data-view="overview" aria-current="page">Overview</a><a href="#accounts" data-view="accounts">Accounts</a><a href="#activity" data-view="activity">Activity</a><a href="#routing" data-view="routing">Routing</a><a href="#resets" data-view="resets">Resets</a><a href="#diagnostics" data-view="diagnostics">Diagnostics</a></nav>
+    <nav aria-label="Dashboard sections"><a href="#overview" data-view="overview" aria-current="page">Overview</a><a href="#accounts" data-view="accounts">Accounts</a><a href="#activity" data-view="activity">Activity</a><a href="#routing" data-view="routing">Routing</a><a href="#resets" data-view="resets">Resets</a><a href="#forecast" data-view="forecast">Forecast</a><a href="#diagnostics" data-view="diagnostics">Diagnostics</a></nav>
   </aside>
   <main id="mainContent" class="main-content">
     <header class="topline"><div><div class="eyebrow" id="breadcrumb">Dashboard / Overview</div><h1 id="pageTitle">Routing & capacity</h1><p class="sub" id="summary">Where requests are expected to go. How much quota each account has used.</p></div><div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="logout">Sign out</button></div></header>
@@ -701,6 +701,11 @@ const PAGE = `<!doctype html>
     </section>
     <section data-section="routing" hidden class="section-body"><div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
     <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table></div><p class="usage" id="resetHistoryNote"></p></section>
+    <section data-section="forecast" hidden class="section-body" id="forecastSection">
+      <div class="section-head"><div><h2>Subscription forecasts</h2><p class="sub">Account usage includes every machine using that subscription.</p></div><label>Work horizon <select id="forecastHorizon"><option value="2">2 hours</option><option value="8" selected>8 hours</option><option value="24">1 day</option><option value="72">3 days</option><option value="168">7 days</option></select></label></div>
+      <div class="card"><p id="forecastSummary" role="status"></p><p class="usage" id="forecastCoverage"></p><p class="usage" id="forecastAssumptions"></p></div>
+      <div id="forecastAccounts"></div><h2>Model alternatives</h2><div id="forecastAdvice" class="card"></div>
+    </section>
     <section data-section="diagnostics" hidden class="section-body" id="diagnostics"><h2>Server diagnostics</h2><div class="split"><div class="card" id="serverInfo"></div><div class="card" id="routingInfo"></div></div><h2>Quota probes and warmup</h2><div class="card"><table id="jobs"></table></div></section>
     <footer id="foot"></footer>
   </main>
@@ -1338,6 +1343,56 @@ ${SHARED_HELPERS}
     document.getElementById('historyLabel').textContent = label; chart.setAttribute('aria-label', label);
   }
 
+  function renderForecast(f) {
+    f = f || { status: 'Forecast history is disabled', coverage: {}, accounts: [], recommendations: [] };
+    var hours = Number(document.getElementById('forecastHorizon').value);
+    var windowLabel = function (bucket, durationMs) {
+      if (bucket.indexOf('shared:') === 0) return durationMs === 18000000 ? 'Shared five-hour window' : durationMs === 604800000 ? 'Shared weekly window' : 'Shared quota window';
+      if (bucket.indexOf('family:') === 0) return bucket.slice(7) + ' weekly window';
+      return bucket.replace(/:/g, ' ');
+    };
+    var end = Date.now() + hours * 3600000;
+    var date = function (t) { return t == null ? 'Unknown' : new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }); };
+    var timing = function (t) { return date(t) + (t > Date.now() ? ', in ' + ((t - Date.now()) / 3600000).toFixed(1) + ' hours' : ''); };
+    document.getElementById('forecastSummary').textContent = f.status + ' · Target ' + date(end);
+    var coverage = f.coverage || {};
+    document.getElementById('forecastCoverage').textContent = 'Unique subscriptions: ' + (coverage.subscriptionCount || 0) + '. ' + (coverage.remoteConsumption || 'History begins after forecast collection is enabled.') + (f.observedThrough ? '. Oldest account reading: ' + date(f.observedThrough) : '');
+    document.getElementById('forecastAssumptions').textContent = 'Experimental current-pace scenario. Each subscription keeps its observed total workload. Future resets are conditional. Account percentages and times are not added into a pooled balance.';
+    var root = document.getElementById('forecastAccounts'); root.replaceChildren();
+    (f.accounts || []).forEach(function (a) {
+      var card = el('section', 'card'); card.appendChild(el('h3', '', a.name + ' · ' + (a.provider === 'codex' ? 'Codex' : 'Claude')));
+      if (a.disabled) card.appendChild(el('p', 'usage', 'Disabled. Excluded from usable capacity.'));
+      if (!a.windows.length) card.appendChild(el('p', 'usage', 'No fresh provider windows recorded yet.'));
+      var table = el('table'); var head = el('tr'); ['Quota window', 'Spent', 'Pace per hour', 'Provider limit', 'Reported reset'].forEach(function (h) { head.appendChild(el('th', '', h)); }); table.appendChild(head);
+      a.windows.forEach(function (w) {
+        var row = el('tr');
+        var projection = w.status;
+        if (w.limitAt != null && w.resetAt > Date.now()) {
+          projection = w.limitAt >= w.resetAt ? 'Reset occurs first; continuation conditional' : w.limitAt > end ? 'No limit projected through target' : timing(w.limitAt);
+        }
+        [windowLabel(w.bucket, w.durationMs), w.utilization == null ? 'Unknown' : (w.utilization * 100).toFixed(1) + '%', w.ratePerHour == null ? 'Not enough evidence' : (w.ratePerHour * 100).toFixed(2) + ' percentage points', projection, date(w.resetAt)].forEach(function (value) { row.appendChild(el('td', '', value)); });
+        table.appendChild(row);
+        if (w.hardCapAt != null || w.softThresholdAt != null || w.lastEstimate) {
+          var notes = el('tr'); var cell = el('td', 'usage'); cell.colSpan = 5;
+          cell.textContent = (w.hardCapAt != null ? 'Hard account cap: ' + timing(w.hardCapAt) + '. ' : '') + (w.softThresholdAt != null ? 'Routing preference threshold: ' + timing(w.softThresholdAt) + '. This may rotate accounts or fall back. ' : '') + (w.lastEstimate ? 'Last estimate predicted a limit at ' + date(w.lastEstimate.limitAt) + '; usage data stale.' : '');
+          notes.appendChild(cell); table.appendChild(notes);
+        }
+      });
+      card.appendChild(table);
+      (a.models || []).forEach(function (m) { card.appendChild(el('p', 'usage', m.model + ': ' + (m.eligible ? 'Reported constraints permit this model; existing session restrictions still apply' : m.reason))); });
+      root.appendChild(card);
+    });
+    (coverage.exclusions || []).forEach(function (a) { root.appendChild(el('p', 'usage', a.name + ': ' + a.reason)); });
+    var advice = document.getElementById('forecastAdvice'); advice.replaceChildren();
+    if (!(f.recommendations || []).length) advice.appendChild(el('p', '', coverage.adviceReason || 'No supported model alternatives yet.'));
+    (f.recommendations || []).forEach(function (r) {
+      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + r.account + ' avoids ' + r.avoidedConstraints.map(windowLabel).join(', ') + '.'));
+      advice.appendChild(el('p', 'usage', r.evidence + '. ' + r.gainReason + '. ' + r.tradeoff));
+    });
+  }
+
+  document.getElementById('forecastHorizon').addEventListener('change', function () { renderForecast(lastStatus && lastStatus.forecast); });
+
   function render(s) {
     lastStatus = s;
     renderProviderRouting(s);
@@ -1348,6 +1403,7 @@ ${SHARED_HELPERS}
     renderOverview(s);
     renderDiagnostics(s);
     renderResets(s);
+    renderForecast(s.forecast);
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
@@ -1524,7 +1580,7 @@ ${SHARED_HELPERS}
 
   function showView() {
     var name = location.hash.slice(1) || 'overview';
-    var views = { overview:['Overview','Routing & capacity','Where requests are expected to go. How much quota each account has used.'], accounts:['Accounts','Account capacity','Compare subscription limits and reset times.'], activity:['Activity','Request activity','Requests and usage observed by this proxy.'], routing:['Routing','Model routing','Server-reported targets and configured routing rules.'], resets:['Resets','Usage resets','When each limit resets, and any reset that came early.'], diagnostics:['Diagnostics','Proxy diagnostics','Connection status, quota probes, and background jobs.'] };
+    var views = { overview:['Overview','Routing & capacity','Where requests are expected to go. How much quota each account has used.'], accounts:['Accounts','Account capacity','Compare subscription limits and reset times.'], activity:['Activity','Request activity','Requests and usage observed by this proxy.'], routing:['Routing','Model routing','Server-reported targets and configured routing rules.'], resets:['Resets','Usage resets','When each limit resets, and any reset that came early.'], forecast:['Forecast','Subscription forecasts','Depletion estimates and resets at each account’s observed pace.'], diagnostics:['Diagnostics','Proxy diagnostics','Connection status, quota probes, and background jobs.'] };
     if (!views[name]) name = 'overview';
     document.getElementById('breadcrumb').textContent = 'Dashboard / ' + views[name][0];
     document.getElementById('pageTitle').textContent = views[name][1];

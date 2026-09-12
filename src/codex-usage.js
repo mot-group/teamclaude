@@ -1,3 +1,4 @@
+import { codexWindows } from './forecast/observations.js';
 import { proxyFetch } from './upstream-fetch.js';
 import { safeLine } from './safe-text.js';
 
@@ -24,7 +25,7 @@ function windows(rateLimit) {
 
 export function normalizeCodexUsage(data) {
   if (!data || typeof data !== 'object' || !Object.hasOwn(data, 'rate_limit')) throw new Error('Missing Codex rate limit');
-  const result = { fiveHour: null, sevenDay: null, ...windows(data.rate_limit) };
+  const result = { fiveHour: null, sevenDay: null, ...windows(data.rate_limit), forecast: codexWindows(data) };
   if (typeof data.plan_type === 'string') result.planType = safeLine(data.plan_type, 64);
   if (Array.isArray(data.additional_rate_limits)) {
     result.modelBuckets = data.additional_rate_limits.map(limit => {
