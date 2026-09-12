@@ -298,6 +298,38 @@ test('a held route answers 429 at once, with the forced account\'s retry-after',
   }
 });
 
+// A forced account can be unavailable with nothing to wait for: disabled by the
+// operator, in an error state, already tried this request. The route is held
+// just the same, so the answer is still the immediate 429 — keyed off the pin,
+// not off a timestamp that does not exist.
+test('a held route on a disabled account answers 429 at once, with a default retry-after', async () => {
+  const am = new AccountManager([
+    { name: 'alice@example.com', type: 'apikey', apiKey: 'k1' },
+    { name: 'bob@example.com', type: 'apikey', apiKey: 'k2' },
+  ], 0.98, {
+    routes: [{ name: 'bulk', match: ['*opus*'], override: { account: 'alice@example.com', whenSpent: 'hold' } }],
+  });
+  am.setDisabled(0, true);
+  assert.equal(am.holdRetryAfterMs('claude-opus-4'), null, 'nothing on the forced account is known to move');
+
+  const proxy = createProxyServer(am, { ...CONFIG, holdSeconds: 3600 });
+  const port = await listen(proxy);
+  try {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-4', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    assert.ok(Date.now() - started < 5_000, 'a held route must not wait on holdSeconds');
+    assert.equal(res.headers.get('retry-after'), '60');
+    assert.match((await res.json()).error.message, /Route "bulk" is held on account "alice@example\.com"/);
+  } finally {
+    proxy.close();
+  }
+});
+
 // Without a hold pin nothing changes: the same exhaustion still gets the
 // fleet-wide retry-after and, where configured, the holdSeconds wait.
 test('an exhausted fleet with no held route keeps the fleet-wide 429', async () => {
@@ -377,7 +409,7 @@ async function withRealServer(fn) {
       if (Date.now() > deadline) throw new Error(`server did not start:\n${output}`);
       await new Promise(r => setTimeout(r, 100));
     }
-    await fn({ force, routesOnDisk, rowInStatus });
+    await fn({ force, routesOnDisk, rowInStatus, configPath });
   } finally {
     child.kill('SIGTERM');
     const killer = setTimeout(() => child.kill('SIGKILL'), 5000);
@@ -465,5 +497,23 @@ test('concurrent writes are serialised: the second sees the first', async () => 
       || (written.account === 'b@example.com' && written.whenSpent === 'hold'),
       JSON.stringify(written),
     );
+  });
+});
+
+// The 409 carries the row the caller should adopt, and a hand edit of the config
+// is exactly the change this process has not read yet. Without publishing disk
+// first, the answer would hand back the pre-edit row and a dashboard clicking
+// "use current" would send the same stale precondition straight back.
+test('a 409 from an external edit carries the edited row', async () => {
+  await withRealServer(async ({ force, configPath }) => {
+    const expected = { match: ['*opus*'], accounts: ['a@example.com', 'b@example.com'], persisted: null };
+    const disk = JSON.parse(await readFile(configPath, 'utf8'));
+    disk.routes[0].match = ['*opus*', '*haiku*'];
+    await writeFile(configPath, JSON.stringify(disk));
+
+    const conflict = await force({ route: 'bulk', expected, account: 'a@example.com', whenSpent: 'fallback' });
+    assert.equal(conflict.status, 409, await conflict.clone().text());
+    const { row } = await conflict.json();
+    assert.deepEqual(row.match, ['*opus*', '*haiku*'], 'the row reflects the file, not the last table this process read');
   });
 });

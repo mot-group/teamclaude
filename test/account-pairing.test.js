@@ -273,3 +273,22 @@ test('a reload picks up a models claim being added and cleared', async () => {
   assert.equal(am.hasOwnershipClaims(), false, 'the refusal lifts without a restart');
   assert.equal(Object.hasOwn(config[0], 'models'), false);
 });
+
+// The Codex source/account-id mismatch takes its own merge branch, and that one
+// used to return before the rule above ran: a save that cleared `models` while
+// the same save changed importFrom or the account id wrote the claim back.
+test('a codex id mismatch still drops a models claim disk no longer has', () => {
+  const config = [{
+    id: 'codex-1', name: 'c@example.com', type: 'oauth', provider: 'codex',
+    accountId: 'acct-A', accessToken: 't', refreshToken: 'r', expiresAt: 1_000,
+    models: ['gpt-5'], priority: 2,
+  }];
+  const disk = [{ ...config[0], accountId: 'acct-B' }];
+  delete disk[0].models; // migrated to a route by hand while the server ran
+
+  const saved = mergeAccountsForSave(config, [], disk);
+
+  assert.equal(Object.hasOwn(saved[0], 'models'), false);
+  assert.equal(saved[0].accountId, 'acct-B', 'the disk row still owns the identity fields');
+  assert.equal(saved[0].priority, 2, 'and the entry is otherwise merged as before');
+});

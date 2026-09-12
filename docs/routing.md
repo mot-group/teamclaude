@@ -180,7 +180,7 @@ There is no timer. The override stays until you clear it, from the dashboard's F
 
 Four things are worth knowing before you rely on it.
 
-**Quota probes still reach a held account.** `hold` governs client traffic only. The probe path keeps sending its own request to the spent account, which is how the proxy finds out that it has recovered.
+**Client traffic never reaches a held account that cannot serve.** Selection yields nothing and the 429 goes out immediately, the exhausted-fleet probe included: that probe is a real client request, and sending it through the account the hold just refused is the one thing `hold` promises not to do. Nothing is lost by it either, since a held route waits on one account whose recovery is already a timestamp that clears itself. The standalone quota prober (`teamclaude probe`, [`quotaProbeSeconds`](quota.md)) is unaffected and keeps refreshing that account's quota on its own schedule.
 
 **`TC_ACCT` wins.** An explicit [session pin](#pin-a-session-to-one-account) bypasses routes altogether, so a pinned session ignores the override.
 

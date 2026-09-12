@@ -119,10 +119,10 @@ test('hold bars every other member and yields nothing when the forced account is
   spend(am.accounts[1]);
   assert.equal(am._routeAllows(am.accounts[0], 'claude-opus-4'), false, 'a is barred while b holds');
   assert.equal(am._routeAllows(am.accounts[1], 'claude-opus-4'), true);
-  // The exhausted-fleet probe still spends its slot on the forced account —
-  // that is the one account whose quota is worth re-learning. Once the slot is
-  // used, selection returns nothing and the caller answers the 429.
-  assert.equal(am.getActiveAccount(null, 'claude-opus-4').name, 'b', 'only the forced account is probed');
+  // Not even the exhausted-fleet probe: it could only ever reach the forced
+  // account, whose recovery is a timestamp that clears itself, and sending it
+  // would put a real client request through the account the hold just refused.
+  assert.equal(am.getActiveAccount(null, 'claude-opus-4'), null, 'a held route never probes');
   assert.equal(am.getActiveAccount(null, 'claude-opus-4'), null, 'no account may serve a held route');
   // Other models are untouched by this route's hold.
   assert.equal(am.getActiveAccount(null, 'claude-sonnet-4-6').name, 'a');

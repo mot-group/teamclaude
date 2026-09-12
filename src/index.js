@@ -497,7 +497,38 @@ async function serverCommand() {
   // CLI, the TUI editor and a hand edit write the same table. Rejecting a stale
   // Apply is the whole reason this is not a plain write.
   const saveOverride = ({ route: name, expected, override }) => queued(async () => {
-    await atomicConfigUpdate(async diskConfig => {
+    try {
+      await writeOverride(name, expected, override);
+    } catch (err) {
+      // The mismatch may be an edit this process has never read — someone
+      // editing the file by hand. The 409 hands the caller `getRoutes()` so it
+      // can offer "use current", and that table would otherwise still be the
+      // pre-edit one. Publish disk first so the row the caller is shown is the
+      // row that caused the refusal. Outside the config transaction on purpose:
+      // a reload step that took the config chain would deadlock inside it.
+      // Called directly: we already hold the queue. A reload that fails
+      // changes nothing about the refusal itself.
+      if (err.code === 'changed-elsewhere') { try { await reloadAccounts(); } catch { /* still a stale write */ } }
+      throw err;
+    }
+    // The file has stopped forcing the route, but the running pin has not — and
+    // if the reload below fails, nothing else would release it. Drop it here so
+    // a half-applied clear errs towards normal routing rather than towards a
+    // force nothing on disk explains.
+    if (!override) accountManager.clearAnyPin(configuredPinId(name));
+    try {
+      await reloadAccounts();
+    } catch (err) {
+      // The write landed; only the apply did not. The caller needs to know the
+      // difference — one needs a retry, the other a reload.
+      throw fail('reload-failed', err.message);
+    }
+    return { warnings: accountManager.routeWarnings || [] };
+  });
+
+  // The transaction alone: precondition, then the edit on the disk row.
+  const writeOverride = (name, expected, override) =>
+    atomicConfigUpdate(async diskConfig => {
       const list = Array.isArray(diskConfig.routes) ? diskConfig.routes : [];
       // Normalised for the comparison only: that is the table every reader is
       // shown, so it is the one `expected` describes.
@@ -515,20 +546,6 @@ async function serverCommand() {
       if (override) list[at].override = { ...override, since: Date.now() };
       else delete list[at].override;
     });
-    // The file has stopped forcing the route, but the running pin has not — and
-    // if the reload below fails, nothing else would release it. Drop it here so
-    // a half-applied clear errs towards normal routing rather than towards a
-    // force nothing on disk explains.
-    if (!override) accountManager.clearAnyPin(configuredPinId(name));
-    try {
-      await reloadAccounts();
-    } catch (err) {
-      // The write landed; only the apply did not. The caller needs to know the
-      // difference — one needs a retry, the other a reload.
-      throw fail('reload-failed', err.message);
-    }
-    return { warnings: accountManager.routeWarnings || [] };
-  });
 
   let tui = null;
   let hooks = {};

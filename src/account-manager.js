@@ -901,6 +901,13 @@ export class AccountManager {
     if (diverted) return diverted;
     const next = this._selectNext(exclude, model, advisorModel);
     if (next) return next;
+    // A held route concerns exactly one account, and the probe only ever reaches
+    // that account (every other member is barred). Its recovery is already
+    // tracked by time — a quota reset clears itself, a throttle and a cooldown
+    // expire — so probing buys nothing and would send this request upstream
+    // through the very account the hold says cannot serve it. Yield nothing so
+    // the caller answers the immediate 429 the hold contract promises.
+    if (this.heldRouteFor(model)) return null;
     // No account is under the switch threshold. Before refusing locally, allow a
     // throttled probe so a stale/poisoned cached quota can't pin us in a
     // permanent "all exhausted" state — the probe's real response refreshes the
@@ -2799,6 +2806,15 @@ export class AccountManager {
     return entry ? this.accounts[entry.pin.index] : null;
   }
 
+  /** The live hold pin governing `model` as { id, pin }, or null. Asked instead
+   * of holdRetryAfterMs wherever the question is "is this route held", because a
+   * forced account that is disabled, errored or excluded carries no future
+   * timestamp and the route is held all the same. */
+  heldRouteFor(model) {
+    const entry = this._pinFor(model);
+    return entry?.pin.whenSpent === 'hold' ? entry : null;
+  }
+
   /**
    * How long until it is worth re-checking a held route, in ms, or null when
    * nothing holds `model` or nothing on the forced account is known to move.
@@ -2808,9 +2824,8 @@ export class AccountManager {
    * so this is the retry-after the client is given.
    */
   holdRetryAfterMs(model, now = Date.now()) {
-    const entry = this._pinFor(model);
-    if (entry?.pin.whenSpent !== 'hold') return null;
-    const account = this.accounts[entry.pin.index];
+    const entry = this.heldRouteFor(model);
+    const account = entry && this.accounts[entry.pin.index];
     if (!account) return null;
     const q = account.quota;
     const weekly = this._windowForBucket(account, this._weeklyBucketFor(model));

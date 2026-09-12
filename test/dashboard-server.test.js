@@ -31,6 +31,13 @@ async function fixture(t) {
         res.end(JSON.stringify({ ok: false, error: 'changed elsewhere', row: { name: 'stale' } }));
         return;
       }
+      // A write that landed and then failed to apply. The 500 body is the only
+      // place that difference is stated, and the operator has to act on it.
+      if (data.route === 'half-applied') {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ ok: false, persisted: true, applied: false, error: 'reload failed; see the proxy log' }));
+        return;
+      }
       res.end(JSON.stringify({ ok: true, row: { name: data.route }, persisted: true, applied: true, warnings: [] }));
       return;
     }
@@ -168,6 +175,13 @@ test('a route override is forwarded field by field, and a malformed one never le
   assert.equal(conflict.status, 409);
   assert.equal((await conflict.json()).error, 'changed elsewhere');
   assert.equal(requests.length, 2);
+
+  // A 500 from this endpoint is explained too: replacing it with the generic
+  // error told the operator nothing had changed after the config write landed.
+  const halfApplied = await send({ route: 'half-applied', expected, clear: true });
+  assert.equal(halfApplied.status, 500);
+  assert.deepEqual(await halfApplied.json(),
+    { ok: false, persisted: true, applied: false, error: 'reload failed; see the proxy log' });
 
   const notJson = await fetch(url + '/teamclaude/routes/override', { method: 'POST', headers: { cookie, origin: url }, body: '{}' });
   assert.equal(notJson.status, 415);

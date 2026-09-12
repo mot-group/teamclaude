@@ -127,7 +127,10 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
       // rejected, and the row as it is now for a 409 — and the dialog needs them
       // to say anything useful. They name routes and accounts this signed-in
       // session already reads from /teamclaude/status.
-      const explained = forcing && [400, 404, 409].includes(response.status);
+      // 500 included: the endpoint answers a failed reload with
+      // `{ persisted: true, applied: false }`, and swapping that for the generic
+      // error told the operator nothing changed after the config write landed.
+      const explained = forcing && [400, 404, 409, 500].includes(response.status);
       if (!response.ok && !explained) { reply(response.status === 401 ? 502 : response.status, { error: 'Proxy request failed' }); return; }
       reply(response.status, await response.json());
     } catch (err) {

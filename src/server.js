@@ -2026,11 +2026,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // request can never use, and the holdSeconds wait would sit on the
     // connection waiting for accounts that are barred from answering it. Reply
     // now, with the forced account's own next known movement.
-    const heldMs = accountManager.holdRetryAfterMs?.(ctx.model);
-    if (heldMs != null) {
+    // Asked of the pin, not of the timestamps: a forced account that is disabled,
+    // errored or excluded has no future stamp to compute a retry-after from, and
+    // the route is held all the same — keying off the stamp dropped exactly those
+    // requests into the fleet-wide wait the hold contract rules out.
+    if (accountManager.heldRouteFor?.(ctx.model)) {
+      const heldMs = accountManager.holdRetryAfterMs(ctx.model);
       // Ceil, floor 1: a sub-second retry-after reads as "immediately" and would
-      // put a client straight back into the same refusal.
-      const retryAfter = Math.max(1, Math.ceil(heldMs / 1000));
+      // put a client straight back into the same refusal. Nothing known to move
+      // (a disabled account waits on a person) is a minute: an interval to ask
+      // again on, not a promise that anything will have changed.
+      const retryAfter = heldMs == null ? 60 : Math.max(1, Math.ceil(heldMs / 1000));
       ctx.status = 429;
       ctx.account = '(route held)';
       if (!res.headersSent) {

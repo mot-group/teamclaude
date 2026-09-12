@@ -146,6 +146,11 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
         if (Object.hasOwn(diskAcct, key)) merged[key] = diskAcct[key];
         else delete merged[key];
       }
+      // Same rule as the ordinary merge below, and for the same reason: this
+      // branch also spreads the in-memory entry over the disk row, so without it
+      // a save that drops `models` resurrects the claim whenever the same save
+      // changes importFrom or accountId.
+      if (!Object.hasOwn(diskAcct, 'models')) delete merged.models;
       return merged;
     }
     if (!diskAcct) return live;
