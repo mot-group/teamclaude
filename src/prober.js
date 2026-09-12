@@ -22,12 +22,13 @@ function clampInterval(ms) {
 }
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, resetTracker = null, creditsFn = fetchCodexResetCredits, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, resetTracker = null, onObservation = null, creditsFn = fetchCodexResetCredits, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
     this.resetTracker = resetTracker;
+    this.onObservation = onObservation;
     this.creditsFn = creditsFn;
     this.profileFn = profileFn;
     this.backendFn = backendFn;
@@ -163,6 +164,9 @@ export class Prober {
         return;
       }
 
+      try {
+        this.onObservation?.(account, usage, { at: Date.now(), intervalMs: this.intervalMs, eventId: String(startedAt) });
+      } catch { /* Forecast collection cannot fail a quota probe. */ }
       if (this.resetTracker) {
         try {
           this.resetTracker.observe(account, usage, { maxGapMs: Math.min(3600_000, Math.max(900_000, this.intervalMs * 3)) });

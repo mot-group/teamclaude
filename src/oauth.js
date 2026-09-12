@@ -1,3 +1,4 @@
+import { claudeWindows } from './forecast/observations.js';
 import { readFile } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
@@ -505,6 +506,7 @@ export function normalizeUsagePayload(data) {
   // family the payload named, so one upstream adds is metered without a release.
   const scopedWeekly = scopedWeeklyLimits(data);
   return {
+    forecast: claudeWindows(data, normalizeUsageBucket),
     fiveHour: normalizeUsageBucket(data?.five_hour),
     sevenDay: normalizeUsageBucket(data?.seven_day),
     sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet) || scopedWeekly.sonnet || null,

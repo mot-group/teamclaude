@@ -31,6 +31,7 @@ import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
+import { ForecastService } from './forecast/service.js';
 import { ResetTracker } from './reset-tracker.js';
 import { Warmer } from './warmer.js';
 import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
@@ -549,6 +550,9 @@ async function serverCommand() {
 
   let tui = null;
   let hooks = {};
+  const forecast = config.forecast?.enabled === true ? new ForecastService({
+    manager: accountManager, config, file: `${getConfigPath()}.forecast.sqlite`,
+  }) : null;
 
   if (useTUI) {
     tui = new TUI({
@@ -641,11 +645,16 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   // Queued, like every other republish of the routing table.
   hooks.reload = reloadQueued;
+  hooks.getForecast = hours => forecast?.getSnapshot(hours) || {
+    version: 1, status: 'Forecast history is disabled', accounts: [], perModel: [], events: [], recommendations: [],
+    coverage: { completePool: false, numericModelGains: false },
+  };
   // The dashboard's Force dialog. Set for both branches: the TUI is not
   // reachable on the background-service deployment the dashboard serves, and
   // the queue is the same one either way.
   hooks.saveOverride = saveOverride;
   hooks.getStatusExtra = () => ({
+    forecast: hooks.getForecast(),
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
     // per-request gate in server.js picks it up.
@@ -757,6 +766,7 @@ async function serverCommand() {
   });
   prober = new Prober(accountManager, {
     resetTracker,
+    onObservation: (account, usage, metadata) => forecast?.observe(account, usage, metadata),
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
   });
@@ -794,11 +804,12 @@ async function serverCommand() {
     warmer?.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
+    setTimeout(() => process.exit(0), 2000).unref?.();
     await persistQuotaState();
+    await forecast?.close();
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
     // short grace period in case anything still hangs.
-    setTimeout(() => process.exit(0), 2000).unref?.();
     server.closeAllConnections?.();
     server.close(() => process.exit(0));
   }

@@ -37,6 +37,7 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 
 | Field | Description |
 | --- | --- |
+| `forecast` | Opt-in subscription-level forecasting: `enabled`, exact `models`, approved `alternatives` pairs, and verified Codex `modelScopes`. Defaults to disabled. Restart after changing this block. See [forecast configuration](forecast/README.md). Existing probe cadence is unchanged. |
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |

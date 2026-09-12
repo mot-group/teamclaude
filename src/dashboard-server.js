@@ -86,7 +86,7 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
         sessions.delete(token);
         reply(200, { ok: true }, { 'Set-Cookie': cookie('', 0) }); return;
       }
-      const allowed = req.method === 'GET' && ['/teamclaude/status', '/teamclaude/quota'].includes(req.url);
+      const allowed = req.method === 'GET' && ['/teamclaude/status', '/teamclaude/quota', '/teamclaude/forecast'].includes(req.url);
       const switching = req.method === 'POST' && req.url === '/teamclaude/switch';
       const forcing = req.method === 'POST' && req.url === '/teamclaude/routes/override';
       if (!allowed && !switching && !forcing) { reply(404, { error: 'Not found' }); return; }

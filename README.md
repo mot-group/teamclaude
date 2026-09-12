@@ -95,6 +95,7 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 | [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, Codex accounts, third-party backends |
 | [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, logging |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
+| [Forecasts](docs/forecast/README.md) | Account-level depletion estimates, reset comparisons, model constraint advice, and history configuration |
 | [Quota](docs/quota.md) | Claude and Codex quota probes, keep-warm, holding on exhaustion |
 | [LAN dashboard](docs/lan-dashboard.md) | Password gate, persistent service, dashboard deployment and operation |
 | [Reset tracking](docs/reset-tracking.md) | Detection rules, banked credits, persistent history, Google Chat configuration |

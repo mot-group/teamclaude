@@ -325,6 +325,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      if (req.method === 'GET' && (req.url === '/teamclaude/forecast' || req.url.startsWith('/teamclaude/forecast?'))) {
+        const url = new URL(req.url, 'http://localhost');
+        const hours = url.searchParams.has('hours') ? Number(url.searchParams.get('hours')) : 8;
+        if (!(hours > 0 && hours <= 168) || [...url.searchParams.keys()].some(k => k !== 'hours')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'hours must be greater than zero and at most 168' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(hooks.getForecast?.(hours) || { version: 1, status: 'Forecast history is disabled' }));
+        return;
+      }
+
       // Reload endpoint — re-sync accounts from config without a restart. This
       // is the headless equivalent of pressing 'R' in the TUI. Local control
       // only (no upstream calls); the auth gate above already applies.
