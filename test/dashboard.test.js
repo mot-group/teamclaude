@@ -8,7 +8,7 @@ import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
-  chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
+  chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -660,4 +660,24 @@ test('session activity copy distinguishes no observations from unavailable track
   assert.equal(sessionActivityText({ active: 3 }), '3 recent Claude session IDs');
   assert.equal(sessionActivityText(), 'Session tracking unavailable');
   assert.equal(sessionActivityText({}), 'Session tracking unavailable');
+});
+
+test('reset history rows date scheduled rolls by the window and early resets by the confirming probe', () => {
+  const w = { type: 'restarted-window', before: { utilization: 0.19, at: 100, resetAt: 150 }, after: { label: '5-hour', utilization: 0.02, at: 200, resetAt: 900 } };
+  const rows = resetHistoryRows([
+    { account: 'a', timing: 'scheduled', windows: [w] },
+    { account: 'b', timing: 'early', windows: [{ ...w, type: 'quota-refill' }, w] },
+    { account: 'c', timing: 'uncertain', windows: [w] },
+  ]);
+  assert.deepEqual(rows.map(r => [r.account, r.when, r.what, r.kind]), [
+    ['a', 150, 'Rolled over on schedule', ''],
+    ['b', 200, 'Reset early, quota refilled', 'warn'],
+    ['b', 200, 'Reset early, window restarted', 'warn'],
+    ['c', 200, 'Reset, timing unclear', 'dim'],
+  ]);
+  assert.deepEqual([rows[0].before, rows[0].after, rows[0].window, rows[0].observed, rows[0].resetAt], [19, 2, '5-hour', [100, 200], [150, 900]]);
+  assert.deepEqual(resetHistoryRows(undefined), []);
+  const html = renderDashboardHtml();
+  assert.match(html, /id="resetEvents" class="reset-table"/);
+  assert.match(html, /function resetHistoryRows/);
 });
