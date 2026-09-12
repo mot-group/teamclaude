@@ -157,8 +157,15 @@ model_provider = "teamclaude"
 name = "teamclaude"
 base_url = "http://127.0.0.1:3456/backend-api/codex"
 wire_api = "responses"
-requires_openai_auth = false
+requires_openai_auth = true
 ```
+
+Keep your native ChatGPT login when using this configuration. Setting
+`requires_openai_auth = true` lets Codex expose that account to the desktop app.
+TeamClaude still replaces model-request credentials with the selected pooled
+account. For a CLI-only setup without a native OpenAI login, `false` permits
+unauthenticated requests to the local proxy, but can hide account-dependent
+desktop settings. See [desktop authentication](codex-remote-access.md#preserve-desktop-account-settings).
 
 ### Codex Desktop remote targets
 

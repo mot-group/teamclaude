@@ -14,7 +14,8 @@ This behavior was verified on 2026-09-09 with Codex Desktop's bundled CLI versio
 
 The request path is Mac Codex Desktop → Linux remote target → TeamClaude → account B. The Mac's login does not force the Linux target's model requests to use account A when the target has a custom model provider.
 
-On the Linux target, the tested `~/.codex/config.toml` provider configuration is:
+For a desktop host with a native ChatGPT login, use this provider configuration
+in `~/.codex/config.toml`:
 
 ```toml
 model_provider = "teamclaude"
@@ -23,7 +24,7 @@ model_provider = "teamclaude"
 name = "TeamClaude codex-2"
 base_url = "http://127.0.0.1:3456/tc-acct/codex-2/backend-api/codex"
 wire_api = "responses"
-requires_openai_auth = false
+requires_openai_auth = true
 ```
 
 Use the name of an enrolled Codex account in place of `codex-2`. The path pin fixes requests to that account and bypasses rotation. The loopback listener accepts the local request; TeamClaude supplies the selected subscription's Bearer token and ChatGPT account ID upstream. This example does not expose the inference listener over the LAN.
@@ -31,10 +32,43 @@ Use the name of an enrolled Codex account in place of `codex-2`. The path pin fi
 Enroll pooled subscriptions separately with `teamclaude login --codex`. Keep those grants separate from the native desktop credentials. Avoid copying a native refresh token into another independently refreshing client. The maintained Linux setup uses directly enrolled credentials in TeamClaude and preserves the native Codex auth file.
 
 The credential-ownership fix for issue #7 preserves this setup and the provider
-configuration above. An enrolled account retains its own tokens and ChatGPT
+model-routing configuration. An enrolled account retains its own tokens and ChatGPT
 account ID across reload, save and restart. If an older version already saved
 substituted credentials, re-enroll the pooled account. Keep the native desktop
 login in place.
+
+## Preserve desktop account settings
+
+Set `requires_openai_auth = true` to keep the native ChatGPT account available
+to the desktop app. With `false`, Codex can return no account even when a saved
+ChatGPT login exists. The profile menu can show the provider name, and
+**Settings > Connections** can show only SSH instead of the remote-control tabs.
+Existing authorized connections may still work. Their availability does not
+prove that the account settings remain accessible.
+
+The original Linux test on 2026-09-09 used `false` and verified an existing
+remote connection. The example above now uses `true` to preserve native account
+features. This follows the [OpenAI authentication documentation](https://learn.chatgpt.com/docs/auth#alternative-model-providers)
+for custom providers.
+
+On 2026-09-11, the backend bundled with ChatGPT for macOS `26.903.71938`, build
+`8576`, returned these results for `account/read` with `refreshToken: false`:
+
+| `requires_openai_auth` | `account` | `requiresOpenaiAuth` |
+| --- | --- | --- |
+| `false` | `null` | `false` |
+| `true` | Native account with `type: "chatgpt"` | `true` |
+
+Both checks used the same saved login and TeamClaude base URL. A separate test
+of the installed proxy sent dummy native credentials through a local upstream
+server and confirmed that TeamClaude replaced both the Bearer token and the
+ChatGPT account ID with the selected pool account's credentials.
+
+After changing the setting, finish active desktop tasks, then quit and reopen
+the app. Check the profile menu and **Settings > Connections**. Visual
+confirmation after restart was still pending when this backend check was
+recorded. This setting does not change device pairings or the selected pool
+account.
 
 ## Verify the two roles
 
