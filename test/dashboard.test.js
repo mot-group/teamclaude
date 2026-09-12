@@ -8,6 +8,7 @@ import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
+  chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -255,6 +256,160 @@ test('a fleet with no routes renders no section', () => {
   assert.deepEqual(routeRows(null), []);
 });
 
+// A configured route with an override, in the shape the endpoint and getRoutes
+// agree on: `override` is the effective runtime pin, `persisted` is what the
+// config file says, and the two can disagree while a TUI pin is in memory.
+const OVERRIDDEN = {
+  providerRouting: [],
+  accounts: [
+    { name: 'a', quota: { unified7d: 0.4, unified7dReset: 2000 } },
+    { name: 'b', quota: { unified7d: 0.1, unified7dReset: 1000 } },
+    { name: 'c', quota: {} },
+  ],
+  routes: [{
+    name: 'codex-default', match: ['gpt-*', '*codex*'], autocreated: false,
+    id: 'configured:codex-default',
+    override: { account: 'a', whenSpent: 'fallback', source: 'config', since: 5, state: 'effective', reason: null },
+    persisted: { account: 'a', whenSpent: 'fallback' },
+    // The route's resolved membership: an empty config list means every
+    // account, and c is one the codex preview leaves out.
+    members: ['a', 'b', 'c'],
+    accounts: [{ name: 'a', eligible: true }, { name: 'b', eligible: true }],
+    previews: [{
+      provider: 'codex', model: 'gpt-', label: 'gpt-*', target: 'a',
+      accounts: [{ name: 'a', eligible: true }, { name: 'b', eligible: true }],
+    }],
+  }],
+};
+const forcedRow = (override, extra = {}) => routeRows({
+  ...OVERRIDDEN,
+  routes: [{ ...OVERRIDDEN.routes[0], override: { account: 'a', source: 'config', ...override }, ...extra }],
+})[0];
+
+test('a route row carries its identity, its live override and what the config says', () => {
+  const [row] = routeRows(OVERRIDDEN);
+  assert.equal(row.id, 'configured:codex-default');
+  assert.deepEqual(row.persisted, { account: 'a', whenSpent: 'fallback' });
+  assert.equal(row.override.state, 'effective');
+  // The Force dialog offers the route's members, and the 409 baseline is built
+  // from the same list, so the server's resolved membership has to reach the
+  // row rather than the preview's provider-filtered accounts.
+  assert.deepEqual(row.members, ['a', 'b', 'c']);
+  assert.deepEqual(row.globs, ['gpt-*', '*codex*']);
+  // A server that does not resolve membership for us falls back to the first
+  // preview's accounts, which is all an older status payload carries.
+  const noMembers = { ...OVERRIDDEN.routes[0] };
+  delete noMembers.members;
+  assert.deepEqual(routeRows({ ...OVERRIDDEN, routes: [noMembers] })[0].members, ['a', 'b']);
+
+  // A server that does not report them yet (the fields are WP1's) leaves the
+  // row usable and unforced rather than rendering a half-built control.
+  const [plain] = routeRows(ROUTED);
+  assert.deepEqual({ id: plain.id, override: plain.override, persisted: plain.persisted }, { id: null, override: null, persisted: null });
+  assert.equal(chipFor(plain), null);
+});
+
+test('the chip says what the override is actually doing, not just that one exists', () => {
+  assert.deepEqual(chipFor(forcedRow({ whenSpent: 'fallback', state: 'effective' })),
+    { kind: 'accent', text: 'forced · falls back when spent' });
+  assert.deepEqual(chipFor(forcedRow({ whenSpent: 'hold', state: 'effective' })),
+    { kind: 'accent', text: 'forced · held' });
+  // Traffic has left the forced account: the row has to name where it went, or
+  // "forced to a" reads as a claim about where requests are landing.
+  assert.deepEqual(chipFor(forcedRow({ whenSpent: 'fallback', state: 'unavailable', reason: 'over its weekly threshold' })),
+    { kind: 'warn', text: 'forced to a · a is over its weekly threshold · serving from a' });
+  assert.deepEqual(chipFor(forcedRow({ whenSpent: 'hold', state: 'holding', reason: 'over its weekly threshold' })),
+    { kind: 'bad', text: 'held on a · a is over its weekly threshold · requests get 429' });
+  assert.deepEqual(chipFor(forcedRow({ whenSpent: 'fallback', state: 'no-target' })),
+    { kind: 'bad', text: 'forced to a · nothing can serve right now' });
+  // A TUI pin is memory only, and the reader cannot otherwise tell.
+  assert.equal(chipFor(forcedRow({ whenSpent: 'hold', state: 'effective', source: 'tui' })).text,
+    'forced · held · from the TUI, until restart');
+  assert.equal(chipFor({}), null);
+  assert.equal(chipFor(null), null);
+  // Names are operator-supplied and reach the chip untouched; the page puts
+  // them through textContent, so nothing here escapes or mangles them.
+  const hostile = '<img src=x onerror=alert(1)>';
+  assert.match(chipFor(forcedRow({ account: hostile, state: 'no-target' })).text, /<img src=x onerror=alert\(1\)>/);
+});
+
+test('the dialog opens on the member whose weekly window comes back first', () => {
+  const row = routeRows(OVERRIDDEN)[0];
+  assert.equal(forceDefaultAccount(row, OVERRIDDEN.accounts), 'b');
+  // An unrestricted route offers every account, c included, even though the
+  // codex preview lists only the two that can serve its sample.
+  assert.deepEqual(row.members, ['a', 'b', 'c']);
+  // An unreported reset is not an early one: it sorts behind every known reset.
+  assert.equal(forceDefaultAccount({ members: ['c', 'a'] }, OVERRIDDEN.accounts), 'a');
+  assert.equal(forceDefaultAccount({ members: ['c'] }, OVERRIDDEN.accounts), 'c');
+  assert.equal(forceDefaultAccount({ members: [] }, OVERRIDDEN.accounts), null);
+  assert.equal(forceDefaultAccount(null, null), null);
+  // Members arrive as {name, eligible} on a getRoutes row and as names on a
+  // page row; both are the same list.
+  assert.equal(forceDefaultAccount({ members: [{ name: 'a' }, { name: 'b' }] }, OVERRIDDEN.accounts), 'b');
+});
+
+test('the baseline sent with a Force is the route definition, canonically', () => {
+  // Membership travels as the resolved names the endpoint compares against,
+  // not the config list: "3" and an omitted list both mean accounts by name.
+  assert.deepEqual(expectedFor(routeRows(OVERRIDDEN)[0]), {
+    match: ['gpt-*', '*codex*'],
+    accounts: ['a', 'b', 'c'],
+    persisted: { account: 'a', whenSpent: 'fallback' },
+  });
+  // The 409 reply hands back a server row, whose match is already an array and
+  // whose accounts are objects. `Use current` builds the next baseline from it.
+  assert.deepEqual(expectedFor(OVERRIDDEN.routes[0]), {
+    match: ['gpt-*', '*codex*'],
+    accounts: ['a', 'b', 'c'],
+    persisted: { account: 'a', whenSpent: 'fallback' },
+  });
+  // Without members, the row's account names still stand in.
+  assert.deepEqual(expectedFor({ globs: ['gpt-*'], accounts: [{ name: 'a' }, { name: 'b' }] }).accounts, ['a', 'b']);
+  // An unforced route sends persisted: null, which is what "I saw no override"
+  // has to say. Omitting the field would read as "I did not look".
+  assert.deepEqual(expectedFor({ globs: ['*fable*'], accounts: [], persisted: null }), { match: ['*fable*'], accounts: [], persisted: null });
+  assert.deepEqual(expectedFor(null), { match: [], accounts: [], persisted: null });
+});
+
+test('the override request is the same POST shape the endpoint documents', () => {
+  const { url, init } = overrideRequest({ route: 'codex-default', expected: { match: ['gpt-*'], accounts: [], persisted: null }, account: 'a', whenSpent: 'hold' }, 'secret');
+  assert.equal(url, '/teamclaude/routes/override');
+  assert.equal(init.method, 'POST');
+  assert.deepEqual(init.headers, { 'x-api-key': 'secret', 'content-type': 'application/json' });
+  assert.deepEqual(JSON.parse(init.body), {
+    route: 'codex-default', expected: { match: ['gpt-*'], accounts: [], persisted: null }, account: 'a', whenSpent: 'hold',
+  });
+  // The LAN dashboard build sends no key of its own; the cookie carries it.
+  assert.equal(overrideRequest({ route: 'r', clear: true }, '').init.headers['x-api-key'], '');
+  assert.deepEqual(JSON.parse(overrideRequest({ route: 'r', clear: true }).init.body), { route: 'r', clear: true });
+});
+
+test('the override outcome separates the config write from the running router', () => {
+  const row = { override: { account: 'a', whenSpent: 'fallback' } };
+  assert.deepEqual(overrideOutcome({ ok: true, row, persisted: true, applied: true, warnings: [] }),
+    { kind: 'ok', row, text: 'Forced to a, falling back when it is spent.' });
+  assert.match(overrideOutcome({ ok: true, row: { override: { account: 'a', whenSpent: 'hold' } }, applied: true }).text, /held on it/);
+  assert.match(overrideOutcome({ ok: true, row: { override: null }, applied: true }).text, /Force cleared/);
+  assert.equal(overrideOutcome({ ok: true, row, applied: true, warnings: ['dropped an unknown bucket'] }).text,
+    'Forced to a, falling back when it is spent. dropped an unknown bucket');
+  // Written but not applied: the next reload picks it up while the live fleet
+  // still routes the old way, which a bare "done" would hide.
+  const half = overrideOutcome({ ok: true, row, persisted: true, applied: false });
+  assert.equal(half.kind, 'warn');
+  assert.match(half.text, /did not reload/);
+
+  assert.deepEqual(overrideOutcome({ ok: false, errors: [{ field: 'account', message: 'not a member of this route' }] }),
+    { kind: 'error', row: null, text: 'Nothing changed: not a member of this route' });
+  assert.match(overrideOutcome({ ok: false, error: 'no such route' }).text, /Nothing changed: no such route/);
+  const conflict = overrideOutcome({ ok: false, error: 'changed elsewhere', row: OVERRIDDEN.routes[0] });
+  assert.equal(conflict.conflict, true);
+  assert.equal(conflict.row, OVERRIDDEN.routes[0], 'the current row drives Use current');
+  const failed = overrideOutcome({ ok: false, persisted: true, applied: false, error: 'reload failed; see the proxy log' });
+  assert.deepEqual({ kind: failed.kind, text: failed.text }, { kind: 'warn', text: 'Saved to the config, but not applied: reload failed; see the proxy log' });
+  assert.deepEqual(overrideOutcome(null), { kind: 'error', row: null, text: 'Nothing changed: no reason given' });
+});
+
 // Built from a REAL getStatus() rather than a hand-written object: a previous
 // version of this banner was validated against a payload the server can never
 // emit, and the impossible fixture hid a false positive.
@@ -393,7 +548,8 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems,
+    chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
@@ -410,6 +566,14 @@ test('dashboard page is self-contained: no external resources', () => {
   assert.doesNotMatch(html, /@import/i);
   // The data fetch targets the gated status endpoint, same origin.
   assert.match(html, /fetch\('\/teamclaude\/status'/);
+  // Every field the page renders is operator or OAuth derived, and route names
+  // and account names now reach the routing table and the Force dialog. The CSP
+  // admits this one script by hash, so an injected tag would not run, but the
+  // page must not be the thing that builds one either.
+  assert.doesNotMatch(html.slice(html.indexOf('<script>')), /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
+  // No inline handlers: CSP has no 'unsafe-inline' for scripts, so an onclick=
+  // attribute would be silently dead rather than obviously broken.
+  assert.doesNotMatch(html, /\son[a-z]+\s*=\s*["']/i);
 });
 
 test('GET /teamclaude/dashboard serves HTML without a key; other methods take the normal path', async () => {
