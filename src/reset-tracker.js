@@ -25,21 +25,27 @@ function readings(usage, at) {
   }
   for (const bucket of usage.modelBuckets || []) entries.push([`model:${bucket.slug}`, bucket.name, bucket]);
   for (const [key, label, bucket] of entries) {
+    // A reset time already behind `at` is the window that just ended, still
+    // being echoed; it is not a reading of a live window.
     if (!bucket || !Number.isFinite(bucket.utilization) || bucket.utilization < 0
-      || !Number.isFinite(bucket.resetAt) || bucket.resetAt <= 0) continue;
+      || !Number.isFinite(bucket.resetAt) || bucket.resetAt <= at) continue;
     result[key] = { label: safeLine(label, 80), utilization: bucket.utilization, resetAt: bucket.resetAt, at };
   }
   return result;
 }
 
 export function classifyReset(before, after, maxGapMs) {
-  if (after.resetAt <= after.at || !before || after.at <= before.at || after.at - before.at > maxGapMs) return null;
+  if (after.resetAt <= after.at || !before || after.at <= before.at) return null;
   const advanced = after.resetAt > before.resetAt + TIME_TOLERANCE;
   const same = Math.abs(after.resetAt - before.resetAt) <= TIME_TOLERANCE;
   if (!advanced && !same) return null;
+  // A scheduled roll is dated by the window's own reset time, not by when the
+  // probes happened to land, so the observation gap does not limit it: an idle
+  // account can sit for hours between a window ending and the next one starting.
   if (advanced && before.at < before.resetAt && after.at >= before.resetAt - TIME_TOLERANCE) {
     return { type: 'restarted-window', timing: 'scheduled', before, after };
   }
+  if (after.at - before.at > maxGapMs) return null;
   if (before.utilization - after.utilization < MIN_DROP - 1e-9 || after.utilization > LOW_USAGE) return null;
   return { type: advanced ? 'restarted-window' : 'quota-refill',
     timing: after.at < before.resetAt - TIME_TOLERANCE ? 'early' : 'uncertain', before, after };
@@ -89,6 +95,13 @@ export class ResetTracker {
     const row = previous || { windows: {}, pending: {}, totals: { early: 0, scheduled: 0, uncertain: 0 }, earlyTypes: { 'restarted-window': 0, 'quota-refill': 0 }, creditNotices: [] };
     row.name = safeLine(account.name, 100);
     row.provider = account.provider || 'anthropic';
+    // A window that ended on schedule since it was last read reports no live
+    // window (or echoes the past reset time) until the account is used again.
+    // Hold the last pre-expiry reading so the next fresh window still has a
+    // `before` to roll over from; otherwise every idle rollover goes uncounted.
+    for (const [key, before] of Object.entries(row.windows)) {
+      if (!current[key] && before.at < before.resetAt && before.resetAt <= at) current[key] = before;
+    }
     const confirmed = [];
     const pending = {};
     for (const [key, after] of Object.entries(current)) {
