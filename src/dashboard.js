@@ -467,6 +467,29 @@ export function accountQuotaGroups(account = {}) {
   return { shared: shared, session: session, models: models };
 }
 
+// One table row per reset-event window for the Resets view. `when` is the
+// moment the reader cares about: a scheduled roll is the window's own reset
+// time, while an early or unclear reset is only known to lie between two
+// probes, so the probe that confirmed it dates it.
+export function resetHistoryRows(events) {
+  var rows = [];
+  (events || []).forEach(function (event) {
+    (event.windows || []).forEach(function (w) {
+      var what, kind = '';
+      if (event.timing === 'scheduled') what = 'Rolled over on schedule';
+      else if (event.timing === 'early') { what = w.type === 'quota-refill' ? 'Reset early, quota refilled' : 'Reset early, window restarted'; kind = 'warn'; }
+      else { what = 'Reset, timing unclear'; kind = 'dim'; }
+      rows.push({
+        when: event.timing === 'scheduled' ? w.before.resetAt : w.after.at,
+        account: event.account, window: w.after.label, what: what, kind: kind,
+        before: Math.round(w.before.utilization * 100), after: Math.round(w.after.utilization * 100),
+        observed: [w.before.at, w.after.at], resetAt: [w.before.resetAt, w.after.resetAt],
+      });
+    });
+  });
+  return rows;
+}
+
 export function sessionActivityText(sessions) {
   if (!sessions || typeof sessions.active !== 'number') return 'Session tracking unavailable';
   return sessions.active === 0 ? 'No recent Claude session IDs observed'
@@ -475,7 +498,7 @@ export function sessionActivityText(sessions) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, routingCards, problems, quotaDisplay, accountQuotaGroups, sessionActivityText,
+  switchRequest, switchOutcome, routeRows, routingCards, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -551,6 +574,11 @@ const PAGE = `<!doctype html>
   .account-table th:nth-child(4) { width:25%; }
   .account-table .provider-heading th { background:#1b2029; color:#dce4f2; padding:10px 16px; font-weight:600; }
   .account-table td { padding-top:20px; padding-bottom:20px; }
+  .reset-table td { padding:12px 16px; }
+  .reset-table th:first-child { white-space:nowrap; }
+  .reset-table td small { display:block; font-size:11px; margin-top:3px; }
+  #resetAccounts .card p { margin-top:8px; }
+  #resetAccounts .card p.usage { margin-top:6px; line-height:1.5; }
   .account-name { font-size:13px; font-weight:600; display:block; overflow-wrap:anywhere; margin-bottom:7px; }
   .account-meta { color:var(--dim); font-size:11px; margin-top:6px; }
   .badge { display:inline-block; font-size:11px; border-radius:5px; border:1px solid var(--line); padding:3px 7px; color:var(--dim); }
@@ -639,6 +667,7 @@ const PAGE = `<!doctype html>
   @media(max-width:1150px) { .main-content { padding:26px; } #app { grid-template-columns:175px minmax(0,1fr); } .sidebar { padding:28px 12px; } .section-head { align-items:start; } .account-tools { justify-content:flex-end; } .account-table th:first-child { width:24%; } .account-table th:last-child { width:68px; } th,td { padding:14px 12px; } }
   @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; overflow:auto; margin-top:18px; } nav a { white-space:nowrap; flex-shrink:0; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; } }
   @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:38px; padding:6px 13px; } .route-panel .section-head { flex-direction:row; flex-wrap:wrap; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; background:none; border:0; padding:12px 0; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:14px; } .account-table td { border:0; padding:0 0 18px; } .account-table td:last-child { padding:0; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } }
+  @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } }
 </style>
 </head>
 <body>
@@ -671,7 +700,7 @@ const PAGE = `<!doctype html>
       <section id="sessionsWrap"><h2>Claude session activity</h2><p class="sub" id="sessionActivity"></p><p class="usage" id="sessionKnown"></p><p class="usage">Counts only requests carrying a Claude session ID. A session remains recent for two minutes after a request, or while a request is running. Codex and requests without a session ID are not included. This does not count open apps or terminals.</p><div class="card"><div class="filters"><label>Project <select id="fProject"></select></label><label>Client <select id="fClient"></select></label><span class="hint" id="sessionCount"></span></div><table id="sessions"></table></div></section>
     </section>
     <section data-section="routing" hidden class="section-body"><div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
-    <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Usage resets</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><p class="usage">Historical percentages always show quota spent.</p><div id="resetEvents"></div></section>
+    <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table></div><p class="usage" id="resetHistoryNote"></p></section>
     <section data-section="diagnostics" hidden class="section-body" id="diagnostics"><h2>Server diagnostics</h2><div class="split"><div class="card" id="serverInfo"></div><div class="card" id="routingInfo"></div></div><h2>Quota probes and warmup</h2><div class="card"><table id="jobs"></table></div></section>
     <footer id="foot"></footer>
   </main>
@@ -1200,8 +1229,21 @@ ${SHARED_HELPERS}
     return value ? new Date(value).toLocaleString() : 'Unknown';
   }
 
-  function resetType(value) {
-    return value === 'restarted-window' ? 'Restarted window' : 'Quota refill';
+  function shortDate(value) {
+    var t = parseTs(value);
+    return isNaN(t) ? 'unknown time' : new Date(t).toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' });
+  }
+
+  function pct(reading) { return Math.round(reading.utilization * 100); }
+
+  // One line per limit the tracker is watching on an account. A window whose
+  // reset time has passed is the held pre-expiry reading (see reset-tracker):
+  // the account has not been used since, so there is no live window to show.
+  function windowLine(w) {
+    var shown = quotaDisplay(w.utilization, quotaMode);
+    var due = parseTs(w.resetAt);
+    return el('p', 'usage', w.label + ' · ' + (shown == null ? 'unknown' : shown + '% ' + quotaMode) + ' · '
+      + (!isNaN(due) && due <= Date.now() ? 'ended ' + shortDate(due) + ', no new window yet' : 'resets ' + shortDate(due)));
   }
 
   function renderResets(s) {
@@ -1209,50 +1251,60 @@ ${SHARED_HELPERS}
     var summary = document.getElementById('resetSummary');
     var accounts = document.getElementById('resetAccounts'); accounts.textContent = '';
     var history = document.getElementById('resetEvents'); history.textContent = '';
+    var note = document.getElementById('resetHistoryNote'); note.textContent = '';
     if (!data) { summary.textContent = 'Reset tracking is unavailable on this proxy.'; return; }
-    var notifications = data.notifications || {};
-    summary.textContent = 'Tracking since ' + resetDate(data.startedAt) + '. ' +
-      ((s.probe || {}).enabled ? 'Unexpected drops need a second probe to confirm. ' : 'Quota probes are off. History is not updating. ') +
-      (notifications.enabled ? 'Google Chat enabled. ' + notifications.pending + ' notifications queued.' : 'Google Chat is off.') +
-      (notifications.lastSentAt ? ' Last sent ' + resetDate(notifications.lastSentAt) + '.' : '') +
-      (data.error ? ' ' + data.error : '') + (notifications.error ? ' ' + notifications.error : '');
+    var probe = s.probe || {}, notifications = data.notifications || {};
+    summary.textContent = (probe.enabled ? 'Each account is probed every ' + fmtIn(probe.intervalSeconds) + '. ' : 'Quota probes are off, so nothing here updates. ')
+      + 'Tracking since ' + shortDate(data.startedAt) + '. '
+      + (notifications.enabled ? 'Early resets go to Google Chat' + (notifications.pending ? ' (' + notifications.pending + ' waiting to send)' : '') + '.' : 'Google Chat alerts are off.')
+      + (data.error ? ' ' + data.error : '') + (notifications.error ? ' ' + notifications.error : '');
     (data.accounts || []).forEach(function (account) {
       var card = el('div', 'card');
       card.appendChild(el('h3', '', account.name));
       var totals = account.totals || {};
-      card.appendChild(el('p', '', 'Early resets: ' + (totals.early || 0) + ' · Scheduled rollovers: ' + (totals.scheduled || 0) + ' · Uncertain timing: ' + (totals.uncertain || 0)));
-      var types = account.earlyTypes || {};
-      card.appendChild(el('p', 'usage', 'Early restarted windows: ' + (types['restarted-window'] || 0) + ' · Early quota refills: ' + (types['quota-refill'] || 0)));
-      card.appendChild(el('p', 'usage', 'Last observation: ' + resetDate(account.lastObservedAt)));
+      var early = totals.early || 0, scheduled = totals.scheduled || 0, unclear = totals.uncertain || 0;
+      card.appendChild(el('p', early ? 'warnt' : '', scheduled + ' on-schedule rollover' + (scheduled === 1 ? '' : 's') + ' · ' + early + ' early reset' + (early === 1 ? '' : 's')
+        + (unclear ? ' · ' + unclear + ' with unclear timing' : '')));
+      var windows = account.windows || {};
+      var keys = Object.keys(windows);
+      if (keys.length) keys.forEach(function (key) { card.appendChild(windowLine(windows[key])); });
+      else card.appendChild(el('p', 'usage', 'No limit windows reported yet.'));
       (account.pending || []).forEach(function (pending) {
-        card.appendChild(el('p', 'warnt', 'Awaiting confirmation: ' + pending.after.label + ' ' + resetType(pending.type).toLowerCase() + ', ' + Math.round(pending.before.utilization * 100) + '% to ' + Math.round(pending.after.utilization * 100) + '%.'));
+        card.appendChild(el('p', 'warnt', 'Possible early reset on ' + pending.after.label + ', ' + pct(pending.before) + '% → ' + pct(pending.after) + '% spent. Waiting for the next probe to confirm.'));
       });
       if (account.provider === 'codex') {
         var inventory = account.credits;
-        card.appendChild(el('p', '', inventory ? 'Banked resets: ' + inventory.availableCount + ' available at last check' : 'Banked resets: unknown'));
-        if (inventory) {
-          card.appendChild(el('p', 'usage', 'Credit inventory checked: ' + resetDate(inventory.observedAt)));
-          inventory.credits.filter(function (credit) { return credit.status === 'available'; }).forEach(function (credit) {
-            card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'Expired ' : 'Expires ') + resetDate(credit.expiresAt) : 'No expiry reported')));
-          });
-        }
+        card.appendChild(el('p', '', inventory ? 'Banked resets: ' + inventory.availableCount + ' available' + (inventory.observedAt ? ', checked ' + fmtAgo(inventory.observedAt) : '') : 'Banked resets: unknown'));
+        if (inventory) inventory.credits.filter(function (credit) { return credit.status === 'available'; }).forEach(function (credit) {
+          card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'expired ' : 'expires ') + shortDate(credit.expiresAt) : 'no expiry reported')));
+        });
         if (account.creditError) card.appendChild(el('p', 'warnt', account.creditError + '. Showing the last successful inventory.'));
-      } else card.appendChild(el('p', 'usage', 'Banked reset inventory is not reported by this provider.'));
+      }
+      card.appendChild(el('p', 'usage', account.lastObservedAt ? 'Last probed ' + fmtAgo(account.lastObservedAt) : 'Not probed yet'));
       accounts.appendChild(card);
     });
     if (!(data.accounts || []).length) accounts.appendChild(el('p', 'usage', 'Waiting for the first successful quota probe.'));
-    history.appendChild(el('p', 'usage', 'Latest 500 events. Counts include older events. Times use the browser timezone. Detection is inferred from provider readings; small drops and long gaps are not counted.'));
-    if (!(data.events || []).length) history.appendChild(el('p', 'usage', 'No resets detected yet.'));
-    (data.events || []).forEach(function (event) {
-      var card = el('div', 'card');
-      card.appendChild(el('h3', '', event.account + ' · ' + (event.timing === 'scheduled' ? 'Scheduled rollover' : event.timing === 'early' ? 'Early reset' : 'Reset with uncertain timing')));
-      (event.windows || []).forEach(function (window) {
-        card.appendChild(el('p', '', window.after.label + ' · ' + resetType(window.type) + ' · ' + Math.round(window.before.utilization * 100) + '% → ' + Math.round(window.after.utilization * 100) + '%'));
-        card.appendChild(el('p', 'usage', 'Observed between ' + resetDate(window.before.at) + ' and ' + resetDate(window.after.at)));
-        card.appendChild(el('p', 'usage', 'Reset time: ' + resetDate(window.before.resetAt) + ' → ' + resetDate(window.after.resetAt)));
+    var rows = resetHistoryRows(data.events);
+    var head = el('thead'), headRow = el('tr');
+    ['When', 'Account', 'Limit', 'What happened', 'Spent before → after'].forEach(function (label) { headRow.appendChild(el('th', '', label)); });
+    head.appendChild(headRow); history.appendChild(head);
+    var body = el('tbody');
+    if (!rows.length) { var emptyRow = el('tr'), empty = el('td', 'empty', 'No resets seen yet.'); empty.colSpan = 5; emptyRow.appendChild(empty); body.appendChild(emptyRow); }
+    rows.forEach(function (row) {
+      var tr = el('tr');
+      tr.title = 'Seen between ' + resetDate(row.observed[0]) + ' and ' + resetDate(row.observed[1]) + '. Reset time ' + resetDate(row.resetAt[0]) + ' → ' + resetDate(row.resetAt[1]) + '.';
+      [['When', shortDate(row.when), ''], ['Account', row.account, ''], ['Limit', row.window, ''],
+        ['What happened', row.what, row.kind === 'warn' ? 'warnt' : row.kind === 'dim' ? 'dim' : ''],
+        ['Spent before → after', row.before + '% → ' + row.after + '%', '']].forEach(function (cell) {
+        var td = el('td', cell[2], cell[1]); td.setAttribute('data-label', cell[0]); tr.appendChild(td);
+        // The probe pair that bounds the detection, visible rather than hover-only.
+        if (cell[0] === 'When') td.appendChild(el('small', 'dim', 'probes ' + shortDate(row.observed[0]) + ' and ' + shortDate(row.observed[1])));
       });
-      history.appendChild(card);
+      body.appendChild(tr);
     });
+    history.appendChild(body);
+    note.textContent = 'Resets are inferred from probe readings, so a small drop or a long gap between probes can be missed.'
+      + ((data.events || []).length >= 500 ? ' Showing the latest 500 events; the account counts include older ones.' : '');
   }
 
   function renderDiagnostics(s) {
@@ -1472,7 +1524,7 @@ ${SHARED_HELPERS}
 
   function showView() {
     var name = location.hash.slice(1) || 'overview';
-    var views = { overview:['Overview','Routing & capacity','Where requests are expected to go. How much quota each account has used.'], accounts:['Accounts','Account capacity','Compare subscription limits and reset times.'], activity:['Activity','Request activity','Requests and usage observed by this proxy.'], routing:['Routing','Model routing','Server-reported targets and configured routing rules.'], resets:['Resets','Usage resets','Observed quota resets and banked reset inventory.'], diagnostics:['Diagnostics','Proxy diagnostics','Connection status, quota probes, and background jobs.'] };
+    var views = { overview:['Overview','Routing & capacity','Where requests are expected to go. How much quota each account has used.'], accounts:['Accounts','Account capacity','Compare subscription limits and reset times.'], activity:['Activity','Request activity','Requests and usage observed by this proxy.'], routing:['Routing','Model routing','Server-reported targets and configured routing rules.'], resets:['Resets','Usage resets','When each limit resets, and any reset that came early.'], diagnostics:['Diagnostics','Proxy diagnostics','Connection status, quota probes, and background jobs.'] };
     if (!views[name]) name = 'overview';
     document.getElementById('breadcrumb').textContent = 'Dashboard / ' + views[name][0];
     document.getElementById('pageTitle').textContent = views[name][1];
@@ -1559,7 +1611,7 @@ ${SHARED_HELPERS}
     document.getElementById(mode === 'spent' ? 'quotaSpent' : 'quotaLeft').addEventListener('click', function () {
       quotaMode = mode;
       try { localStorage.setItem('teamclaude-quota-display', mode); } catch {}
-      if (lastStatus) { renderAccounts(lastStatus); if (document.getElementById('accountDialog').open) renderAccountDetails(); }
+      if (lastStatus) { renderAccounts(lastStatus); renderResets(lastStatus); if (document.getElementById('accountDialog').open) renderAccountDetails(); }
     });
   });
   document.querySelectorAll('[data-close]').forEach(function (button) { button.addEventListener('click', function () { document.getElementById(button.getAttribute('data-close')).close(); }); });
