@@ -56,7 +56,7 @@ teamclaude login             # select a Claude subscription; repeat per account
 teamclaude login --codex     # repeat per Codex account
 ```
 
-For this fork, merge `"autoUpdate": false` into TeamClaude's config before installing the service. This prevents npm self-updates from replacing the fork. Stop any foreground `teamclaude server` before installing the service on the same port:
+For this fork, merge `"autoUpdate": false` into TeamClaude's config before installing the service. This prevents npm self-updates from replacing a packaged fork installation. The updater already skips source checkouts. Stop any foreground `teamclaude server` before installing the service on the same port:
 
 ```bash
 teamclaude service install
@@ -88,7 +88,7 @@ A fresh plain `claude` invocation now uses these settings. If a launcher exclude
 ANTHROPIC_BASE_URL=http://127.0.0.1:3456 ANTHROPIC_AUTH_TOKEN=teamclaude claude -p "Your task"
 ```
 
-This configures base-URL routing. For features that hardcode Anthropic URLs, use `teamclaude run -- <claude arguments>` and the [MITM proxy mode](docs/proxy-modes.md#mitm-proxy-mode-default). A shell alias alone does not configure desktop apps or agents that spawn executables without an interactive shell.
+This configures base-URL routing with a client placeholder. The built-in `teamclaude run` and `teamclaude env` commands normally emit no client credential. For features that hardcode Anthropic URLs, use `teamclaude run -- <claude arguments>` and the [MITM proxy mode](docs/proxy-modes.md#mitm-proxy-mode-default). Before switching to MITM, clear these two variables from saved settings and the launching environment, including Codex child-process defaults, and retain your native Claude login. Otherwise the saved base URL can send inference outside the CONNECT tunnel and bypass a MITM account pin. A shell alias alone does not configure desktop apps or agents that spawn executables without an interactive shell.
 
 ### 3. Set Codex's provider and child-process defaults
 
@@ -108,7 +108,9 @@ ANTHROPIC_BASE_URL = "http://127.0.0.1:3456"
 ANTHROPIC_AUTH_TOKEN = "teamclaude"
 ```
 
-Codex CLI and desktop Codex use this user configuration. The provider routes Codex's own requests; `shell_environment_policy.set` also routes Claude CLI commands launched by Codex. `requires_openai_auth = true` lets the local proxy supply Codex credentials. The `/backend-api/codex` suffix is required for subscription traffic. `OPENAI_BASE_URL` is not a substitute for this provider configuration.
+Codex CLI and desktop Codex use this user configuration. The provider routes Codex's own requests, and `shell_environment_policy.set` also routes Claude CLI commands launched by Codex. The `/backend-api/codex` suffix is required for subscription traffic. `OPENAI_BASE_URL` is not a substitute for this provider configuration.
+
+Keep your native ChatGPT login when using `requires_openai_auth = true`. This setting preserves desktop account features. TeamClaude replaces model-request credentials with the selected pool account either way. For a CLI-only setup without a native OpenAI login, set `requires_openai_auth = false` instead. That permits local proxy requests but can hide account-dependent desktop settings. Enroll pooled subscriptions separately from the native login. See [desktop account settings](docs/codex-remote-access.md#preserve-desktop-account-settings).
 
 If you use `CODEX_HOME`, edit `config.toml` in that directory instead. Preserve the TeamClaude provider when overriding models, reasoning effort, or profiles. Use the unpinned URL above to let the router select accounts.
 
@@ -129,7 +131,7 @@ If the proxy is unavailable, report the failure instead of falling back to a
 direct provider. Apply these defaults without asking on each invocation.
 ```
 
-If `~/.codex/AGENTS.override.md` exists, Codex reads it instead of `AGENTS.md`; put the rule in the active file. Custom `CODEX_HOME` and `CLAUDE_CONFIG_DIR` directories also need their own instructions and settings. Start new sessions after editing. Instructions guide future commands; they cannot redirect an already running agent's connection.
+If `~/.codex/AGENTS.override.md` exists, Codex reads it instead of `AGENTS.md`. Put the rule in the active file, as described in [OpenAI's instruction discovery guide](https://developers.openai.com/codex/guides/agents-md). Custom `CODEX_HOME` and `CLAUDE_CONFIG_DIR` directories also need their own instructions and settings. Start new sessions after editing. Instructions guide future commands; they cannot redirect an already running agent's connection.
 
 ### 5. Verify each launch path
 
