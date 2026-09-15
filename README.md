@@ -43,6 +43,119 @@ The command reference uses `teamclaude`; from a source checkout, substitute `nod
 
 Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
 
+## Make routing automatic for agents and CLIs
+
+These steps configure all projects for your OS user on macOS or Linux. Repeat them on each machine that runs agents or review jobs. The examples use a proxy on the **same machine**, at `http://127.0.0.1:3456`.
+
+### 1. Add accounts and keep the proxy running
+
+After the source checkout above, use `node src/index.js` in place of `teamclaude` unless you already have a fork launcher installed. Add each subscription you want to pool:
+
+```bash
+teamclaude login             # select a Claude subscription; repeat per account
+teamclaude login --codex     # repeat per Codex account
+```
+
+For this fork, merge `"autoUpdate": false` into TeamClaude's config before installing the service. This prevents npm self-updates from replacing a packaged fork installation. The updater already skips source checkouts. Stop any foreground `teamclaude server` before installing the service on the same port:
+
+```bash
+teamclaude service install
+teamclaude service status
+teamclaude probe 300         # refresh quota every five minutes
+teamclaude status
+```
+
+The service starts at login through launchd on macOS or systemd on Linux. For unattended Linux jobs that must survive logout, follow the install command's `loginctl enable-linger` guidance. See [service commands](docs/usage.md#command-reference).
+
+### 2. Set Claude Code's user defaults
+
+Merge this `env` object into `~/.claude/settings.json`. Preserve your existing settings and other environment entries:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456",
+    "ANTHROPIC_AUTH_TOKEN": "teamclaude"
+  }
+}
+```
+
+`teamclaude` is a non-secret placeholder for this loopback connection. TeamClaude supplies the selected account's real upstream credential. The placeholder lets Claude CLI use the proxy without depending on an expired local OAuth login. It is not a valid credential for a remote TeamClaude server; remote clients need [proxy authentication](docs/configuration.md#fields).
+
+A fresh plain `claude` invocation now uses these settings. If a launcher excludes user settings or uses another configuration directory, pass both variables explicitly:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:3456 ANTHROPIC_AUTH_TOKEN=teamclaude claude -p "Your task"
+```
+
+This configures base-URL routing with a client placeholder. The built-in `teamclaude run` and `teamclaude env` commands normally emit no client credential. For features that hardcode Anthropic URLs, use `teamclaude run -- <claude arguments>` and the [MITM proxy mode](docs/proxy-modes.md#mitm-proxy-mode-default). Before switching to MITM, clear these two variables from saved settings and the launching environment, including Codex child-process defaults, and retain your native Claude login. Otherwise the saved base URL can send inference outside the CONNECT tunnel and bypass a MITM account pin. A shell alias alone does not configure desktop apps or agents that spawn executables without an interactive shell.
+
+### 3. Set Codex's provider and child-process defaults
+
+Merge the following into `~/.codex/config.toml`. Keep `model_provider` at the top level, before any table headers. Merge existing tables instead of defining them twice:
+
+```toml
+model_provider = "teamclaude"
+
+[model_providers.teamclaude]
+name = "teamclaude"
+base_url = "http://127.0.0.1:3456/backend-api/codex"
+wire_api = "responses"
+requires_openai_auth = true
+
+[shell_environment_policy.set]
+ANTHROPIC_BASE_URL = "http://127.0.0.1:3456"
+ANTHROPIC_AUTH_TOKEN = "teamclaude"
+```
+
+Codex CLI and desktop Codex use this user configuration. The provider routes Codex's own requests, and `shell_environment_policy.set` also routes Claude CLI commands launched by Codex. The `/backend-api/codex` suffix is required for subscription traffic. `OPENAI_BASE_URL` is not a substitute for this provider configuration.
+
+Keep your native ChatGPT login when using `requires_openai_auth = true`. This setting preserves desktop account features. TeamClaude replaces model-request credentials with the selected pool account either way. For a CLI-only setup without a native OpenAI login, set `requires_openai_auth = false` instead. That permits local proxy requests but can hide account-dependent desktop settings. Enroll pooled subscriptions separately from the native login. See [desktop account settings](docs/codex-remote-access.md#preserve-desktop-account-settings).
+
+If you use `CODEX_HOME`, edit `config.toml` in that directory instead. Preserve the TeamClaude provider when overriding models, reasoning effort, or profiles. Use the unpinned URL above to let the router select accounts.
+
+### 4. Add persistent agent instructions
+
+Add this rule to both `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`, preserving their existing contents:
+
+```text
+Use TeamClaude for all local Codex and Claude Code invocations, including
+delegated tasks and reviews. Preserve Codex's teamclaude provider when changing
+models or reasoning settings.
+
+When launching Claude CLI, pass ANTHROPIC_BASE_URL=http://127.0.0.1:3456 and
+ANTHROPIC_AUTH_TOKEN=teamclaude. Let TeamClaude select the account by model and
+quota. Do not pin an account unless the user requests it.
+
+If the proxy is unavailable, report the failure instead of falling back to a
+direct provider. Apply these defaults without asking on each invocation.
+```
+
+If `~/.codex/AGENTS.override.md` exists, Codex reads it instead of `AGENTS.md`. Put the rule in the active file, as described in [OpenAI's instruction discovery guide](https://developers.openai.com/codex/guides/agents-md). Custom `CODEX_HOME` and `CLAUDE_CONFIG_DIR` directories also need their own instructions and settings. Start new sessions after editing. Instructions guide future commands; they cannot redirect an already running agent's connection.
+
+### 5. Verify each launch path
+
+```bash
+teamclaude status
+claude -p --model claude-fable-5-1 "Reply with exactly OK. Do not use tools."
+codex exec --skip-git-repo-check "Reply with exactly OK. Do not use tools."
+teamclaude status
+```
+
+Use a model available to your accounts. These tests consume a small amount of quota. Confirm successful responses and an increase in the corresponding account's request count. For request-level evidence, use the TUI activity view or [activity logging](docs/usage.md#request-logging). A healthy status endpoint alone does not prove the client uses the proxy.
+
+When one Claude account has spent its Fable quota, the live status should select another eligible account for Fable. The global current-account marker can still name the first account. To prefer Fable-depleted accounts for Opus, Sonnet, and Haiku too, merge `"preferFableDepletedAccounts": true` into TeamClaude's config and reload it. That optional preference is off by default; see [Fable quota preservation](docs/routing.md#prefer-accounts-with-depleted-fable-quota).
+
+Test desktop sessions separately. Codex's bundled desktop executable and CLI have been verified with this setup. **Claude desktop Code routing remains unverified**: its launcher can supply its own provider settings, and a successful Claude CLI test does not prove desktop routing. The regular Claude Chat tab does not use these agent instructions. Confirm a real local Code request in TeamClaude before relying on desktop rotation.
+
+### Scheduled jobs and cross-review pollers
+
+Configure the machine and OS user that actually runs the job. launchd, systemd, and `env -i` do not inherit an interactive shell's aliases or exports.
+
+For a Codex reviewer that uses a temporary `HOME`, preserve an absolute `CODEX_HOME` pointing to the configured Codex directory. For a Claude reviewer that clears the environment or excludes user settings, pass both Claude proxy variables explicitly to its process. Check the job's actual launch command and logs, not only a manual terminal invocation.
+
+Verify that the scheduler can execute the script and that requests reach TeamClaude. For example, launchd exit code `126` with `Operation not permitted` means the job failed before inference; changing routing settings will not repair that launch failure. Keep existing schedules on their current host unless you intend to move them.
+
 ## What it does
 
 - Rotates to the next account when the 5h session or 7d weekly bucket reaches the threshold (98% by default), preferring the account whose weekly quota resets soonest.
