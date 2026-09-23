@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   providerOf, providerForPath, applyAuthHeaders, upstreamFor, rewritesBody,
-  isKnownProvider, DEFAULT_PROVIDER,
+  defaultHeadersTimeoutFor, isKnownProvider, DEFAULT_PROVIDER,
 } from '../src/provider.js';
 
 // An account written before providers existed carries no `provider` field. It
@@ -37,6 +37,37 @@ test('the request path selects the provider', () => {
   assert.equal(providerForPath('/v1/complete'), 'anthropic');
   assert.equal(providerForPath(''), 'anthropic');
   assert.equal(providerForPath(undefined), 'anthropic');
+});
+
+// The path goes upstream verbatim, so this prefix test has to read it the way
+// the server that resolves it will. Otherwise the two disagree about which pool
+// of accounts is eligible, and therefore about which credential is attached.
+test('the provider is selected on the decoded path', () => {
+  assert.equal(providerForPath('/backend-api%2fcodex/responses'), 'codex');
+  assert.equal(providerForPath('/backend-api/codex%2fresponses'), 'codex');
+  assert.equal(providerForPath('/backend-api/codex%2Fmodels?client_version=0.150.1'), 'codex');
+  assert.equal(providerForPath('/%62ackend-api/codex/responses'), 'codex');
+});
+
+// A backslash is a separator to the URL parser, so `new URL()` folds it while
+// building the outgoing target. The prefix test has to fold it too, or the
+// request goes out as a Codex path having been classified as an Anthropic one.
+test('the provider is selected on the separator-folded path', () => {
+  assert.equal(providerForPath('/backend-api\\codex/responses'), 'codex');
+  assert.equal(providerForPath('/backend-api/codex\\responses'), 'codex');
+  assert.equal(providerForPath('/backend-api\\codex'), 'codex');
+  assert.equal(providerForPath('/backend-api%5ccodex/responses'), 'codex');
+});
+
+// One decode deep: `%252f` resolves to a literal `%2f` inside a segment, so
+// `/backend-api%252fcodex/…` is a path under `/backend-api%2fcodex`, not a Codex
+// one. A malformed escape has no decoded form and is read as sent.
+test('a double-encoded or undecodable path is classified as it resolves', () => {
+  assert.equal(providerForPath('/backend-api%252fcodex/responses'), 'anthropic');
+  assert.equal(providerForPath('/backend-api/codex%252fresponses'), 'anthropic');
+  assert.equal(providerForPath('/backend-api/%/responses'), 'anthropic');
+  assert.equal(providerForPath('/backend-api/codex/%/responses'), 'codex');
+  assert.equal(providerForPath('/backend-api%255ccodex/responses'), 'anthropic');
 });
 
 test('Anthropic OAuth sends a bearer token, an API key sends x-api-key', () => {
@@ -79,4 +110,16 @@ test('the configured upstream applies to Anthropic only', () => {
 test('body rewrites are Anthropic-only', () => {
   assert.equal(rewritesBody({ type: 'oauth' }), true);
   assert.equal(rewritesBody({ provider: 'codex' }), false);
+});
+
+// Codex holds the response head open while the model reasons, so a large turn
+// passes two minutes before its first byte while the socket is perfectly
+// healthy. Anthropic streams within seconds and keeps the fleet default —
+// `null` says the provider has no opinion, so nothing else has to know what
+// that default is.
+test('Codex waits longer for the response head than the fleet default', () => {
+  assert.equal(defaultHeadersTimeoutFor({ provider: 'codex' }), 300_000);
+  assert.equal(defaultHeadersTimeoutFor({ provider: 'anthropic' }), null);
+  assert.equal(defaultHeadersTimeoutFor({ type: 'oauth' }), null);
+  assert.equal(defaultHeadersTimeoutFor(undefined), null);
 });

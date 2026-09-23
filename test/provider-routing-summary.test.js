@@ -27,7 +27,7 @@ test('header separates providers and groups model-specific Claude targets', () =
   const fable = status.routes.find(r => r.name === 'fable');
   assert.deepEqual(fable.accounts.map(a => a.name), ['claude-a', 'claude-b']);
   assert.equal(fable.target, 'claude-b');
-  assert.ok(routeRows(status).every(row => row.kind !== 'default'));
+  assert.deepEqual(routeRows(status).filter(row => row.kind === 'default').map(row => row.provider), ['anthropic', 'codex']);
 });
 
 test('preview mirrors provider cursor and priority without changing routing state', () => {

@@ -1,7 +1,21 @@
-// Tracks Claude Code sessions by their `x-claude-code-session-id` header so
-// teamclaude can (a) report how many sessions are running and (b) optionally
-// keep each session pinned to one account while spreading NEW sessions across
-// accounts (the opt-in fix for concurrency funnelling — issue #109).
+// Tracks live CONVERSATIONS so teamclaude can (a) report what the fleet is
+// carrying and (b) optionally keep each conversation pinned to one account
+// while spreading NEW ones across accounts (the opt-in fix for concurrency
+// funnelling — issue #109).
+//
+// The key is a pin key, not a bare session id: a client's
+// `x-claude-code-session-id` narrowed to the conversation within it (see
+// conversation.js for how, and why). One Claude Code session emits one session
+// id for its own turns AND for every subagent it launches, so keying on that
+// header alone held a whole fan-out on one account — N concurrent requests
+// queueing behind one account's ceiling, for a prompt cache none of them
+// shared. A conversation is the thing that owns a cache, so it is the thing
+// that is pinned, counted as load, and spread.
+//
+// Each record carries the session id it belongs to, unnarrowed, so the readout
+// can still group and name what an operator recognises. Counts here are
+// therefore conversations: a session that fans out nine ways is nine of them,
+// which is also what its load on the fleet actually is.
 //
 // A session pins PER WEEKLY QUOTA BUCKET, not once overall. Quota and
 // eligibility are already decided per bucket — an account whose Fable weekly is
@@ -19,27 +33,37 @@
 //   - ACTIVE: a session counts as "active" (and toward per-account load) if it
 //     made a request this recently. Short, so load-balancing reacts to what is
 //     actually running now rather than to sessions merely lingering in the hour.
-import { remapHeld } from './rollover.js';
+import { remapHeld, newObservation } from './rollover.js';
 
 export const SESSION_KNOWN_TTL_MS = 60 * 60 * 1000; // 1h idle → forgotten
 export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "active"
 
 const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
-// The session id is a client-supplied header, and every distinct value becomes
-// a Map key that lives for the known window. A client minting a fresh id per
-// request would otherwise grow this map for an hour with nothing to stop it, so
-// the tracker bounds itself: at most this many sessions (the idle ones go first
-// when the cap is hit — one still in flight is never dropped), and no key longer
-// than this. server.js validates the header too; this is the tracker's own guard.
+// A pin key is derived from client-supplied bytes — the session header and the
+// conversation's opening — and every distinct value becomes a Map key that lives
+// for the known window. A client minting a fresh session id per request, or one
+// rewriting its first message every turn, would otherwise grow this map for an
+// hour with nothing to stop it, so the tracker bounds itself: at most this many
+// conversations (the idle ones go first when the cap is hit — one still in
+// flight is never dropped), and no key longer than this.
+//
+// The cap counts conversations, so one client fanning out holds as many entries
+// as it has agents in flight rather than one. That is the quantity worth
+// bounding: the entries exist to hold a pin and a prompt cache each, and a
+// client with ten thousand live conversations has bigger problems than this map.
 export const MAX_SESSIONS = 10_000;
 export const MAX_SESSION_ID_LENGTH = 128;
+// The session id, the separator and the digest conversation.js appends. Bounded
+// rather than derived from that module so the tracker's own guard does not
+// depend on the caller it is guarding against.
+export const MAX_KEY_LENGTH = MAX_SESSION_ID_LENGTH + 1 + 22;
 
-// The Map key for a client-supplied id. Bounded here so every entry point keys
-// the same way and a long id cannot hold more memory than a short one.
-function keyOf(sessionId) {
-  if (typeof sessionId !== 'string' || sessionId.length <= MAX_SESSION_ID_LENGTH) return sessionId;
-  return sessionId.slice(0, MAX_SESSION_ID_LENGTH);
+// The Map key for a client-supplied pin key. Bounded here so every entry point
+// keys the same way and a long key cannot hold more memory than a short one.
+function keyOf(key) {
+  if (typeof key !== 'string' || key.length <= MAX_KEY_LENGTH) return key;
+  return key.slice(0, MAX_KEY_LENGTH);
 }
 
 // Per-session token totals, kept per weekly bucket rather than once per session.
@@ -86,11 +110,42 @@ function setAndReturn(map, key, value) {
   return value;
 }
 
+/**
+ * A rollover reading held for the account a preemption pushed traffic off,
+ * until a served request releases it or a fail-back hands it back. One hold per
+ * escaped account, chained newest first, so a second preemption taken before the
+ * first is settled holds both readings.
+ *
+ * @typedef {Object} Hold
+ * @property {number} idx the account the held reading was taken on
+ * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
+ * @property {string|null} provider the fleet whose reading this preserves, null while no walk has moved it
+ * @property {number} gen the stamp of the move that escaped this roll
+ * @property {Hold|null} prev the escape still outstanding behind this one, null at the tail
+ */
+/**
+ * What one sticky choice was last found resting on, and what that account's
+ * windows read then. Shared by the current account and by every session pin,
+ * so both stores answer a roll the same way.
+ *
+ * @typedef {Object} Observation
+ * @property {number|null} idx the account the reading was taken on, null before one is named
+ * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
+ * @property {Hold|null} unescaped the roll this choice was pushed off and has not escaped
+ * @property {number} gen the stamp a confirmation is scoped by
+ * @property {string|null} provider the fleet whose reading this is
+ * @property {Map<string, number>|null} handedBack the account's windows as they stood when a hold handed this reading back, so the roll it was handed back for is not held again; null once the reading moves
+ */
 export class SessionTracker {
+  /**
+   * @param {Object} [opts]
+   * @param {number} [opts.knownTtlMs]
+   * @param {number} [opts.activeTtlMs]
+   * @param {() => number} [opts.now]
+   */
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
     // id -> { pins: Map<bucketKey, { idx, at }>,
-    //         refs: Map<bucketKey, { idx, windows: Map<window, reset>,
-    //                                unescaped: { idx, windows } | null, gen }>,
+    //         refs: Map<bucketKey, Observation>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
@@ -241,6 +296,43 @@ export class SessionTracker {
     return s.starved;
   }
 
+  /**
+   * Record one client request's outcome against EVERY live conversation of a
+   * session, for the exits that refuse a request before its body is read: an
+   * unreachable egress, a dot-segment path, an unknown account pin. They can
+   * name the session that asked but not the conversation within it, because the
+   * conversation is named by a body nobody has read yet.
+   *
+   * Refusing them all is the honest reading rather than a convenient one: what
+   * those exits refuse is the SESSION's request, on grounds that have nothing to
+   * do with which of its conversations sent it — an egress that is not up is not
+   * up for any of them. Attributing it to one conversation would need a guess,
+   * and dropping it entirely would let a proxy refusing everything report that
+   * nothing is starving.
+   *
+   * Walks rather than keeping an index: these exits are rare, the map is bounded
+   * by MAX_SESSIONS, and a second map keyed by session id would need its own
+   * lifetime and its own sweep to stay in step with this one.
+   *
+   * @param {string|null} sessionId
+   * @param {boolean} usable
+   * @param {number} [now]
+   * @returns {number} how many conversations took the outcome
+   */
+  recordOutcomeForSession(sessionId, usable, now = this._now()) {
+    if (!sessionId) return 0;
+    let touched = 0;
+    // Deleting the entry a Map iterator is on is defined behaviour, so the
+    // expired ones are dropped in place without copying the map first.
+    for (const [key, s] of this.sessions) {
+      if (this._isExpired(s, now)) { this.sessions.delete(key); continue; }
+      if (s.sessionId !== sessionId) continue;
+      s.starved = usable ? 0 : s.starved + 1;
+      touched += 1;
+    }
+    return touched;
+  }
+
   // A known, non-expired session's record, or null. Never creates one, and
   // drops an expired one on read like pinnedAccount does.
   _live(sessionId, now) {
@@ -275,7 +367,12 @@ export class SessionTracker {
         // monotonically — and no denominator is needed, which keeps `count`
         // (forward attempts, inflated by retries) out of the question entirely.
         starved: 0,
-        // Labels from the request that opened the session (see beginRequest).
+        // Labels from the request that opened the conversation (see
+        // beginRequest). `sessionId` is the client session this conversation is
+        // one of — what the readout groups by, and the only name of it an
+        // operator would recognise.
+        sessionId: null,
+        conversation: null,
         client: null,
         dimensions: null,
       };
@@ -333,12 +430,20 @@ export class SessionTracker {
     return s.pins.get(bucket)?.idx ?? null;
   }
 
-    // The rollover observation this session holds for `bucket`: the account
-    // traffic was last found resting on and what its windows read then. Kept
-    // beside the pin rather than on it because it outlives a relocation — a pin
-    // just moved off an account is not evidence about that account, and the
-    // observation has to still be there when the traffic comes back. It dies
-    // with the session.
+  /**
+   * The rollover observation this session holds for `bucket`: the account
+   * traffic was last found resting on and what its windows read then. Kept
+   * beside the pin rather than on it because it outlives a relocation — a pin
+   * just moved off an account is not evidence about that account, and the
+   * observation has to still be there when the traffic comes back. It dies
+   * with the session.
+   *
+   * @param {string|null} sessionId
+   * @param {string|null} bucket
+   * @param {boolean} [create]
+   * @param {number} [now]
+   * @returns {Observation|null}
+   */
   refsFor(sessionId, bucket, create = false, now = this._now()) {
     sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);
@@ -347,8 +452,9 @@ export class SessionTracker {
       this.sessions.delete(sessionId);
       return null;
     }
+    /** @type {Observation|null} */
     let ref = s.refs.get(bucket);
-    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null, gen: 0 });
+    if (!ref && create) s.refs.set(bucket, ref = newObservation());
     return ref || null;
   }
 
@@ -402,13 +508,22 @@ export class SessionTracker {
         else pin.idx = moved;
       }
       // An observation names its account by the same position, so it follows the
-      // same shift. One naming the account that went away is dropped whole:
-      // left behind, it would be read against whatever inherits the slot.
+      // same shift. One naming the account that went away is dropped only if it
+      // holds nothing. Left behind it would be read against whatever inherits
+      // the slot, but the rolls it holds for OTHER accounts are still owed to
+      // them, so a reading naming nobody carries them until each is handed back.
       for (const [bucket, ref] of [...s.refs]) {
         const moved = ref.idx == null ? null : mapFn(ref.idx);
-        if (ref.idx != null && moved == null) { s.refs.delete(bucket); continue; }
+        const held = remapHeld(ref.unescaped, mapFn);
+        if (moved == null) {
+          // The one factory builds the nameless reading in both stores, so a
+          // field the shape gains cannot miss one. Nothing owed is nothing to keep.
+          if (held) s.refs.set(bucket, { ...newObservation(), unescaped: held });
+          else s.refs.delete(bucket);
+          continue;
+        }
         ref.idx = moved;
-        ref.unescaped = remapHeld(ref.unescaped, mapFn);
+        ref.unescaped = held;
       }
     }
   }
@@ -493,6 +608,7 @@ export class SessionTracker {
     let known = 0;
     let active = 0;
     const perAccount = {};
+    const knownPerAccount = {};
     // { [index]: { [bucket]: activeCount } }. `perAccount` counts a session once
     // per account however many families it holds there, which is right for load
     // — one session is one client — but it cannot answer which FAMILY those
@@ -518,6 +634,11 @@ export class SessionTracker {
       }
       known += 1;
       if (items) items.push(sessionItem(id, s, this._isActive(s, now)));
+      // A pin remains useful for the whole known hour even after it stops
+      // counting as live load. Attribute that quieter population separately so
+      // status can distinguish an idle session from no observed session at all.
+      const knownAccounts = new Set([...s.pins.values()].map(pin => pin.idx));
+      for (const idx of knownAccounts) knownPerAccount[idx] = (knownPerAccount[idx] || 0) + 1;
       for (const [bucket, t] of s.tokens) {
         const per = byBucket[bucket] || (byBucket[bucket] = emptyAggregate());
         for (const k of COUNTERS) {
@@ -553,7 +674,7 @@ export class SessionTracker {
     }
     tokens.activeContext = activeContext;
     tokens.byBucket = byBucket;
-    const base = { known, active, perAccount, perAccountBucket, tokens, starvedMax };
+    const base = { known, active, perAccount, knownPerAccount, perAccountBucket, tokens, starvedMax };
     // Newest first: a per-session table is read top-down for what is happening
     // now, and the list is capped by the same TTLs as the map behind it.
     if (items) items.sort((a, b) => b.lastSeen - a.lastSeen);
@@ -574,6 +695,8 @@ function sessionItem(id, s, active) {
     starved: s.starved,
     firstSeen: s.firstSeen,
     lastSeen: s.lastSeen,
+    session: s.sessionId,
+    conversation: s.conversation,
     client: s.client,
     dimensions: s.dimensions ? { ...s.dimensions } : null,
     pins: Object.fromEntries([...s.pins].map(([bucket, p]) => [bucket, p.idx])),
@@ -590,6 +713,8 @@ function sessionItem(id, s, active) {
 function applyMetadata(s, metadata) {
   if (!metadata || typeof metadata !== 'object') return;
   if (typeof metadata.client === 'string' && metadata.client) s.client = metadata.client;
+  if (typeof metadata.sessionId === 'string' && metadata.sessionId) s.sessionId = metadata.sessionId;
+  if (typeof metadata.conversation === 'string' && metadata.conversation) s.conversation = metadata.conversation;
   const dims = metadata.dimensions;
   if (dims && typeof dims === 'object' && Object.keys(dims).length) {
     s.dimensions = { ...(s.dimensions || {}), ...dims };

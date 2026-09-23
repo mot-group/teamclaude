@@ -15,6 +15,7 @@ import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 import { AdmissionGate, DEFAULT_MAX_QUEUE, DEFAULT_QUEUE_TIMEOUT_MS } from './admission-gate.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
 // multiplexes ALL requests to an origin over a SINGLE HTTP/2 connection; under
@@ -100,18 +101,28 @@ const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTRE
 //
 // Default is generous (well above Claude's realistic first-byte, even when
 // queued or under load) so a slow-but-legitimate response is never mistaken for
-// a dead socket. Override with TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (or
-// per-call opts).
-const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
+// a dead socket. It is the wait for a backend this module knows nothing about:
+// a caller that knows its own upstream is slower to the head says so with
+// `defaultHeadersTimeoutMs`, which is how the forward path applies the
+// provider's default (provider.js — a Codex response head is held open while
+// the model reasons). Order, most specific first: the per-call
+// `headersTimeoutMs`, then TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (the
+// operator's fleet-wide override), then the caller's default, then this one.
+export const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
 
-function resolveHeadersTimeout(perCall) {
+/**
+ * @param {number|null|undefined} perCall
+ * @param {number|null|undefined} [fallbackMs]
+ * @returns {number}
+ */
+function resolveHeadersTimeout(perCall, fallbackMs) {
   if (perCall != null) return perCall;
   const env = Number(process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS);
-  return env > 0 ? env : DEFAULT_HEADERS_TIMEOUT_MS;
+  return env > 0 ? env : positiveInt(fallbackMs, DEFAULT_HEADERS_TIMEOUT_MS);
 }
 
 function headersTimeoutError(ms) {
-  const err = new Error(`upstream response headers timed out after ${ms}ms`);
+  const err = /** @type {CodedError} */ (new Error(`upstream response headers timed out after ${ms}ms`));
   // Recognized by server.js isTransient → fail fast + let the client retry, so
   // Node's fetch pool evicts the stale connection instead of wedging.
   err.code = 'TEAMCLAUDE_HEADERS_TIMEOUT';
@@ -121,9 +132,10 @@ function headersTimeoutError(ms) {
 // `useProxy` is decided by the caller (it varies per attempt — e.g. direct first,
 // then via sx after a 429). With it false, or sx unprovisioned, this is plain fetch
 // (plus the headers-timeout guard).
+/** @param {Record<string, any>} [opts] */
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
-  const { headersTimeoutMs, queueTimeoutMs, ...fetchOpts } = opts;
-  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
+  const { headersTimeoutMs, defaultHeadersTimeoutMs, queueTimeoutMs, ...fetchOpts } = opts;
+  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs, defaultHeadersTimeoutMs);
   // The admission wait is a per-call option of the node:http paths only; the
   // global-fetch escape hatch is not gated (it has no socket pool to protect).
   const nodeOpts = queueTimeoutMs == null ? fetchOpts : { ...fetchOpts, queueTimeoutMs };
@@ -208,7 +220,7 @@ function proxiedFetch(url, opts, sx, timeoutMs) {
     // tests inject a CA here to reach a self-signed upstream.
     tunnelTls({ proxy, targetHost: u.hostname, targetPort: Number(u.port) || 443, tlsOptions: sx.tlsOptions || {} })
       .then((sock) => cb(null, sock))
-      .catch((err) => cb(err));
+      .catch((err) => cb(err, null));
     return undefined; // socket delivered asynchronously via cb
   };
   return nodeRequest(u, opts, timeoutMs, { transport: https, agent });
@@ -234,7 +246,7 @@ async function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
   if (!admitted) {
     forget();
     if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
-    const err = new Error(`upstream admission queue for ${u.origin} is full or its wait deadline passed`);
+    const err = /** @type {CodedError} */ (new Error(`upstream admission queue for ${u.origin} is full or its wait deadline passed`));
     err.code = 'TEAMCLAUDE_UPSTREAM_OVERLOADED';
     throw err;
   }

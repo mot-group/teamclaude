@@ -1,7 +1,9 @@
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
-import { modelGlobMatches } from './model.js';
+import { modelGlobMatches, resolveSwitchThreshold } from './model.js';
 import { safeLine } from './safe-text.js';
+import { providerOf } from './provider.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 // Attach mode — the dashboard against a server running somewhere else (a
 // background service, another terminal). The renderer is the same one the
@@ -24,6 +26,7 @@ const text = (value, max, fallback = '') => {
   return safeLine(value, max) || fallback;
 };
 const NAME_MAX = 64;
+const LABEL_MAX = 32;
 
 // Addresses that reach this machine. A server bound to one of these exempts
 // loopback clients from the proxy-key gate, which changes what a 401 can mean.
@@ -96,6 +99,7 @@ export class RemoteControl {
 
   async _call(method, path, body) {
     const deadline = this.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    /** @type {Record<string, string>} */
     const headers = {};
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
     if (body !== undefined) headers['content-type'] = 'application/json';
@@ -130,11 +134,11 @@ export class RemoteControl {
       // clients from the key gate, so a 401 from there cannot be about the key
       // and blaming it would send the operator to edit a config that is fine.
       const auth = !answered && (res.status === 401 || res.status === 403);
-      const err = new Error(auth
+      const err = /** @type {CodedError} */ (new Error(auth
         ? (LOOPBACK_HOSTS.has(this.host)
           ? `something other than teamclaude is answering on port ${this.port} (HTTP ${res.status})`
           : `the server rejected the proxy API key (HTTP ${res.status})`)
-        : answered ? text(payload.error, 200, `HTTP ${res.status}`) : `HTTP ${res.status}`);
+        : answered ? text(payload.error, 200, `HTTP ${res.status}`) : `HTTP ${res.status}`));
       err.status = res.status;
       err.answered = answered;
       throw err;
@@ -185,6 +189,12 @@ export class RemoteAccountManager {
   constructor() {
     this.accounts = [];
     this.currentIndex = -1;
+    // Provider → current account, from a server that reports one per pool: by
+    // position when the server sends it, else by name.
+    /** @type {Record<string, string|null>|null} */
+    this.currentAccounts = null;
+    /** @type {Record<string, number|null>|null} */
+    this.currentIndexes = null;
     this.switchThreshold = 0.98;
     // The per-bucket table when the server sent one, so the attached dashboard
     // marks the same families blocked as the server's own TUI does.
@@ -196,11 +206,26 @@ export class RemoteAccountManager {
     this.connected = false;   // false ⇒ the view is a stale snapshot
     this.lastError = null;
     this.status = null;
+    // Empty until the first poll, so the header shows no version rather than
+    // this process's own — in attach mode that would name the wrong machine.
+    this.versionLabel = '';
+    this.updateAvailable = false;
   }
 
   /** Per-bucket threshold lookup, mirroring AccountManager.thresholdFor so the
-   * shared renderer works against either. */
-  thresholdFor(bucket) {
+   * shared renderer works against either. `account`, when given, is one of the
+   * plain objects `applyStatus` builds off `status.accounts` — its own
+   * `switchThreshold` (#409) is resolved with the SAME `resolveSwitchThreshold`
+   * the live server uses, so the attached dashboard reddens a bar at exactly
+   * the value the server is gating on.
+   * @param {string} bucket
+   * @param {any} [account] */
+  thresholdFor(bucket, account = null) {
+    return resolveSwitchThreshold(account?.switchThreshold, bucket, this._fleetThresholdFor(bucket));
+  }
+
+  /** @param {string} bucket */
+  _fleetThresholdFor(bucket) {
     const t = this.switchThresholds;
     if (t && typeof t === 'object') {
       const v = t[bucket] ?? t.default;
@@ -233,6 +258,14 @@ export class RemoteAccountManager {
     // -1 when the payload names an account that is no longer listed: nothing is
     // marked current, which is the truth, rather than defaulting to the first row.
     this.currentIndex = this.accounts.findIndex(a => a.name === text(status?.currentAccount, NAME_MAX));
+    const perProvider = status?.currentAccounts;
+    this.currentAccounts = perProvider && typeof perProvider === 'object' && !Array.isArray(perProvider)
+      ? Object.fromEntries(Object.entries(perProvider).map(([p, name]) => [p, name == null ? null : text(name, NAME_MAX)]))
+      : null;
+    const indexes = status?.currentIndexes;
+    this.currentIndexes = indexes && typeof indexes === 'object' && !Array.isArray(indexes)
+      ? Object.fromEntries(Object.entries(indexes).map(([p, i]) => [p, Number.isInteger(i) && i >= 0 && i < this.accounts.length ? i : null]))
+      : null;
     if (status?.switchThreshold != null) this.switchThreshold = status.switchThreshold;
     this.switchThresholds = status?.switchThresholds || null;
 
@@ -264,6 +297,10 @@ export class RemoteAccountManager {
       accounts: (Array.isArray(r?.accounts) ? r.accounts : [])
         .map(a => ({ ...a, name: text(a?.name, NAME_MAX, '?'), eligible: !!a?.eligible })),
     }));
+    // A server too old to send versionLabel still sends version; one older than
+    // both leaves the label empty and the header simply omits it.
+    this.versionLabel = text(status?.server?.versionLabel ?? status?.server?.version, LABEL_MAX);
+    this.updateAvailable = !!status?.server?.updateAvailable;
     this.status = status;
     this.connected = true;
     this.lastError = null;
@@ -280,6 +317,20 @@ export class RemoteAccountManager {
 
   getRoutes() {
     return this.routes;
+  }
+
+  /** Mirrors AccountManager.currentIndexFor: by `currentIndexes`, else by name and
+   * provider, else the one cursor an older server sends. */
+  currentIndexFor(/** @type {string} */ provider) {
+    if (this.currentIndexes && provider in this.currentIndexes) return this.currentIndexes[provider];
+    if (!this.currentAccounts) {
+      const cur = this.accounts[this.currentIndex];
+      return cur && providerOf(cur) === provider ? this.currentIndex : null;
+    }
+    const name = this.currentAccounts[provider];
+    if (name == null) return null;
+    const idx = this.accounts.findIndex(a => a.name === name && providerOf(a) === provider);
+    return idx >= 0 ? idx : null;
   }
 
   /** The account index a request for `model` would land on, from the route

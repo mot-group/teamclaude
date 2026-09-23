@@ -1,18 +1,19 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
-import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount } from './provider.js';
+import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken, validateCodexCredentials } from './codex-auth.js';
 import { credentialFile, importedCodexTuple } from './account-source.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, WEEKLY_BUCKET_KEYS } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
-import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
+import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
 import { ROUTING_PROVIDERS, patternPreviews } from './routing-preview.js';
 import { normalizeRoutes, routeMembers, configuredPinId, autoPinId, parsePinId, WHEN_SPENT } from './routes.js';
+/** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -36,6 +37,7 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
 const EVEN_SPELLINGS = ['on', 'true', 'yes', '1', 'even'];
 const warnedDistributeValues = new Set();
 
+/** @param {boolean|string|null|undefined} setting */
 export function distributionMode(setting) {
   if (typeof setting === 'string') {
     const value = setting.trim().toLowerCase();
@@ -73,6 +75,7 @@ const MAX_CODEX_MODEL_BUCKETS = 32;
 
 // An `anthropic-ratelimit-*-reset` header (epoch seconds) as ms, or null when
 // it is not a positive finite number. Never NaN: see updateQuota.
+/** @param {string|null|undefined} value */
 function resetHeaderMs(value) {
   if (value == null || value === '') return null;
   const seconds = parseInt(value, 10);
@@ -81,6 +84,7 @@ function resetHeaderMs(value) {
 
 // An RFC 3339 reset header, stripped and bounded, or null when it does not
 // name a moment in time.
+/** @param {string|null|undefined} value */
 function resetTimestamp(value) {
   if (value == null || value === '') return null;
   const text = safeLine(value, 64);
@@ -101,6 +105,12 @@ const PERSISTED_QUOTA_FIELDS = [
   'unifiedStatus', 'unifiedStatusSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
   'scopedWeekly',
+  // Codex free rate-limit reset credits, `{ available, applicable, seenAt }`.
+  // Worth persisting although it is not a quota: the usage probe is off by
+  // default, so without this a restart forgets that an account holds a credit
+  // until something next reads /wham/usage — and the row that says so is the
+  // only place an operator sees one at all.
+  'resetCredits',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -111,6 +121,23 @@ const FAMILY_WEEKLY_BUCKETS = [
   { key: 'unified7dFable', label: 'Fable', usageKey: 'sevenDayFable' },
   { key: 'unified7dSonnet', label: 'Sonnet', usageKey: 'sevenDaySonnet' },
 ];
+
+/**
+ * The quota fields a Codex account only ever LEARNS — from a `/wham/usage`
+ * payload, or for `resetCredits` from the state restored off disk — so
+ * `emptyQuota` below does not seed them. Absent is meaningful for each: it says
+ * nothing has been read yet, which a seeded null would spell the same way as
+ * "read, and empty".
+ *
+ * Declared here so the one place that writes them can say so (`@type` on the
+ * local that holds the quota), rather than each one reading as a property that
+ * does not exist.
+ *
+ * @typedef {object} CodexLearnedQuota
+ * @property {string} [planType]  the Codex subscription tier
+ * @property {{available: number, applicable: number|null, seenAt: number}} [resetCredits]  free rate-limit reset credits held, and when that was last seen
+ * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
+ */
 
 function emptyQuota() {
   return {
@@ -153,10 +180,29 @@ function emptyQuota() {
 
 // One level deeper than a spread, for the per-bucket usage split. Each bucket's
 // counters are a flat object, so this is the whole depth of the structure.
+/** @param {Record<string, Record<string, number>>} byBucket */
 function copyBuckets(byBucket) {
   const out = {};
   for (const [bucket, counters] of Object.entries(byBucket)) out[bucket] = { ...counters };
   return out;
+}
+
+/**
+ * The per-account switchThreshold an account will actually gate on: the config
+ * entry's value with anything outside (0, 1] dropped, and one line telling the
+ * operator what was dropped. The constructor and the config reload both come
+ * through here so a value refused at startup is refused on reload too. Without
+ * the line a `98` typed for 98% would silently hold the account in rotation
+ * until it hit the upstream wall, with every display showing it as configured.
+ * @param {Record<string, any>} acct
+ * @returns {number|Object<string, number>|null}
+ */
+export function accountSwitchThreshold(acct) {
+  const { value, rejected } = sanitizeSwitchThreshold(acct?.switchThreshold);
+  if (rejected.length) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring ${safeLine(rejected.join(', '), 160)} — a switch threshold must be a number above 0 and at most 1 (0.98 means 98%)`);
+  }
+  return value;
 }
 
 // Build a fresh in-memory account record from a config/disk account object.
@@ -191,13 +237,31 @@ function makeAccount(acct, index) {
     hasClaudeMax: acct.hasClaudeMax ?? null,
     hasClaudePro: acct.hasClaudePro ?? null,
     priority: acct.priority || 0,
+    // Where this account sits in the list the TUI draws, arranged by the
+    // operator from the settings screen. Presentation only: nothing but
+    // _displayOrder in tui.js reads it, and it is emphatically NOT `priority`
+    // above — that one decides which account rotation spends next, and the two
+    // answer different questions about the same fleet. `null` means never
+    // placed, which lists after every account that has been.
+    displayOrder: Number.isFinite(acct.displayOrder) ? acct.displayOrder : null,
     disabled: acct.disabled || false,
     maxUsage: acct.maxUsage ?? null,
+    // Per-account switchThreshold override (issue #409) — a rotation
+    // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
+    // thresholdFor() for the resolution order.
+    switchThreshold: accountSwitchThreshold(acct),
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
     // that reject e.g. `context_management`). See server.js stripBodyFields.
     stripRequestFields: acct.stripRequestFields || null,
+    // Whether this upstream keeps Anthropic message-thread state. Off for a
+    // third-party backend, which would otherwise be handed a bare delta. See
+    // server.js refusesThreadContinue.
+    messageThreads: acct.messageThreads === true,
+    // Whether the operator has already been told this upstream keeps no thread
+    // state, so the line is printed once rather than per refusal.
+    threadRefusalReported: false,
     models: acct.models || null,
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
@@ -254,11 +318,30 @@ function makeAccount(acct, index) {
 // trailing [Nm] context-length suffix (e.g. "deepseek-v4-pro[1m]"); we match it
 // against a bare request too. Shared by _accountOwnsModel's two lookups so the
 // predicate can't drift.
+/** @param {string} declared @param {string} model */
 function modelMatches(declared, model) {
   return declared === model || declared.replace(/\[\d+m\]$/, '') === model;
 }
 
 export class AccountManager {
+  /**
+   * @param {Array<Object>} accounts  config entries, credentials resolved
+   * @param {number|Object<string, number>} [switchThreshold]  one number, or per bucket with a `default`
+   * @param {Object} [opts]
+   * @param {Function} [opts.refreshFn]
+   * @param {Function} [opts.codexRefreshFn]
+   * @param {number} [opts.throttleProbeFloorMs]
+   * @param {number} [opts.familyStaleMs]
+   * @param {number} [opts.statusStaleMs]
+   * @param {number} [opts.forcedRefreshFloorMs]
+   * @param {Array<Object>} [opts.routes]
+   * @param {Object} [opts.ramp]
+   * @param {boolean|string} [opts.distributeSessions]
+   * @param {Object} [opts.adaptive]
+   * @param {Object} [opts.sessionTracker]
+   * @param {Object} [opts.expiryRouting]
+   * @param {boolean} [opts.preferFableDepletedAccounts]
+   */
   constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferFableDepletedAccounts = false } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
@@ -275,6 +358,7 @@ export class AccountManager {
     // `distributeSessions` gates the behavioural change: keep each session on its
     // account for cache reuse, but spread NEW sessions across equal-priority
     // accounts by load instead of funnelling them all onto the current one.
+    /** @type {SessionTracker} */
     this.sessionTracker = sessionTracker || new SessionTracker();
     // 'off' | 'even' | 'adaptive'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
@@ -309,6 +393,10 @@ export class AccountManager {
     // it. Each such switch arms the ramp below, so steady interleaved traffic
     // holds both accounts at the ramp floor while nothing has failed over.
     this.routeCursors = new Map();
+    /** Rotation for requests that carry no session id; separate from the shared
+     *  cursor so turning it never moves a running session's account.
+     *  @type {number} */
+    this._untaggedCursor = 0;
     // One cursor per provider. `currentIndex` is a single slot, and a request
     // only another provider can serve would otherwise drag it across: a Codex
     // request moved it onto a Codex account and the next Anthropic request moved
@@ -329,6 +417,7 @@ export class AccountManager {
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
     // knob is off: nothing writes one then and none survives the transition.
+    /** @type {Observation|null} */
     this._currentObs = null;
     // Throttle for the held-rollover line, keyed by (account index, WINDOW,
     // reason). Keying by the request bucket would let two windows that share one
@@ -392,8 +481,34 @@ export class AccountManager {
    * Bucket keys are the quota field names (unified5h, unified7d, unified7dFable,
    * unified7dSonnet, tokens, requests). Anything unlisted takes `default`, so a
    * bare number behaves exactly as it always has.
+   *
+   * An individual account can override this fleet setting with its own
+   * `accounts[].switchThreshold` (issue #409 — mixed plans, mixed extra-usage
+   * settings, want different rotation points). Same two shapes, and the same
+   * resolution order one level down: the account table's entry for THIS
+   * bucket, else the account's own `default` (or bare number), else the fleet
+   * value resolved above. So an account table with no `default` only overrides
+   * the buckets it lists — it does not opt the account out of the fleet
+   * setting for every OTHER bucket. `resolveSwitchThreshold` is shared with the
+   * status renderer and the attach-mode TUI so a value read off the wire agrees
+   * with the value the live gate used.
+   *
+   * Still a rotation PREFERENCE, exactly like the fleet value: the
+   * all-exhausted revalidation probe can override it the same way. That is
+   * what keeps it a different setting from the hard `accounts[].maxUsage` cap
+   * — see capFor.
+   * @param {string} bucket
+   * @param {any} [account]
    */
-  thresholdFor(bucket) {
+  thresholdFor(bucket, account = null) {
+    return resolveSwitchThreshold(account?.switchThreshold, bucket, this._fleetThresholdFor(bucket));
+  }
+
+  /** The fleet-wide threshold for one bucket, ignoring any per-account
+   * override — thresholdFor()'s fallback, and what an account with no
+   * `switchThreshold` of its own resolves to.
+   * @param {string} bucket */
+  _fleetThresholdFor(bucket) {
     const t = this.switchThreshold;
     if (typeof t === 'number') return t;
     if (t && typeof t === 'object') {
@@ -512,8 +627,14 @@ export class AccountManager {
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
+    // A move made by an operator or a poll names the provider cursor of the
+    // account it lands on. A move inside a selection walk does not: the walk
+    // records where it left the slot once it is done (see getActiveAccount),
+    // and a borrowed walk that picks a shared API key — which reads as the
+    // default provider — would otherwise overwrite the OWNER's cursor here.
+    if (this._selectingProvider == null) this.providerCursors.set(providerOf(account), account.index);
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
-    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, account);
+    this._firstSightOn(this._currentObs ??= newObservation(), account);
   }
 
   /**
@@ -640,7 +761,7 @@ export class AccountManager {
     if (!account?.entitlementDeniedUntil) return false;
     if (now < account.entitlementDeniedUntil) return true;
     account.entitlementDeniedUntil = null;
-    console.log(`[TeamClaude] Account "${account.name}" entitlement cooldown expired, marking available`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" entitlement cooldown expired, marking available`);
     return false;
   }
 
@@ -660,14 +781,22 @@ export class AccountManager {
    * bucket, so the account must be eligible for both models. When no account
    * satisfies both, selection degrades to executor-only routing so the main
    * request keeps flowing (upstream then fails just the advisor call).
+   *
+   * `sessionId` is a PIN KEY throughout this class and the session tracker: a
+   * client session narrowed to the conversation within it, since one client
+   * session fans out across many (see conversation.js). It is spelled
+   * `sessionId` because it is one for every request that names no conversation,
+   * and because the affinity it drives is the same affinity it always was.
    */
   getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER, decision = null) {
     // Selection reads this.currentIndex as "where the fleet is". With more than
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
     //
-    // With one provider — every config that predates #246 — `borrowed` is always
-    // false and this is the same code it was.
+    // With one provider `borrowed` is always false, so the `providerCursors`
+    // entry this method writes has no reader at all. Its one reader is the
+    // `providerCursors.get(provider)` inside `if (borrowed)`, which only a
+    // borrowed walk reaches.
     const owner = providerOf(this.accounts[this.currentIndex]);
     const borrowed = !!this.accounts.length && owner !== provider;
     const saved = this.currentIndex;
@@ -677,6 +806,7 @@ export class AccountManager {
     }
 
     let account;
+    let walked;
     // Scoped rather than threaded through _select/_selectNext/_divertedFor: the
     // whole walk is synchronous, so nothing can interleave and observe it, and
     // the alternative is a provider argument on six private methods that exist
@@ -697,6 +827,7 @@ export class AccountManager {
       this._selectionDecision = null;
       this._selectionNow = null;
       this._selectionCursorKey = null;
+      walked = this.currentIndex;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
       if (borrowed) this.currentIndex = saved;
@@ -708,7 +839,16 @@ export class AccountManager {
     // the next real failover unpaced.
     if (account) {
       this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
-      this.providerCursors.set(providerOf(account), account.index);
+      // `walked` names where this walk left the shared slot, captured in the
+      // `finally` while it still held it. When it names one of this provider's
+      // own accounts — including a borrow that re-seeded and then held its
+      // slot — the cursor takes it. Which one it names turns on where the walk
+      // left the slot, not on what it picked. Either way the fallback is the
+      // account that served — and when that account is another provider's, as
+      // a shared key is, this provider records nothing rather than a cursor
+      // its own re-seed would refuse.
+      const rest = providerOf(this.accounts[walked]) === provider ? walked : account.index;
+      if (providerOf(this.accounts[rest]) === provider) this.providerCursors.set(provider, rest);
       // Served from somewhere else: the forced account is away, so its return
       // counts as a join and gets paced again.
       const entry = this._pinForRequest(model, advisorModel);
@@ -759,8 +899,10 @@ export class AccountManager {
     // other's client, so crossing them is never right. An API key carries no
     // such tie — it is metered capacity, not a seat — so it stays eligible for
     // whichever app is asking, which is what keeps a third-party backend usable
-    // from both.
-    const foreign = this.accounts.filter(a => providerOf(a) !== provider && isSubscriptionAccount(a));
+    // from both. Asked through `canServeProvider`, the same predicate the
+    // exhaustion report draws its candidate set from, so the accounts a request
+    // could have used and the accounts it is told about cannot disagree.
+    const foreign = this.accounts.filter(a => !canServeProvider(a, provider));
     if (foreign.length === 0) return exclude;
     const combined = new Set(exclude || []);
     for (const account of foreign) combined.add(account.index);
@@ -789,13 +931,15 @@ export class AccountManager {
     this.refreshExpiredQuotas(model,
       this.expiryRouting.enabled || this._usesFablePreference(model, advisorModel) ? (exclude ?? new Set()) : exclude,
       advisorModel);
-    // Session-affinity distribution (opt-in): keep a session on its pinned
-    // account for cache reuse, and route a new session to the least-loaded
-    // account. Only when enabled, only for a real session, and only when no
-    // route pin can take this request — a pin that CAN serve must still win,
-    // but one whose account is spent must not cost the session its affinity
-    // (the walk below honours it). Falls through to the normal walk
-    // if nothing session-eligible is found (e.g. the whole tier is exhausted).
+    // Session-affinity distribution (opt-in): keep a conversation on its pinned
+    // account for cache reuse, and route a new one to the least-loaded account.
+    // The unit is the conversation rather than the client session because one
+    // session fans out — a Claude Code session and every subagent it launches
+    // share its id, and holding them together pinned a whole fan-out to one
+    // account for a cache none of them shared (see conversation.js). Only when
+    // enabled, only for a request that named one, and only outside a manual
+    // route pin that can serve it. Falls through to the normal walk if nothing
+    // eligible is found (e.g. the whole tier is exhausted).
     const pinEntry = this._pinForRequest(model, advisorModel);
     if (sessionId && !(pinEntry && this._pinServes(pinEntry.pin, model, advisorModel, exclude))) {
       if (this.distributeSessions) {
@@ -808,6 +952,13 @@ export class AccountManager {
         const acc = this._selectDrainingSession(sessionId, exclude, model, advisorModel);
         if (acc) return acc;
       }
+    }
+    // An untagged request has no session to pin, so the walk below rests every
+    // one of them on the current account. Spread them too, on their own cursor.
+    if (!sessionId && this.distributeSessions
+        && !(pinEntry && this._pinServes(pinEntry.pin, model, advisorModel, exclude))) {
+      const acc = this._selectUntagged(exclude, model, advisorModel);
+      if (acc) return acc;
     }
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
@@ -922,6 +1073,41 @@ export class AccountManager {
    * eligible account. Returns null if nothing is eligible, so the caller falls
    * back to the normal quota-driven walk. Does NOT record the pin — that happens
    * on the actual route (recordSession), so retries/failover re-pin naturally. */
+  /**
+   * Round-robin for requests that carry no session id.
+   *
+   * The Codex CLI tags `POST /responses` with `session-id` but not its catalog
+   * fetch, and Claude Code tags `/v1/messages` but not its telemetry. Those
+   * untagged requests have nothing to pin, so the walk below rests all of them
+   * on the current account: measured against a five-account Codex pool with
+   * distribution on, every session's `GET /models` landed on one account, 16
+   * requests against 1 apiece for its siblings.
+   *
+   * `_pickLeastLoaded` does not spread them. An untagged request never reaches
+   * `recordSession`, so it adds no session count, and a serial caller's
+   * in-flight is back to zero by the time the next one arrives — the tiebreak
+   * chain is level every time and answers with the same account. Hence a cursor
+   * of its own.
+   *
+   * That cursor is its own on purpose: `_setCurrent` is what sessions riding
+   * the shared one follow, and moving it from a catalog fetch would hand a
+   * running conversation to another account mid-flight and throw away the
+   * prompt cache it built there. An untagged request picks where it goes and
+   * changes nothing for anyone else.
+   *
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @returns {Record<string, any>|null}
+   */
+  _selectUntagged(exclude, model, advisorModel) {
+    const candidates = this._bandedCandidates(exclude, model, advisorModel);
+    if (candidates.length === 0) return null;
+    const cursor = this._untaggedCursor;
+    this._untaggedCursor = cursor + 1;
+    return candidates[cursor % candidates.length];
+  }
+
   _selectForSession(sessionId, exclude, model, advisorModel) {
     // The pin is per governing bucket, and this request is bound by the
     // EXECUTOR's: one request goes to one account, so the executor's affinity is
@@ -929,13 +1115,18 @@ export class AccountManager {
     // (_isAvailable, below) rather than a second key.
     const bucket = this._weeklyBucketFor(model);
     const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
-    // The bucket's own pin first. Failing that, any account the session already
-    // sits on for another family: one session stays on one account unless that
-    // account cannot serve the request (the README's "pins it there"). Without
-    // this, a session's first request of a second family would go to
-    // _pickLeastLoaded, which counts the session's own pin as load and pushes
-    // the new family onto a sibling — splitting every mixed-model session
-    // across two accounts by construction, not only on a real diversion.
+    // The bucket's own pin first. Failing that, any account this conversation
+    // already sits on for another family: one conversation stays on one account
+    // unless that account cannot serve the request (the README's "pins it
+    // there"). Without this, its first request of a second family would go to
+    // _pickLeastLoaded, which counts the conversation's own pin as load and
+    // pushes the new family onto a sibling — splitting every mixed-model
+    // conversation across two accounts by construction, not only on a real
+    // diversion.
+    //
+    // Scoped to the one conversation, not to everything sharing its session id:
+    // two agents of one fan-out are not each other's affinity, and treating
+    // them as one is what funnelled them onto a single account.
     const candidates = [];
     if (pinIdx != null) candidates.push(pinIdx);
     for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
@@ -1059,7 +1250,6 @@ export class AccountManager {
   _pickAdaptive(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     const bucket = this._weeklyBucketFor(model);
-    const threshold = this.thresholdFor(bucket);
 
     // The SAME candidate set the even walk uses, so adaptive cannot quietly
     // bypass expiry routing: with it off this is every eligible account, and
@@ -1093,11 +1283,13 @@ export class AccountManager {
     const planWeights = tier.map(a => quotaTier(a).weight);
     const usePlanWeights = planWeights.every(weight => weight != null && weight > 0);
 
+    // Per-account, not hoisted above the tier: an account with its own
+    // switchThreshold (issue #409) tapers toward ITS OWN wall, not the fleet's.
     const candidates = tier.map((account, i) => ({
       account,
       index: account.index,
       utilization: windows[i].utilization,
-      threshold,
+      threshold: this.thresholdFor(bucket, account),
       capacity: usePlanWeights ? planWeights[i] : null,
       reserve: this.burnRateLearner.reserve(account.index, windows[i].bucket),
       load: this._adaptiveLoad(account, now),
@@ -1105,7 +1297,7 @@ export class AccountManager {
     }));
     const maxRemaining = Math.max(...candidates.map(c => {
       const u = Number.isFinite(c.utilization) ? c.utilization : 0;
-      const head = Math.max(0, threshold - u);
+      const head = Math.max(0, c.threshold - u);
       return c.capacity != null ? c.capacity * head : head;
     }));
 
@@ -1236,6 +1428,18 @@ export class AccountManager {
   }
 
   /**
+   * The same, for an exit that can name only the client session — every live
+   * conversation of it takes the outcome (see SessionTracker).
+   *
+   * @param {string|null} sessionId
+   * @param {boolean|null} usable
+   */
+  recordOutcomeForSession(sessionId, usable) {
+    if (!sessionId || usable === null) return;
+    this.sessionTracker.recordOutcomeForSession(sessionId, usable);
+  }
+
+  /**
    * Per-account diagnostics for adaptive distribution: the profile plan tier,
    * relative score weight, and actual next target.
    *
@@ -1288,7 +1492,6 @@ export class AccountManager {
   _adaptiveStatsFor(model, provider, reported) {
     const now = Date.now();
     const bucket = this._weeklyBucketFor(model);
-    const threshold = this.thresholdFor(bucket);
 
     const excluded = this._excludeOtherProviders(null, provider);
     const eligible = this._bandedCandidates(excluded, model);
@@ -1308,6 +1511,9 @@ export class AccountManager {
       const window = windows.get(a.index);
       const utilization = window.utilization;
       const u = Number.isFinite(utilization) ? utilization : 0;
+      // Per-account: an account with its own switchThreshold (#409) reports
+      // headroom against ITS OWN wall, not the fleet's.
+      const threshold = this.thresholdFor(bucket, a);
       const head = Math.max(0, threshold - u);
       const planWeight = planWeights.get(a.index);
       return {
@@ -1343,7 +1549,7 @@ export class AccountManager {
       if (!r.competing) { r.score = 0; continue; }
       const { score } = scoreCandidate({
         utilization: r.utilization,
-        threshold,
+        threshold: r.threshold,
         capacity: usePlanWeights ? r.planWeight : null,
         reserve: r.reserve,
         load: r.sessions + r.inFlight,
@@ -1399,10 +1605,8 @@ export class AccountManager {
    */
   previewRouteIndex(model, advisorModel = null, provider = DEFAULT_PROVIDER) {
     const saved = { index: this.currentIndex, provider: this._selectingProvider, cursor: this._selectionCursorKey };
-    if (providerOf(this.accounts[this.currentIndex]) !== provider) {
-      const own = this.providerCursors.get(provider);
-      if (own != null && this.accounts[own] && providerOf(this.accounts[own]) === provider) this.currentIndex = own;
-    }
+    const currentIndex = this._currentIndexForProvider(provider);
+    if (currentIndex != null) this.currentIndex = currentIndex;
     this._selectingProvider = provider;
     this._selectionCursorKey = this._usesFablePreference(model) ? this._cursorKey(model, advisorModel, provider) : null;
     try {
@@ -1439,6 +1643,23 @@ export class AccountManager {
     }
     const best = this._pickBestAvailable(exclude, model, advisorModel);
     return best ? best.index : null;
+  }
+
+  /** One provider's current account index, as `currentAccounts` names it in
+   * status; null when nothing can serve that provider. Moves nothing. */
+  currentIndexFor(/** @type {string} */ provider) {
+    return this._currentIndexForProvider(provider);
+  }
+
+  /** The cursor owned by one provider, falling back to the account that its
+   * next request would start from before that provider has seen traffic. */
+  _currentIndexForProvider(provider) {
+    const excluded = this._excludeOtherProviders(null, provider);
+    const allowed = index => index != null && this.accounts[index] && !excluded?.has(index);
+    const own = this.providerCursors.get(provider);
+    if (allowed(own)) return own;
+    if (allowed(this.currentIndex)) return this.currentIndex;
+    return this._pickBestAvailable(excluded, null)?.index ?? null;
   }
 
   _isProbeable(account) {
@@ -1577,7 +1798,7 @@ export class AccountManager {
   }
 
   _familySpent(account, key) {
-    return account.quota[key] != null && account.quota[key] >= this.thresholdFor(key);
+    return account.quota[key] != null && account.quota[key] >= this.thresholdFor(key, account);
   }
 
   _usesFablePreference(model, advisorModel = null) {
@@ -1708,7 +1929,7 @@ export class AccountManager {
       account.status = 'active';
       account.rateLimitedUntil = null;
       account.throttledAt = null;
-      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limit expired, marking active`);
     }
 
     if (account.status === 'exhausted') return 'exhausted';
@@ -2058,7 +2279,7 @@ export class AccountManager {
     // the transition seeds" and "an aim never overwrites".
     if (wasWatching) return;
     const current = this.accounts[this.currentIndex];
-    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, current);
+    if (current) this._firstSightOn(this._currentObs ??= newObservation(), current);
     for (const { sessionId, bucket, idx } of this.sessionTracker.livePins()) {
       this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true), this.accounts[idx]);
     }
@@ -2203,6 +2424,12 @@ export class AccountManager {
    * `_isAvailable` excludes accounts at or above the switch threshold. Shared by
    * both selection loops so they cannot disagree on the candidate set.
    */
+  /**
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @returns {Array<Record<string, any>>}
+   */
   _bandedCandidates(exclude = null, model = null, advisorModel = null) {
     const now = this._selectionNow ?? Date.now();
     for (const account of this.accounts) this._clearExpiredQuotas(account, now);
@@ -2270,6 +2497,8 @@ export class AccountManager {
    * writes only where nothing is lost, since the aimed request may never arrive.
    * Nothing here releases a held roll: arriving is not being served, and only a
    * served attempt carrying this observation's stamp releases one.
+   *
+   * @param {Observation} obs
    */
   _restOn(obs, account, model) {
     if (obs.idx !== account.index) {
@@ -2278,13 +2507,39 @@ export class AccountManager {
       // `_firstSightOn` hands that back, and every cursor or pin move goes
       // through `_setCurrent` or `recordSession`, so a fail-back has been
       // offered it before any request reaches here.
-      const leaving = obs.idx == null ? null : this.accounts[obs.idx];
-      if (leaving && this._anyJumped(obs.windows, leaving)) {
-        obs.unescaped = { idx: obs.idx, windows: obs.windows };
+      // A reading that names NO account was offered nothing on the way here: the
+      // rebuild a removal leaves behind names nobody, and no cursor moved for
+      // `_firstSightOn` to run on. So this rest is the arrival, and a roll the
+      // chain still owes the account it arrives at is handed back rather than
+      // first-sighted away with the week that account has already gained.
+      if (obs.idx == null) {
+        const back = findHeld(obs.unescaped, h => h.idx === account.index);
+        if (back) {
+          this._moveObs(obs, account.index);
+          obs.windows = back.windows;
+          obs.handedBack = new Map(Object.entries(this._accountWindows(account)));
+          obs.unescaped = dropHeld(obs.unescaped, account.index);
+          return;
+        }
       }
+      const leaving = obs.idx == null ? null : this.accounts[obs.idx];
+      // The hold belongs to the fleet whose READING it preserves, the one that
+      // last moved this observation, rather than to the fleet that writes it.
+      // A borrower resting on the owner's cursor displaces the owner's reading.
+      // A reading no walk has moved names no fleet, so the fleet that observes
+      // the roll takes it, and a single-provider fleet can still settle it.
+      const owed = leaving && this._newRoll(obs, leaving)
+        ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider }
+        : null;
+      this._moveObs(obs, account.index);
+      // Every account the fleet is still away from keeps its OWN roll, so a
+      // second escape is chained onto the first instead of forgetting it. The
+      // push takes the stamp of the move that escaped the roll, and only a stay
+      // under that stamp releases it. At most one roll per account, the newest:
+      // a later escape was read after the earlier one's window had rolled.
+      if (owed) obs.unescaped = { ...owed, gen: obs.gen, prev: dropHeld(obs.unescaped, owed.idx) };
       // Established whole, from every window the account presents, so a window
       // that comes back is a first sight rather than a stale value read as a jump.
-      this._moveObs(obs, account.index);
       obs.windows = new Map(Object.entries(this._accountWindows(account)));
       return;
     }
@@ -2318,18 +2573,48 @@ export class AccountManager {
    * design turns on — a reading whose account HAS rolled while its traffic has
    * not come to rest elsewhere, the fail-back's only protection. The test is
    * whether ANY window rolled, since an aim discards the whole reading at once.
+   *
+   * @param {Observation} obs
    */
   _firstSightOn(obs, account) {
     if (!obs || !account) return;
-    if (obs.idx != null && obs.idx !== account.index) {
+    if (obs.idx !== account.index) {
       // A fail-back reaches its origin through a cursor move rather than a rest:
       // the pass returning the traffic finds the cursor still on the account
       // that refused it, so _restOn never sees the arrival. The held roll is
       // given back here, to the account that still owes it.
-      if (obs.unescaped?.idx === account.index) {
+      // Matched on index alone, whatever fleet holds it and whatever move
+      // escaped it: handing a roll back to the account that owes it is a
+      // restoration and not a settlement by anyone. Only that account's roll is
+      // given back, so every other escape still outstanding stands. A reading
+      // that names no account arrives here too, and one holding nothing for this
+      // account takes the same fresh reading it always did: there is no account
+      // at a null index for _anyJumped to have rolled.
+      const owed = findHeld(obs.unescaped, h => h.idx === account.index);
+      if (owed) {
+        // The account the hand-back LEAVES may have rolled under the traffic that
+        // rested on it, and the restore below replaces its reading. That roll is
+        // an escape like any other, so it is chained rather than discarded.
+        // A reading no walk established names no fleet, so the roll it loses is
+        // held for the fleet the chain belongs to: the hold being handed back is
+        // that fleet's, and a hold naming nobody can be settled by nobody.
+        const leaving = obs.idx == null ? null : this.accounts[obs.idx];
+        const displaced = leaving && this._newRoll(obs, leaving)
+          ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? owed.provider ?? this._selectingProvider }
+          : null;
         this._moveObs(obs, account.index);
-        obs.windows = obs.unescaped.windows;
-        obs.unescaped = null;
+        obs.windows = owed.windows;
+        obs.handedBack = new Map(Object.entries(this._accountWindows(account)));
+        // A restore outside a selection walk reads no fleet from one. The reading
+        // handed back is the one the hold's fleet established, so it keeps that
+        // fleet, and the next hand-back has one to stamp the roll it leaves with.
+        obs.provider ??= owed.provider;
+        obs.unescaped = dropHeld(obs.unescaped, account.index);
+        // No stamp: the move that leaves this roll is a move BACK, and a stay
+        // served at the account it returns to is no evidence about the one it
+        // left. Only a stay served on that account releases it, or a return that
+        // restores it, which is matched on index and needs no stamp.
+        if (displaced) obs.unescaped = { ...displaced, gen: null, prev: dropHeld(obs.unescaped, displaced.idx) };
         return;
       }
       if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
@@ -2343,10 +2628,19 @@ export class AccountManager {
   /**
    * The stamp scopes a confirmation: a request that selected before this move,
    * or after a later one, carries a different one and is no evidence here.
+   *
+   * @param {Observation} obs
+   * @param {number} index
    */
   _moveObs(obs, index) {
     obs.idx = index;
     obs.gen = ++this._obsGen;
+    obs.handedBack = null;
+    // A move inside a selection walk makes the reading that fleet's, so its own
+    // stay is what settles a roll pushed off it. The same-index stay in `_restOn`
+    // does not come through here: a borrowed walk advances a reading the resting
+    // fleet never established, and stamping there hands it the owner's roll.
+    obs.provider = this._selectingProvider;
   }
 
   /** Has ANY window this reading holds rolled over on the account it was taken
@@ -2357,6 +2651,24 @@ export class AccountManager {
     if (!reading || !account) return false;
     for (const [window, resetAt] of Object.entries(this._accountWindows(account))) {
       if (this._jumped(reading, { window, resetAt })) return true;
+    }
+    return false;
+  }
+
+  /** Has a window rolled on this account that the reading was NOT handed back
+   * for? A hand-back restores the reading from before a roll and records the
+   * account's windows as they stood then, so that roll is a jump against the
+   * reading but not against the record. A window that has moved since the
+   * hand-back, or one the record never saw, is a roll of its own, and the
+   * departure that finds it holds it. Per window, so a rest governed by one
+   * window says nothing about another's roll, and a second fleet's window
+   * rolling on the same reading is still seen. */
+  _newRoll(obs, account) {
+    if (!obs.handedBack) return this._anyJumped(obs.windows, account);
+    for (const [window, resetAt] of Object.entries(this._accountWindows(account))) {
+      const win = { window, resetAt };
+      if (!this._jumped(obs.windows, win)) continue;
+      if (!obs.handedBack.has(window) || this._jumped(obs.handedBack, win)) return true;
     }
     return false;
   }
@@ -2381,29 +2693,47 @@ export class AccountManager {
   confirmStay(account, carried, sessionId = null, provider = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
-    // One observation slot is shared by every provider, so the roll it holds and
-    // the success offered for it can belong to different fleets. The REQUEST's
-    // provider settles it, and a confirmation naming no fleet settles nothing.
-    const held = this._currentObs?.unescaped;
-    if (held && provider && providerOf(this.accounts[held.idx]) === provider) {
-      this._releaseHeld(this._currentObs, account, carried.current);
-    }
+    this._releaseHeld(this._currentObs, account, carried.current, provider);
     if (sessionId) {
       // The bucket comes from the stamp, since a route edit reaches the running
-      // table before the response does. Ungated, because a session's own
-      // observation cannot name an account it never selected.
-      this._releaseHeld(this.sessionTracker.refsFor(sessionId, carried.bucket), account, carried.pin);
+      // table before the response does.
+      this._releaseHeld(this.sessionTracker.refsFor(sessionId, carried.bucket), account, carried.pin, provider);
     }
   }
 
   /**
-   * Clear one observation's held roll, only where the request confirms the stay
-   * it selected under. Another account, or any move since, is a different stay.
+   * Settle the roll the confirmed move escaped, on the evidence that the
+   * destination SERVED a request selecting under that move. Another account, or
+   * any move since, is a different stay. A confirmation naming no fleet settles
+   * nothing. Every other roll on the chain waits for its own fail-back or for
+   * the stay of its own move.
+   *
+   * @param {Observation} obs
+   * @param {string|null} provider
    */
-  _releaseHeld(obs, account, carried) {
+  _releaseHeld(obs, account, carried, provider) {
     if (!obs || carried == null) return;
     if (obs.idx !== account.index || obs.gen !== carried) return;
-    obs.unescaped = null;
+    const owed = findHeld(obs.unescaped, h => h.gen === carried);
+    // A serve settles a roll held against the very account it was served at,
+    // whatever move stamped it: a borrowed walk can leave the reading resting on
+    // an account the chain still owes without any move of ours, and being served
+    // there is the arrival the hold was waiting for. Its own fleet only, so the
+    // shared-key rule is untouched, and only that account's roll, so every
+    // other escape on the chain still stands. One confirmation can qualify that
+    // roll and the one this move escaped, and each is settled on its own evidence.
+    const own = findHeld(obs.unescaped, h => h.idx === account.index && h.provider === provider);
+    if (!provider) return;
+    if (own) obs.unescaped = dropHeld(obs.unescaped, own.idx);
+    if (!owed) return;
+    // A hold has a reading to itself only where the destination is its own
+    // fleet's subscription, which no other fleet is ever served at. Anywhere
+    // else the destination has one reading for whoever it serves, so a success
+    // by the fleet served there settles the roll held against it.
+    const settledByAnyServed = owed.provider != null
+      && !(isSubscriptionAccount(account) && providerOf(account) === owed.provider);
+    if (owed.provider !== provider && !settledByAnyServed) return;
+    obs.unescaped = dropHeld(obs.unescaped, owed.idx);
   }
 
   /** The reading for the sticky CURRENT account, taken at the top of a selection
@@ -2412,7 +2742,7 @@ export class AccountManager {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     const resting = this.accounts[this.currentIndex];
     if (!resting || exclude?.has(resting.index)) return;
-    this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 };
+    this._currentObs ??= newObservation();
     this._restOn(this._currentObs, resting, model);
   }
 
@@ -2477,10 +2807,13 @@ export class AccountManager {
     const now = Date.now();
     if (now < (this._rolloverHeldLogAt.get(key) || 0)) return;
     this._rolloverHeldLogAt.set(key, now + 60_000);
-    console.log(`[TeamClaude] Account "${account.name}" rolled over its ${window} window ${this._heldRolloverReason(reason)}`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rolled over its ${window} window ${this._heldRolloverReason(reason)}`);
   }
 
-  /** The half of the held-rollover line that says which of the two cases it is. */
+  /**
+   * The half of the held-rollover line that says which of the two cases it is.
+   * @param {'none-eligible'|'ranks-best'} reason
+   */
   _heldRolloverReason(reason) {
     switch (reason) {
       case 'none-eligible': return 'but no eligible account can take that traffic — still routing there';
@@ -2516,8 +2849,11 @@ export class AccountManager {
    * are recorded whether or not they currently bind, because one that starts
    * binding later would otherwise be first-sighted on the very request that
    * should have caught it rolling.
+   *
+   * @returns {Object<string, number>}
    */
   _accountWindows(account) {
+    /** @type {Object<string, number>} */
     const out = {};
     for (const bucket of this._windowKeys()) {
       const window = this._windowForBucket(account, bucket);
@@ -2593,7 +2929,7 @@ export class AccountManager {
       const id = configuredPinId(r.name);
       return {
         name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
-        id, pinned: this._pinnedName(id), previews,
+        id, provider: first?.provider || DEFAULT_PROVIDER, pinned: this._pinnedName(id), previews,
         // The route's resolved membership, by name and in fleet order: index
         // references resolved, an empty list meaning every account. Distinct
         // from `accounts` below, which is the first preview's per-provider
@@ -2622,7 +2958,7 @@ export class AccountManager {
       const id = autoPinId(d.name);
       out.push({
         name: d.name, match: d.match, bucket: null, color: null, autocreated: true,
-        id, pinned: this._pinnedName(id), previews: [preview],
+        id, provider: preview.provider || DEFAULT_PROVIDER, pinned: this._pinnedName(id), previews: [preview],
         // An auto row has no member list at all, so every account is a member.
         members: this.accounts.map(a => a.name),
         // An auto row exists only while a family bucket is reported, so nothing
@@ -2863,7 +3199,7 @@ export class AccountManager {
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
-      console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" session quota reset`);
       // Recorded on the account, not just returned. _clearExpiredQuotas is
       // reached from two directions — refreshExpiredQuotas on the request path,
       // which runs the session-reset switch rule, and _isNearQuota via
@@ -2883,7 +3219,7 @@ export class AccountManager {
       session = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
-      console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -2921,7 +3257,7 @@ export class AccountManager {
     // per account per window and no more. A reading with headroom is left alone:
     // it gates nothing, so it cannot seal anything in.
     for (const { key, label } of FAMILY_WEEKLY_BUCKETS) {
-      if (q[key] == null || q[key] < this.thresholdFor(key)) continue;
+      if (q[key] == null || q[key] < this.thresholdFor(key, account)) continue;
       const seenField = `${key}SeenAt`;
       // Unknown age (restored from an older state file, or set by a path that
       // predates the stamp): start the clock now rather than clearing at once,
@@ -2932,7 +3268,7 @@ export class AccountManager {
         continue;
       }
       if (now < q[seenField] + this.familyStaleMs) continue;
-      console.log(`[TeamClaude] Account "${account.name}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
       q[key] = null;
       q[`${key}Reset`] = null;
       q[seenField] = null;
@@ -3002,15 +3338,23 @@ export class AccountManager {
   refreshExpiredQuotas(model = null, exclude = null, advisorModel = null) {
     let changed = false;
     const scopedRouting = this.expiryRouting.enabled || this._usesFablePreference(model, advisorModel);
-    const resetAdvisor = this._usesFablePreference(model) ? advisorModel : null;
     // Gated here rather than at the switch call, because the pending flag is read
     // against it too: with the feature off every reset is consumed on sight.
     const scope = scopedRouting ? exclude : null;
+    // Selection admits an advisor request on BOTH its models, so the switch is
+    // drawn on both too. Never more strictly than the pass that decides the
+    // request, though: where no reachable account can serve the advisor model,
+    // selection routes on the main model alone and the event is spent on that
+    // basis. Ordered so that this scan reads no account with the knob off or
+    // with no advisor model in hand: reading one clears its expired windows.
+    const adv = (scope != null && advisorModel
+      && this.accounts.some(a => !scope.has(a.index) && this._isAvailable(a, model, advisorModel)))
+      ? advisorModel : null;
     // THE EXCLUSION SET IS WHAT MARKS A CALL AS A REQUEST'S: the request path
     // hands one on every call, empty included, and the TUI loop, getQuotaSummary
     // and selectActiveAccount hand none. The tests below are the switch's own.
     const canRouteTo = account => account != null
-      && !scope.has(account.index) && this._isAvailable(account, model, resetAdvisor);
+      && !scope.has(account.index) && this._isAvailable(account, model, adv);
     // The cursor's account is one end of every comparison the switch makes, so a
     // request that cannot be sent there settles nothing and leaves the event too.
     const spends = !scopedRouting
@@ -3033,12 +3377,12 @@ export class AccountManager {
         sessionReset.push(account);
       }
     }
-    // The model reaches the switch only while the feature is on. Handed no
-    // model, the switch runs the same `_isAvailable(acc)` it does with the knob
-    // off: threading one in would make the disabled path's candidate filter
-    // model-scoped, a live routing change on the path that promises none.
+    // Neither model reaches the switch unless the feature is on. Handed none,
+    // the switch runs the same `_isAvailable(acc)` the knob-off path runs; a
+    // model-scoped filter there is a live routing change on the path that
+    // promises none.
     if (sessionReset.length) {
-      this._switchOnSessionReset(sessionReset, scopedRouting ? model : null, scope, resetAdvisor);
+      this._switchOnSessionReset(sessionReset, scopedRouting ? model : null, scope, adv);
     }
     return changed;
   }
@@ -3068,11 +3412,12 @@ export class AccountManager {
       // goes. Kept here as well as in refreshExpiredQuotas, so a caller that does
       // not filter first gets the same answer.
       if (exclude?.has(acc.index)) continue;
-      // Model-scoped, because the request being routed has one: an account whose
-      // Fable weekly is spent is still fully usable for Opus, and a switch that
-      // ignores the model can install one the model's own picker would refuse.
-      // The caller pre-filters on this only with the feature on. With it off,
-      // this line alone keeps an account whose weekly is spent out of the switch.
+      // Scoped to the models this switch is handed: the caller drops the advisor
+      // model when no reachable account serves it, so the switch is never
+      // stricter than the pass that decides the request. An account whose Fable
+      // weekly is spent is fully usable for Opus, and a switch that ignores
+      // either model installs one the request's own picker refuses. With the
+      // feature off this line alone keeps an account whose weekly is spent out.
       if (!this._isAvailable(acc, model, advisorModel)) continue; // enough session & weekly quota left
       if (this._usesFablePreference(model, advisorModel)
           && (this._preemptedBy(acc, model, advisorModel, exclude) || this._policyMove(current, acc, model, advisorModel))) continue;
@@ -3103,12 +3448,27 @@ export class AccountManager {
         || (mine === theirs && this._rankedReset(acc, model) < this._rankedReset(best, model))) best = acc;
     }
 
-    // TWO guards, different properties, neither implying the other. Band
-    // membership says the account is worth spending at all. The rank comparison
-    // says this switch leaves no strictly better account behind, which
-    // membership does not claim once a lower tier passes through unbanded. Both
-    // are drawn over what this request can be sent to.
-    if (this.expiryRouting.enabled && !this._bandedCandidates(exclude, model, advisorModel).includes(best)) return;
+    // TWO guards, different properties, neither implying the other, and NOT
+    // drawn over the same fleet. The rank comparison weighs `best` against the
+    // account the cursor is on, both of which THIS REQUEST reached, so it is
+    // measured on what this request can be sent to; and it says this switch
+    // leaves no strictly better account behind, which membership does not claim
+    // once a lower tier passes through unbanded. Band membership says the
+    // account is worth spending at all, and the only thing the answer does here
+    // is move the CURSOR, which serves every request behind this one. So it is
+    // drawn over the fleet that cursor serves: the request's provider partition,
+    // narrowed by the model filter _bandedCandidates already applies, and never
+    // by the accounts this one attempt has tried. An account a 429 pushed this
+    // request off holds whatever band it holds for everybody else.
+    // Both models, because that filter is per-account and reads the
+    // already-degraded argument: the band re-evaluates no degradation, so the
+    // advisor term narrows the set and re-imposes nothing the caller dropped.
+    // The provider comes from the walk in progress, as it does in _cursorKey; a
+    // direct caller has none and means the default fleet. Kept inside the `&&`
+    // rather than hoisted, so the knob-off path evaluates none of it.
+    if (this.expiryRouting.enabled && !this._bandedCandidates(
+      this._excludeOtherProviders(null, this._selectingProvider || DEFAULT_PROVIDER),
+      model, advisorModel).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
@@ -3126,7 +3486,7 @@ export class AccountManager {
     this._clearExpiredQuotas(account);
 
     // Shared 5-hour bucket gates every request regardless of model.
-    if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h')) return true;
+    if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h', account)) return true;
 
     // The HIGHER of the weekly bucket that GOVERNS this model and the shared
     // weekly one. Fable and Sonnet meter their own quota, so a spent Fable
@@ -3136,17 +3496,17 @@ export class AccountManager {
     // ratcheting further past that cap. When the family bucket isn't reported
     // (e.g. the plan doesn't expose it) the shared one answers alone.
     const weeklyVal = this._governingWeekly(account, model);
-    if (weeklyVal != null && weeklyVal >= this.thresholdFor(this._weeklyBucketFor(model))) return true;
+    if (weeklyVal != null && weeklyVal >= this.thresholdFor(this._weeklyBucketFor(model), account)) return true;
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
       const used = 1 - (q.tokensRemaining / q.tokensLimit);
-      if (used >= this.thresholdFor('tokens')) return true;
+      if (used >= this.thresholdFor('tokens', account)) return true;
     }
 
     if (q.requestsLimit != null && q.requestsRemaining != null) {
       const used = 1 - (q.requestsRemaining / q.requestsLimit);
-      if (used >= this.thresholdFor('requests')) return true;
+      if (used >= this.thresholdFor('requests', account)) return true;
     }
 
     return false;
@@ -3352,7 +3712,7 @@ export class AccountManager {
     if (account.probing && account.quota.unified7dReset != null) {
       account.probing = false;
       account.requalify = true;
-      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+      console.log(`[TeamClaude] Learned weekly quota for "${safeLine(account.name, 64)}", re-evaluating selection`);
     }
 
     this._observeBurnRate(account, observed);
@@ -3362,7 +3722,7 @@ export class AccountManager {
 
     if (this._isNearQuota(account)) {
       const pct = account.quota.unified7d != null ? Math.round(account.quota.unified7d * 100) : null;
-      console.log(`[TeamClaude] "${account.name}" near weekly quota${pct == null ? '' : ` (${pct}%)`}`);
+      console.log(`[TeamClaude] "${safeLine(account.name, 64)}" near weekly quota${pct == null ? '' : ` (${pct}%)`}`);
     }
   }
 
@@ -3423,7 +3783,7 @@ export class AccountManager {
     if (account.probing && account.quota.unified7dReset != null) {
       account.probing = false;
       account.requalify = true;
-      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+      console.log(`[TeamClaude] Learned weekly quota for "${safeLine(account.name, 64)}", re-evaluating selection`);
     }
 
     // `unified-status` is upstream's verdict on THIS response. A family-cap 429
@@ -3478,7 +3838,7 @@ export class AccountManager {
         : account.quota.tokensLimit
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
           : '?';
-      console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" at ${pct}% usage — will switch on next request`);
     }
   }
 
@@ -3571,7 +3931,7 @@ export class AccountManager {
       // drop the dead-token guard too — otherwise the account would come back
       // active but never attempt a refresh (see ensureTokenFresh).
       account._deadRefreshToken = null;
-      console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" re-enabled — clearing error state`);
     }
   }
 
@@ -3621,7 +3981,7 @@ export class AccountManager {
     const now = Date.now();
     for (const { key, label, usageKey } of FAMILY_WEEKLY_BUCKETS) {
       const bucket = usage[usageKey];
-      const wasSpent = q[key] != null && q[key] >= this.thresholdFor(key);
+      const wasSpent = q[key] != null && q[key] >= this.thresholdFor(key, account);
       if (bucket && bucket.utilization != null) {
         q[key] = bucket.utilization;
         q[`${key}Reset`] = bucket.resetAt ?? null;
@@ -3640,8 +4000,8 @@ export class AccountManager {
         continue;
       }
       // Worth a line: the account was refusing this family and is not any more.
-      if (wasSpent && !(q[key] != null && q[key] >= this.thresholdFor(key))) {
-        console.log(`[TeamClaude] Account "${account.name}" ${label} weekly quota confirmed available by probe`);
+      if (wasSpent && !(q[key] != null && q[key] >= this.thresholdFor(key, account))) {
+        console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${label} weekly quota confirmed available by probe`);
       }
     }
     // Families beyond the two with dedicated fields. Replaced wholesale rather
@@ -3665,11 +4025,11 @@ export class AccountManager {
       const was = q.spend;
       q.spend = { ...usage.spend };
       if (q.spend.enabled && !was?.enabled) {
-        console.log(`[TeamClaude] Account "${account.name}" can bill real money past its plan limits (extra usage is enabled upstream)`);
+        console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" can bill real money past its plan limits (extra usage is enabled upstream)`);
       }
       const spentNow = (q.spend.usedMinor || 0) > 0;
       if (spentNow && !((was?.usedMinor || 0) > 0)) {
-        console.log(`[TeamClaude] Account "${account.name}" has started spending real money: ${formatMoney(q.spend)}`);
+        console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" has started spending real money: ${formatMoney(q.spend)}`);
       }
     }
 
@@ -3681,22 +4041,36 @@ export class AccountManager {
     }
   }
 
+  /** Apply a read-only Codex `/wham/usage` reading without counting traffic. */
   applyCodexUsageData(accountIndex, usage) {
     const account = this.accounts[accountIndex];
     if (!account || providerOf(account) !== 'codex' || !usage || usage.error) return;
+    // The Codex-learned fields below are written here for the first time, so the
+    // empty-quota shape does not carry them. See CodexLearnedQuota.
+    /** @type {typeof account.quota & CodexLearnedQuota} */
     const q = account.quota;
-    for (const [field, bucket] of [['unified5h', 'fiveHour'], ['unified7d', 'sevenDay']]) {
-      if (Object.hasOwn(usage, bucket)) {
-        q[field] = usage[bucket]?.utilization ?? null;
-        q[`${field}Reset`] = usage[bucket]?.resetAt ?? null;
-      }
-    }
-    this.applyUsageData(accountIndex, { fiveHour: usage.fiveHour, sevenDay: usage.sevenDay });
+    q.unified5h = usage.fiveHour?.utilization ?? null;
+    q.unified5hReset = usage.fiveHour?.resetAt ?? null;
+    q.unified7d = usage.sevenDay?.utilization ?? null;
+    q.unified7dReset = usage.sevenDay?.resetAt ?? null;
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
-    if (usage.modelBuckets) {
-      q.codexModelBuckets = Object.fromEntries(usage.modelBuckets.slice(0, MAX_CODEX_MODEL_BUCKETS).map(bucket => [
-        bucket.slug, { name: bucket.name, utilization: bucket.utilization, resetAt: bucket.resetAt, seenAt: Date.now() },
-      ]));
+    // Stamped, because nothing else refreshes it: a payload that mentions no
+    // credits leaves the last reading alone rather than blanking it, so the
+    // age is the only thing that says how much the number is worth.
+    if (usage.resetCredits) q.resetCredits = { ...usage.resetCredits, seenAt: Date.now() };
+    if (Array.isArray(usage.modelBuckets)) {
+      q.codexModelBuckets = Object.fromEntries(usage.modelBuckets.slice(0, MAX_CODEX_MODEL_BUCKETS)
+        .filter(bucket => bucket?.slug)
+        .map(bucket => [safeLine(bucket.slug, 64), {
+          name: safeLine(bucket.name || bucket.slug, 64),
+          utilization: bucket.utilization,
+          resetAt: bucket.resetAt ?? null,
+          seenAt: Date.now(),
+        }]));
+    }
+    if (account.probing && q.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
     }
   }
 
@@ -3735,7 +4109,7 @@ export class AccountManager {
     // after throttleProbeFloorMs from here, so a probe that 429s again pushes
     // the next probe out by a full floor rather than hammering upstream.
     account.throttledAt = Date.now();
-    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limited for ${retryAfterSeconds}s`);
   }
 
   /**
@@ -3749,7 +4123,7 @@ export class AccountManager {
     account.status = 'active';
     account.rateLimitedUntil = null;
     account.throttledAt = null;
-    console.log(`[TeamClaude] Account "${account.name}" revalidated — rate limit no longer applies, back in rotation`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" revalidated — rate limit no longer applies, back in rotation`);
   }
 
   /**
@@ -3786,7 +4160,7 @@ export class AccountManager {
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
       if (account.status !== 'error') {
         account.status = 'error';
-        console.error(`[TeamClaude] Account "${account.name}" still holds a rejected refresh token — run: teamclaude login`);
+        console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" still holds a rejected refresh token — run: teamclaude login`);
       }
       return;
     }
@@ -3812,7 +4186,7 @@ export class AccountManager {
     if (account._refreshPromise) return account._refreshPromise;
 
     account._refreshPromise = (async () => {
-      console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
+      console.log(`[TeamClaude] Refreshing token for account "${safeLine(account.name, 64)}"...`);
       // The token we SEND, captured before the await. A config reload or
       // `teamclaude import` (updateAccountTokens) can install newer tokens while
       // the grant is in flight; reading `account.refreshToken` afterwards would
@@ -3834,7 +4208,7 @@ export class AccountManager {
           ? this._codexRefreshFn(sent)
           : this._refreshFn(sent));
         if (replaced()) {
-          console.log(`[TeamClaude] Discarding refresh result for account "${account.name}" — its tokens were replaced while the refresh was in flight`);
+          console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
         }
         if (providerOf(account) === 'codex') {
@@ -3854,10 +4228,10 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
-        console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
+        console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
-        console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
+        console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // Reserve 'error' (which drops the account from rotation until re-login)
         // for a GENUINE auth rejection: the refresh token itself is no longer
         // valid — revoked, or invalidated by an account/plan migration. A
@@ -3874,11 +4248,11 @@ export class AccountManager {
           // a token imported mid-refresh stays untouched and gets its own try.
           account._deadRefreshToken = sent;
           if (account.refreshToken !== sent) {
-            console.log(`[TeamClaude] Account "${account.name}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
+            console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
             return;
           }
           account.status = 'error';
-          console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
       } finally {
         account._refreshPromise = null;
@@ -3896,7 +4270,26 @@ export class AccountManager {
   }
 
   /**
+   * Take an account out of rotation because upstream rejected its credential
+   * and nothing in this process can repair it. `error` is the state selection
+   * already skips and status already explains ("needs re-login"); a reload that
+   * brings a new credential, or re-enabling the account, clears it.
+   *
+   * @param {number} accountIndex
+   * @param {string} why  one clause for the log line
+   */
+  markCredentialRejected(accountIndex, why) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.status === 'error') return;
+    account.status = 'error';
+    const remedy = account.type === 'oauth' ? 'run: teamclaude login' : 'check the key in the config';
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: ${why} — ${remedy}`);
+  }
+
+  /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
+   * @param {number} accountIndex
+   * @param {{ accessToken?: string, refreshToken?: string, expiresAt?: number, accountId?: string }} tokens
    */
   updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt, accountId }) {
     const account = this.accounts[accountIndex];
@@ -3918,7 +4311,7 @@ export class AccountManager {
     else if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
-    console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
+    console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
       refreshToken: account.refreshToken,
@@ -3941,6 +4334,7 @@ export class AccountManager {
    */
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
+    const before = this.accounts[this.currentIndex] ?? null;
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
@@ -3975,15 +4369,26 @@ export class AccountManager {
     // against whichever account inherited the slot; its held roll the same.
     const moved = this._currentObs?.idx == null ? null : remap(this._currentObs.idx);
     if (this._currentObs) {
-      this._currentObs = moved == null ? null
-        : {
-          idx: moved,
-          windows: this._currentObs.windows,
-          unescaped: remapHeld(this._currentObs.unescaped, remap),
-          // Renumbering names the same account by a new index, so a request
-          // already in flight against it still confirms the stay it selected on.
-          gen: this._currentObs.gen,
-        };
+      // Renumbering is nobody's success, and it names the same account by a new
+      // index, so everything but the two indices survives the shift: the stamp
+      // saying whose reading this is, and the gen a request already in flight
+      // against that account still confirms its stay on. The account that went
+      // away is the only one whose roll the removal settles, so what it was
+      // holding for the others moves onto a fresh reading. That reading names no
+      // account and has no windows, which is evidence about nobody, while every
+      // hold under it keeps its own stamp and gen.
+      const held = remapHeld(this._currentObs.unescaped, remap);
+      this._currentObs = moved != null
+        ? { ...this._currentObs, idx: moved, unescaped: held }
+        : held ? { ...newObservation(), unescaped: held } : null;
+    }
+    // A removal that takes the account the cursor rests on leaves the cursor at
+    // a neighbour, with a reading the rebuild left nameless. A reading the
+    // removal merely renumbered keeps its own account, so it is offered
+    // nothing.
+    const landed = this.accounts[this.currentIndex] ?? null;
+    if (landed && landed !== before && this._currentObs && this._currentObs.idx == null) {
+      this._firstSightOn(this._currentObs, landed);
     }
     // A throttle key names an account by index, so the shift would point a live
     // entry at a different account. Not worth renumbering: the entries expire in
@@ -4010,11 +4415,11 @@ export class AccountManager {
         burnRate: this.burnRateLearner.export(a.index),
         concCap: this.concurrencyLearner.export(a.index),
       };
-      return {
-        provider: providerOf(a),
-        ...(providerOf(a) === 'codex' && { accountId: a.accountId }),
-        accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive,
-      };
+      // `provider` and `accountId` identify a Codex account, which has no
+      // `accountUuid`: a row saved without them reads as Anthropic and stops
+      // matching the account it was written for. Rows from an older version
+      // therefore stop restoring Codex quota, which is re-learned from traffic.
+      return { accountUuid: a.accountUuid, accountId: a.accountId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
     });
   }
 
@@ -4026,7 +4431,11 @@ export class AccountManager {
   restoreQuotaState(saved) {
     if (!Array.isArray(saved)) return;
     for (const account of this.accounts) {
-      const match = saved.find(s => sameIdentity({ ...s, provider: s?.provider ?? providerOf(account) }, account));
+      const match = saved.find(s => {
+        if (sameIdentity({ ...s, provider: s?.provider ?? DEFAULT_PROVIDER }, account)) return true;
+        if (s?.provider != null || providerOf(account) === DEFAULT_PROVIDER || s?.name !== account.name) return false;
+        return this.accounts.filter(a => a.name === s.name).length === 1;
+      });
       if (!match || !match.quota) continue;
       this._confirmedFable.delete(account);
       for (const f of PERSISTED_QUOTA_FIELDS) {
@@ -4071,8 +4480,23 @@ export class AccountManager {
     // precisely because it trusts the server to have done this (#237).
     this.sweepExpiredQuotas();
     const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
+    const currentAccounts = {};
+    // The same, by position in `accounts`. A name alone is ambiguous when one
+    // address is both a pool's own login and a shared API key.
+    /** @type {Record<string, number|null>} */
+    const currentIndexes = {};
+    const defaultTargets = {};
+    for (const provider of new Set(this.accounts.map(a => providerOf(a)))) {
+      const index = this._currentIndexForProvider(provider);
+      currentAccounts[provider] = index == null ? null : this.accounts[index]?.name ?? null;
+      currentIndexes[provider] = index ?? null;
+      defaultTargets[provider] = this._routeTarget(null, provider);
+    }
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
+      currentAccounts,
+      currentIndexes,
+      defaultTargets,
       // Where a request no route claims lands right now — the same derivation
       // as each route's `target`, so a status reader need not assume "the
       // current account" when that account is blocked or outranked.
@@ -4105,8 +4529,17 @@ export class AccountManager {
         type: a.type,
         orgName: a.orgName || null,
         priority: a.priority || 0,
+        // The attached TUI spreads these fields onto its own account objects
+        // and sorts its rows by this one, so without it `teamclaude attach`
+        // draws array order beside a server TUI drawing the arrangement.
+        displayOrder: a.displayOrder ?? null,
         disabled: a.disabled || false,
         maxUsage: a.maxUsage ?? null,
+        // Raw per-account override (issue #409), same shapes as the fleet-wide
+        // field, so a remote reader (the attach-mode TUI, a status --json
+        // consumer) can resolve it with the shared resolveSwitchThreshold
+        // rather than only seeing this account's already-resolved default.
+        switchThreshold: a.switchThreshold ?? null,
         status: a.status,
         fableEvidence: this._fableEvidence(a),
         // Why the account is out of rotation right now (null = it can serve).
@@ -4114,6 +4547,7 @@ export class AccountManager {
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
         sessions: sessions.perAccount[a.index] || 0,
+        knownSessions: sessions.knownPerAccount[a.index] || 0,
         // Shared-weekly pressure (model-agnostic), so the ordering the router
         // works from can be read off the payload. Computed whether or not the
         // knob is on: a measurement of the fleet, not a report of the feature's

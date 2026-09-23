@@ -13,6 +13,7 @@ import { credentialFile } from './account-source.js';
  * used to discard everything else on it (`disabled`, `priority`, `upstream`,
  * `modelMap`, `models`), so an account disabled on disk silently rejoined
  * rotation on every restart and a third-party backend lost its upstream.
+ * @param {{ accounts: Array<Record<string, any>> }} config
  */
 export async function resolveAccounts(config) {
   const accounts = [];
@@ -32,7 +33,7 @@ export async function resolveAccounts(config) {
           }
           accounts.push({ ...acct, importFrom: from, ...creds });
           console.log(`Imported "${acct.name}" from ${from}`);
-        } catch (err) {
+        } catch (/** @type {any} */ err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);
         }
       } else if (acct.accessToken && (!isCodex || (typeof acct.accessToken === 'string' && acct.accessToken.trim()))) {

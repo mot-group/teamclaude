@@ -16,6 +16,7 @@ try {
   chmodSync(workerData.file, 0o600);
   const fresh = statSync(workerData.file).size === 0;
   try {
+    // @ts-expect-error node:sqlite has no types in @types/node 20
     const { DatabaseSync } = await import('node:sqlite');
     db = new DatabaseSync(workerData.file);
     execute = sql => db.exec(sql);

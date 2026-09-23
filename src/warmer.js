@@ -29,6 +29,22 @@ import {
 const SCHEDULE_TIMER_GRACE_MS = 60_000;
 
 export class Warmer {
+  /**
+   * @param {Object} accountManager
+   * @param {Object} opts
+   * @param {number} [opts.intervalMs]
+   * @param {{mode?: string, resetTime: string, timezone: string, anchorResetAt?: string}|null} [opts.schedule]
+   * @param {number} [opts.port]
+   * @param {string|null} [opts.apiKey]
+   * @param {string} [opts.model]
+   * @param {string} [opts.prompt]
+   * @param {Function} [opts.spawnFn]
+   * @param {number} [opts.timeoutMs]
+   * @param {Function} [opts.log] defaults to a call-time `console.log` — see below
+   * @param {Function} [opts.nowFn]
+   * @param {Function} [opts.setTimeoutFn]
+   * @param {Function} [opts.clearTimeoutFn]
+   */
   constructor(accountManager, {
     intervalMs = 0,
     schedule = null,
@@ -38,7 +54,15 @@ export class Warmer {
     prompt = 'hi',
     spawnFn = defaultSpawn,
     timeoutMs = 120_000,
-    log = console.log,
+    // Resolves the console per call rather than capturing it. A default
+    // parameter is evaluated when the constructor runs, and the server builds
+    // its warmer in the same tick as `server.listen()` — before the listen
+    // callback reaches `tui.start()`, which swaps `console.log` for the
+    // activity log. Only an interval or schedule set at startup is announced
+    // before that; a reload's reschedule and a sweep's deferral notice both
+    // come afterwards, and a captured `console.log` would put them on a
+    // terminal the alternate screen has already covered.
+    log = (/** @type {string} */ line) => console.log(line),
     nowFn = Date.now,
     setTimeoutFn = setTimeout,
     clearTimeoutFn = clearTimeout,
@@ -76,7 +100,10 @@ export class Warmer {
     else if (this.intervalMs > 0) this.reschedule(this.intervalMs);
   }
 
-  /** Change interval at runtime (0 = off). Warms once immediately when turned on. */
+  /**
+   * Change interval at runtime (0 = off). Warms once immediately when turned on.
+   * @param {number} intervalMs
+   */
   reschedule(intervalMs) {
     const wasOn = !this.schedule && this.intervalMs > 0 && this.timer;
     this._scheduleGeneration += 1;
@@ -102,7 +129,10 @@ export class Warmer {
     }
   }
 
-  /** Change to a reset-target schedule without replaying missed runs. */
+  /**
+   * Change to a reset-target schedule without replaying missed runs.
+   * @param {{mode?: string, resetTime: string, timezone: string, anchorResetAt?: string}|null} schedule
+   */
   rescheduleSchedule(schedule) {
     const scheduleStatus = schedule ? resolveWarmupSchedule(schedule, this.nowFn()) : null;
     const generation = ++this._scheduleGeneration;
@@ -219,7 +249,8 @@ export class Warmer {
     if (generation !== this._scheduleGeneration || this._stopped) return false;
     if (deadline !== null && this.nowFn() >= deadline) return false;
     this._running = true;
-    let finishRun;
+    /** @type {(value?: unknown) => void} */
+    let finishRun = () => {};
     const runFinished = new Promise(resolve => { finishRun = resolve; });
     this._runFinished = runFinished;
     const abort = this._abort = new AbortController();
@@ -326,11 +357,16 @@ export class Warmer {
   /** The `claude` invocation for one account. Pure/deterministic so tests can
    *  assert the args and env without spawning anything. */
   _spawnSpec(account, signal) {
-    // Pin by accountUuid — a stable identity. The rotation index is NOT usable:
-    // it is array position, so removing an account would repoint this at a
+    // One user can have accounts in several organizations, all sharing the
+    // same accountUuid. Qualify it with orgUuid when possible so each warm-up
+    // reaches the intended subscription. The rotation index is NOT usable: it
+    // is array position, so removing an account would repoint this at a
     // different one. Fall back to the display name when the uuid isn't known
-    // yet (e.g. an API-key account, or before the first profile fetch).
-    const pin = encodePinComponent(account.accountUuid || account.name);
+    // yet (e.g. before the first profile fetch).
+    const identity = account.accountUuid && account.orgUuid
+      ? `${account.accountUuid}/${account.orgUuid}`
+      : account.accountUuid || account.name;
+    const pin = encodePinComponent(identity);
     const baseUrl = `http://127.0.0.1:${this.port}/tc-acct/${pin}`;
     return {
       command: 'claude',

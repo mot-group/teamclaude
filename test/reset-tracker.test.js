@@ -136,13 +136,13 @@ test('credit parser ignores purchase fields and rejects malformed inventories', 
   assert.equal(result.immediate_reset_purchase_eligible, undefined);
   assert.throws(() => normalizeResetCredits({ credits: [], available_count: -1 }));
   assert.throws(() => normalizeResetCredits({ ...payload, credits: [{ ...payload.credits[0], expires_at: 'invalid' }] }));
-  await fetchCodexResetCredits({ ...a, type: 'oauth', credential: 'test' }, { fetchFn: async (url, options) => {
+  await fetchCodexResetCredits({ ...a, type: 'oauth', credential: 'test' }, { fetchImpl: async (url, options) => {
     assert.equal(url, 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits');
     assert.equal(options.method || 'GET', 'GET');
     assert.equal(options.headers['ChatGPT-Account-Id'], a.accountId);
     return new globalThis.Response(JSON.stringify(payload));
   } });
-  const refused = await fetchCodexResetCredits({ ...a, provider: 'anthropic', type: 'oauth', credential: 'test' }, { fetchFn: () => assert.fail('wrong provider') });
+  const refused = await fetchCodexResetCredits({ ...a, provider: 'anthropic', type: 'oauth', credential: 'test' }, { fetchImpl: () => assert.fail('wrong provider') });
   assert.ok(refused.error);
 });
 

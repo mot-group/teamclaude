@@ -77,9 +77,11 @@ teamclaude priority <name> --first
 teamclaude priority <name> --last
 ```
 
-`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** still need a restart.
+`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk still need a restart, because a reload never drops a running account; removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
 
-Accounts can also be added and removed from the TUI settings screen: **`g`** → **Add account** / **Remove account**.
+Accounts can also be added, removed and reordered from the TUI settings screen: **`g`** → **Add account** / **Remove account** / **Reorder accounts**.
+
+**Reorder accounts** sets the order the account list is drawn in — `↑`/`↓` pick an account, `←`/`→` move it up and down, each move saved as you make it. It writes a `displayOrder` on the entry and touches nothing else: an account keeps its place in the `accounts` array, so route pins, session pins and `TC_ACCT` all go on naming the same accounts, and rotation order stays `priority`'s business alone. An account with no `displayOrder` — every account, until the first time you arrange them, and every one added afterwards — lists after the ones that have one, which is where a newly added account appeared anyway. A [third-party backend](#third-party-backend-accounts) served by a local process is infrastructure rather than a seat to rotate between: the TUI keeps those at the end of the list, and the screen leaves them there.
 
 ## The `id` field
 
@@ -216,6 +218,12 @@ and one TUI.
   `account_uuid` TeamClaude patches into an Anthropic request body — so the
   Codex path performs no body rewrite at all.
 - Tokens refresh against `auth.openai.com` using the Codex CLI's own client id.
+- The proxy waits **5 minutes** for the response head instead of the fleet's 2,
+  because the ChatGPT backend sends nothing until the model has finished
+  reasoning — on a large-context turn that is minutes of silence on a perfectly
+  healthy socket. The wait covers the head only: once it arrives the deadline is
+  dropped and the body streams for as long as it needs.
+  `TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS` overrides both figures.
 - The request body is forwarded untouched. This is a passthrough, not a
   translation layer: TeamClaude never converts between the Anthropic and OpenAI
   protocols.
@@ -239,6 +247,31 @@ Two details are worth knowing if you read the raw headers:
 
 With `teamclaude probe 300`, the background prober also reads Codex subscription usage without generating a completion. It uses the same duration-based window mapping and keeps idle accounts current. The dashboard displays these readings, [detected resets, and banked reset credits](reset-tracking.md).
 
+### Free rate-limit reset credits
+
+OpenAI occasionally grants a ChatGPT account a free **rate-limit reset credit**:
+redeeming one clears the account's spent windows ahead of their own reset. The
+Codex CLI offers it as a manual action only, so a pooled account that runs dry
+sits out the rest of its week holding one unless somebody notices it is there.
+
+The count an account holds comes free with the quota probe — it rides on the
+same `/wham/usage` payload the quota reading does — and shows up as `RC1` on the
+TUI row, a `Reset` line in `teamclaude status`, and a badge on the dashboard
+card. It survives a restart, which matters because the probe is off by default:
+without that, nothing would say a credit exists until something next happened to
+read the usage endpoint.
+
+Only the probe refreshes the count, so a reading can outlive the credit it
+describes — redeemed in the Codex CLI, or expired. The `status` line therefore
+says how old the reading is (`as of 3h ago`), and every surface drops it once it
+is more than 7 days old.
+
+The count is what the account **holds**. Whether a particular credit can be
+spent is a separate question — the payload's `applicable_available_count` is
+upstream's own view of how many would reset a window right now, and is named on
+the `status` line when it is zero — and spending one remains a manual action in
+the Codex CLI.
+
 ## Third-party backend accounts
 
 Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.
@@ -257,8 +290,9 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
 }
 ```
 
-- **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only.
+- **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only. One class of request is answered by the proxy instead of being forwarded — see [message threads](#message-threads) below.
 - **`modelMap`** — when a Claude model name arrives in the request body, it is rewritten to the mapped name before forwarding.
+- **`messageThreads`** — set to `true` when the backend keeps Anthropic message-thread state (a relay that reaches Anthropic does). Off by default for a third-party backend — see below.
 
 Where the provider publishes one, its own balance or quota is shown in `teamclaude status` — see [third-party backend quota](quota.md#third-party-backend-quota).
 
@@ -276,6 +310,20 @@ claude --model 'deepseek-v4-pro[1m]'
 ```
 
 Model names with brackets (e.g. `deepseek-v4-pro[1m]`) must be quoted in the shell.
+
+### Message threads
+
+Claude Code keeps the conversation on the server once a thread exists: the first `/v1/messages` body carries `thread: {"type": "create"}` with the whole messages array, and every later one carries `thread: {"type": "continue"}` with only the new delta. A backend that keeps no thread state ignores the unknown field and answers the delta on its own, so from the second turn onward the model no longer sees the conversation — and nothing anywhere reports an error.
+
+When a thread cannot be continued Anthropic answers `400`, and Claude Code resends the whole conversation rather than giving up (observed on 2.1.269). So the proxy answers a `continue` bound for an account with a per-account `upstream` with that same `400` rather than forwarding it. The body carries `details.error_code: "thread_unsupported_request"`, which the client reads as "this model keeps no thread state": it resends the turn in full and then drops the `thread` field entirely for the rest of the session, so the refusals are counted per agent and model rather than per turn, and cost no tokens. A session running subagents pays one refusal for the main agent and one for each subagent on that model. `count_tokens` is never refused: there is no conversation to resend for a token count.
+
+The flag the client sets is keyed on the model, not on the account serving it. If the same model name is served both by a third-party backend and by Anthropic accounts, a refusal turns threads off for that model everywhere until the session ends — the conversation still works, it just travels in full each turn.
+
+An `upstream` whose host is Anthropic's own is left alone without any flag — a region pin or a mirror reaches the real thread store, so there is nothing to repair. The host is what decides it: a third-party API serving the Anthropic shape does that under its own host.
+
+Only a per-account `upstream` arms this. A fleet pointed at a third-party host through the global `upstream` is not covered, and there is no setting to turn the refusal on for it.
+
+A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` and continues are forwarded untouched.
 
 ### `accounts[].models` is deprecated
 

@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
+import { AccountManager, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { normalizeRoutes, routeMembers, configuredPinId } from './routes.js';
 import { createProxyServer } from './server.js';
@@ -34,28 +34,41 @@ import { Prober } from './prober.js';
 import { ForecastService } from './forecast/service.js';
 import { ResetTracker } from './reset-tracker.js';
 import { Warmer } from './warmer.js';
-import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
+import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
+import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
-import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
+import {
+  ConfigOpError,
+  DISTRIBUTE_MODES,
+  removeRoute,
+  setBucketThresholds,
+  setDistribution,
+  setProbeSeconds,
+  setThreshold,
+  setWarmupSchedule,
+  setWarmupSeconds,
+  thresholdRatio,
+  thresholdTable,
+  upsertRoute,
+} from './config-ops.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
 // the switch, so a const declared under the switch is still in the temporal
 // dead zone when the command body runs — keep them above the dispatch.
-// Ceiling for `teamclaude probe <seconds>`: setInterval takes a 32-bit signed
-// millisecond delay, so anything past ~2,147,483 s overflows to 1 ms.
-const MAX_PROBE_SECONDS = 7 * 24 * 3600;
 const ROUTE_USAGE = [
   'Usage: teamclaude route [list]',
   '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
@@ -66,8 +79,6 @@ const ROUTE_USAGE = [
   '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
   'First matching route wins. Changes apply to a running server immediately.',
 ].join('\n');
-
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
 const THRESHOLD_USAGE = [
   'Usage: teamclaude threshold                 (show the current thresholds)',
@@ -80,30 +91,7 @@ const THRESHOLD_USAGE = [
   'server immediately.',
 ].join('\n');
 
-// The buckets a threshold can be keyed by: the quota windows the manager asks
-// thresholdFor() about. An unknown key would be accepted by the config and then
-// never consulted, so the CLI refuses it rather than storing a typo.
-const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
-
 const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
-
-// What each mode writes to the config, and what to say once it is set. Keyed by
-// the mode `distributionMode` resolves to, so the command and the router cannot
-// disagree about what a setting means.
-const DISTRIBUTE_MODES = {
-  off: {
-    value: false,
-    said: 'Session distribution off — sessions already running keep their accounts and drain; new ones rotate by quota.',
-  },
-  even: {
-    value: true,
-    said: 'Session distribution on — new sessions spread across equal-priority accounts, each pinned to its own for cache reuse.',
-  },
-  adaptive: {
-    value: 'adaptive',
-    said: 'Session distribution adaptive — new sessions concentrate on the account with the least remaining weekly credit, tapering off as it nears the switch threshold and backing off when it is busy.',
-  },
-};
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -133,6 +121,10 @@ switch (command) {
     break;
   case 'attach':
     await attachCommand();
+    process.exit(0);
+    break;
+  case 'dashboard':
+    await dashboardCommand();
     process.exit(0);
     break;
   case 'accounts':
@@ -252,6 +244,14 @@ async function serverCommand() {
   // per stall in the service log, lag figures under `server.eventLoop`).
   const eventLoopMonitor = startEventLoopMonitor();
 
+  // With a TUI coming, hold what startup prints until the TUI owns the console,
+  // then replay it into the activity pane (and its log file) — see early-log.js.
+  // The same test `useTUI` applies below, taken here because the first lines are
+  // printed long before that one is reached.
+  const tuiExpected = !(args.includes('--headless') || args.includes('--no-tui'))
+    && process.stdout.isTTY && process.stdin.isTTY;
+  const earlyConsole = tuiExpected ? captureEarlyConsole() : null;
+
   const config = await loadOrCreateConfig();
   // Token writes below pair rows by entry id against a re-read of the file, so
   // the ids have to be on disk before the first refresh, not just in memory.
@@ -351,7 +351,10 @@ async function serverCommand() {
     atomicConfigUpdate(async diskConfig => {
       // Pick up any new accounts from disk so the running fleet serves them
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
+      const removed = removedAccountIds(config);
       for (const diskAcct of diskConfig.accounts) {
+        // A row the TUI is in the middle of removing is not a new account (#422).
+        if (diskAcct?.id && removed.has(diskAcct.id)) continue;
         const known = config.accounts.some(a => sameAccountEntry(a, diskAcct));
         if (!known) {
           // Keep the raw entry in config and give its id to the resolved account.
@@ -380,10 +383,28 @@ async function serverCommand() {
   // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
   const serverStartedAt = Date.now();
+  // Read once here, not per request: `teamclaude update` swaps package.json on
+  // disk while this process keeps running the old code, and status must report
+  // what is running, not what is installed.
+  const serverVersion = currentVersion();
+  // What the header names this build, and whether the last recorded check saw
+  // something newer. A checkout gets no update marker: autoUpdate refuses to
+  // npm-install over one, so offering it would advertise a declined action.
+  const { label: versionLabel, git: fromGit } = await resolveVersionLabel();
+  const updateAvailable = !fromGit && await updateAvailableFromCache({ current: serverVersion });
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
-  const sx = new SxManager({ log: console.error });
+  // Resolved per call, not captured. This manager speaks when it provisions,
+  // and the provisioning just below is the only one that happens here — at
+  // startup, with no TUI yet to paint over the answer. Every later one is
+  // triggered from inside a running TUI: the settings screen's `sx.configure`
+  // and `sx.setMode`, and the key/mode change picked up by `reloadAccounts`.
+  // By then `tui.start()` has swapped `console.error` for the activity log, so
+  // handing over the function object here would bind the pre-TUI console and
+  // put "sx.org proxy ready" / "provisioning failed" on a terminal the
+  // alternate screen has already covered.
+  const sx = new SxManager({ log: line => console.error(line) });
   if (config.sx?.apiKey) {
     const r = await sx.configure(config.sx.apiKey, config.sx.mode);
     if (!r.ok) console.error(`[TeamClaude] sx.org disabled: ${r.error}`);
@@ -413,6 +434,12 @@ async function serverCommand() {
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
     }
+    // The MCP endpoint's mode: read per request, so this is what opens,
+    // narrows or closes it without a restart. Outside the guard above on
+    // purpose: an operator who deletes the whole `proxy` section has asked for
+    // the endpoint to be off as surely as one who deletes the key, and leaving
+    // the old mode in memory would keep it served.
+    if (config.proxy) config.proxy.mcp = diskConfig.proxy?.mcp;
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     for (const warning of accountManager.setRoutes(config.routes)) {
@@ -439,6 +466,12 @@ async function serverCommand() {
     accountManager.setExpiryRouting(config.expiryRouting);
     config.sessionTitles = diskConfig.sessionTitles;
     sessionTitles.configure(config.sessionTitles);
+    // Both are read per request off this object (server.js) and the TUI already
+    // persists them; without this a hand edit or another writer waited for a restart.
+    config.eventLogging = diskConfig.eventLogging || 'hide';
+    // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
+    config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
+    config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -548,7 +581,23 @@ async function serverCommand() {
       else delete list[at].override;
     });
 
+  // The account half of a save. The TUI's save below starts with it, and the
+  // MCP endpoint uses it alone: an account changed there is changed in-process,
+  // on a server that may have no TUI to save for it, and writing the settings
+  // too would pin this server's resolved defaults into a file that never
+  // spelled them out.
+  const mergeAccountsOnto = (/** @type {Record<string, any>} */ diskConfig) => {
+    diskConfig.accounts = mergeAccountsForSave(
+      config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
+    );
+    // The written list omits them, so they are gone from disk too and there
+    // is nothing left to re-adopt. Holding the ids any longer would only
+    // refuse an account the operator re-adds later.
+    clearRemovedAccountIds(config);
+  };
+
   let tui = null;
+  /** @type {Record<string, any>} */
   let hooks = {};
   const forecast = config.forecast?.enabled === true ? new ForecastService({
     manager: accountManager, config, file: `${getConfigPath()}.forecast.sqlite`,
@@ -556,15 +605,9 @@ async function serverCommand() {
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx, activityLogPath, sessionTitles,
+      accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        diskConfig.accounts = mergeAccountsForSave(
-          config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
-        );
-        // The written list omits them, so they are gone from disk too and there
-        // is nothing left to re-adopt. Holding the ids any longer would only
-        // refuse an account the operator re-adds later.
-        clearRemovedAccountIds(config);
+        mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
         // Persist other runtime-tunable settings edited from the TUI.
@@ -575,6 +618,7 @@ async function serverCommand() {
         // screen too; the server reads them live from `config`, but without this
         // the edit never reached disk and was silently undone by the next start.
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
+        if (config.defaultClientMode != null) diskConfig.defaultClientMode = config.defaultClientMode;
         if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
         if (config.sessionTitles != null) diskConfig.sessionTitles = config.sessionTitles;
         // Routes are NOT written here. The editor writes each edit through disk
@@ -645,6 +689,7 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   // Queued, like every other republish of the routing table.
   hooks.reload = reloadQueued;
+  hooks.persistAccounts = () => queued(() => atomicConfigUpdate(mergeAccountsOnto));
   hooks.getForecast = hours => forecast?.getSnapshot(hours) || {
     version: 1, status: 'Forecast history is disabled', accounts: [], perModel: [], events: [], recommendations: [],
     coverage: { completePool: false, numericModelGains: false },
@@ -664,6 +709,9 @@ async function serverCommand() {
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
     usageDimensions: dimensionUsage.export(),
     server: {
+      version: serverVersion,
+      versionLabel,
+      updateAvailable,
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
@@ -701,7 +749,7 @@ async function serverCommand() {
   });
   hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
 
-  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage);
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost });
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -726,9 +774,15 @@ async function serverCommand() {
       console.log(`[TeamClaude] Upstream proxy: direct — ${describeSelfProxy(egressProxy)}`);
     }
     if (tui) {
+      const held = earlyConsole?.release() ?? [];
       tui.start();
+      // In the order they were said, ahead of the line that follows them.
+      for (const line of held) console.log(line);
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
     } else {
+      // Same test as `tuiExpected`, so this holds nothing; released all the same
+      // so a line can never stay held if the two ever come to disagree.
+      for (const line of earlyConsole?.release() ?? []) console.log(line);
       const sep = '='.repeat(60);
       console.log('');
       console.log(sep);
@@ -770,6 +824,10 @@ async function serverCommand() {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
   });
+  // The web dashboard's one-shot probe button uses the same zero-spend action
+  // as the TUI's `p` key. Assigned after construction because the hook object
+  // is already shared with the server created above.
+  hooks.probeQuota = () => prober?.probeAll();
   prober.start();
 
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
@@ -785,11 +843,14 @@ async function serverCommand() {
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
+  // Not awaited, and nothing inside it is synchronous: the npm probe and the
+  // install are child processes the loop runs beside (#353), so this never
+  // holds up a request.
   if (!tui) autoUpdate({ config }).catch(() => {});
 
   // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
-  // signals (SIGINT/SIGTERM) and the TUI's ctrl-c / q keypress (which in raw mode
-  // never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
+  // signals (SIGINT/SIGTERM/SIGHUP) and the TUI's ctrl-c / q keypress (which in
+  // raw mode never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
   // impatient user, or a signal racing the keypress — forces an immediate exit
   // instead of re-running teardown, which would re-arm server.close() and leak a
   // 'close' listener on the server each time (MaxListenersExceededWarning).
@@ -815,6 +876,11 @@ async function serverCommand() {
   }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // A closed pane or a dropped SSH session hangs up the controlling terminal.
+  // SIGHUP's default action kills the process where it stands, skipping stop()
+  // and the quota-state save; routed through the same funnel, a vanished
+  // terminal is an orderly exit like any other.
+  process.on('SIGHUP', shutdown);
 }
 
 // ── import ──────────────────────────────────────────────────
@@ -963,7 +1029,7 @@ async function loginCommand() {
 }
 
 async function loginApiCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -975,15 +1041,20 @@ async function loginApiCommand() {
     process.exit(1);
   }
 
-  if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-    name = `api-${n}`;
-  }
-
-  config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
-  await saveConfig(config);
+  // The prompt above waits on the user for as long as they take, and a running
+  // server may have rotated an OAuth account's refresh token on disk meanwhile.
+  // Saving the copy loaded before the prompt would put the dead token back and
+  // lose that account on its next restart, so the row is added to a fresh read.
+  const config = await atomicConfigUpdate(disk => {
+    if (!name) {
+      const n = disk.accounts.filter(a => a.name.startsWith('api-')).length + 1;
+      name = `api-${n}`;
+    }
+    disk.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+  });
   console.log(`Added API key account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 async function loginOAuthCommand({ pasteOnly = false } = {}) {
@@ -1024,7 +1095,13 @@ async function envCommand() {
     process.exit(1);
   }
   const port = config.proxy.port;
-  const useMitm = !args.slice(1).includes('--no-mitm');
+  let useMitm;
+  try {
+    useMitm = resolveClientMode(config, args.slice(1)) === 'mitm';
+  } catch (/** @type {any} */ err) {
+    process.stderr.write(`teamclaude env: ${err.message}\n`);
+    process.exit(1);
+  }
 
   let caPath = null;
   // The leaf has to name every host MITM will intercept, or the CONNECT for
@@ -1038,7 +1115,13 @@ async function envCommand() {
     lines = buildClaudeEnvLines({
       port, useMitm, caPath, holdSeconds: config.holdSeconds,
       account, proxyApiKey: config.proxy?.apiKey || '',
+      // The shell doing the eval keeps its own NO_PROXY entries; re-running is
+      // idempotent, since the merged value is what it will have next time.
+      inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
     });
+    // Base-URL mode takes the proxy back OUT of a shell an earlier MITM eval
+    // put it into; only this proxy's own loopback address is unset.
+    if (!useMitm) lines.push(...clearSelfProxyEnvLines(port));
   } catch (err) {
     // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
     process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
@@ -1056,7 +1139,9 @@ async function envCommand() {
       process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
     }
   }
-  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  // The flag that reproduces this mode whatever the config's default says.
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? ' --mitm' : ' --no-mitm'})"\n`);
+  process.stderr.write(`# default mode is ${config.defaultClientMode === 'base-url' ? 'base-URL' : 'MITM'} (config defaultClientMode; the TUI settings screen toggles it)\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
@@ -1073,12 +1158,18 @@ async function runCommand() {
   // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
   // before an optional `--` separator; everything after `--` goes verbatim to
   // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
-  // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
-  // --mitm is still accepted (now a no-op) for backward compatibility.
+  // endpoints are intercepted too; the config's `defaultClientMode` can make
+  // base-URL the default instead, and --mitm / --no-mitm decide per launch.
   const rest = args.slice(1);
   const sep = rest.indexOf('--');
   const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
-  const useMitm = !tcFlags.includes('--no-mitm');
+  let useMitm;
+  try {
+    useMitm = resolveClientMode(config, tcFlags) === 'mitm';
+  } catch (/** @type {any} */ err) {
+    console.error(`[TeamClaude] ${err.message}`);
+    process.exit(1);
+  }
   const autoFallback = tcFlags.includes('--auto-fallback');
   const claudeArgs = sep >= 0
     ? rest.slice(sep + 1)
@@ -1116,7 +1207,13 @@ async function runCommand() {
         : '';
       const proxyUrl = `http://${userinfo}127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
-      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
+      // Keep the operator's own NO_PROXY and add ours — see mergeNoProxy. Both
+      // spellings are read: a tool that set only one still meant it.
+      const inheritedNoProxy = [process.env.NO_PROXY, process.env.no_proxy];
+      env.NO_PROXY = env.no_proxy = mergeNoProxy(...inheritedNoProxy);
+      if (inheritedNoProxy.some(bypassesAllHosts)) {
+        console.error('[TeamClaude] NO_PROXY=* ignored: it would send api.anthropic.com around the proxy (no rotation). Use --no-mitm for a direct launch.');
+      }
       env.NODE_EXTRA_CA_CERTS = caPath;
       if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
       else if (pinnedBase) {
@@ -1168,7 +1265,7 @@ async function runCommand() {
   });
 
   if (result.error) {
-    if (result.error.code === 'ENOENT') {
+    if (/** @type {CodedError} */ (result.error).code === 'ENOENT') {
       console.error('Claude Code not found in PATH. Install it first.');
     } else {
       console.error(`Failed to start claude: ${result.error.message}`);
@@ -1185,6 +1282,20 @@ async function runCommand() {
 }
 
 // ── status ──────────────────────────────────────────────────
+
+// process.stdout.write is asynchronous when stdout is a pipe, so a write that
+// is followed by process.exit loses whatever has not reached the pipe yet: on
+// macOS a 15 KB status came out as its first 512 bytes through `| jq`. This
+// resolves once the bytes are handed off. A reader that quits early (`| head`)
+// raises EPIPE, which console.log swallows; the listener keeps that behaviour.
+function writeStdout(text) {
+  return new Promise(resolve => {
+    process.stdout.write(text, err => {
+      if (err) process.stdout.once('error', () => {});
+      resolve();
+    });
+  });
+}
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
@@ -1207,10 +1318,10 @@ async function statusCommand() {
     });
     const data = await res.json();
     if (json) {
-      console.log(JSON.stringify(data, null, 2));
+      await writeStdout(`${JSON.stringify(data, null, 2)}\n`);
       return;
     }
-    console.log(renderStatus(data, { color }));
+    await writeStdout(`${renderStatus(data, { color })}\n`);
   } catch (err) {
     if (err?.name === 'TimeoutError') {
       console.error(`Proxy at localhost:${config.proxy.port} did not answer status within ${timeoutMs}ms.`);
@@ -1266,6 +1377,30 @@ async function attachCommand() {
     session.am.applyStatus(first);
     session.start();
   });
+}
+
+// Open the browser dashboard against a running server. The page is served by
+// the proxy itself, so this is `attach` for the browser: it does not start a
+// server. A background daemon started from here would run with no log and no
+// supervisor, which is what `teamclaude service install` exists to avoid.
+async function dashboardCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+  const dashboardUrl = `http://${host}:${port}/teamclaude/dashboard`;
+  if (!(await isProxyUp(port))) {
+    console.error(`[TeamClaude] Proxy not running on port ${port}.`);
+    console.error('Start it with: teamclaude server   (or: teamclaude service install)');
+    process.exit(1);
+  }
+
+  console.log(`Dashboard: ${dashboardUrl}`);
+  const opener = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start'
+    : 'xdg-open';
+  const opened = spawnSync(opener, process.platform === 'win32' ? ['', dashboardUrl] : [dashboardUrl], { stdio: 'ignore', shell: process.platform === 'win32' });
+  if (opened.error || opened.status !== 0) console.error('Could not open a browser; open the URL above by hand.');
 }
 
 // ── switch ──────────────────────────────────────────────────
@@ -1630,18 +1765,9 @@ async function probeCommand() {
       console.error('Usage: teamclaude probe <off|seconds>');
       process.exit(1);
     }
-    if (seconds > 0 && seconds < 30) {
-      console.error('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
-      process.exit(1);
-    }
-    // Past the ceiling the interval would overflow into a 1 ms probe storm.
-    if (seconds > MAX_PROBE_SECONDS) {
-      console.error(`Maximum probe interval is ${MAX_PROBE_SECONDS}s (7 days).`);
-      process.exit(1);
-    }
   }
 
-  config.quotaProbeSeconds = seconds;
+  applyOrExit(() => setProbeSeconds(config, seconds));
   await saveConfig(config);
   console.log(seconds > 0
     ? `Quota probe set to every ${seconds}s (reads /api/oauth/usage; does not spend quota).`
@@ -1678,22 +1804,7 @@ async function warmupCommand() {
       console.error(`Usage: teamclaude warmup ${arg} HH:MM --timezone Area/City`);
       process.exit(1);
     }
-    const schedule = { resetTime, timezone };
-    try {
-      if (arg === 'rolling') {
-        config.warmupSchedule = createRollingWarmupSchedule(schedule);
-      } else {
-        const resolved = resolveWarmupSchedule(schedule);
-        config.warmupSchedule = {
-          resetTime: resolved.resetTime,
-          timezone: resolved.timezone,
-        };
-      }
-    } catch (err) {
-      console.error(err.message);
-      process.exit(1);
-    }
-    config.warmupSeconds = 0;
+    applyOrExit(() => setWarmupSchedule(config, arg, { resetTime, timezone }));
     await saveConfig(config);
     console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
     await notifyRunningServer(config);
@@ -1709,14 +1820,9 @@ async function warmupCommand() {
       console.error('Usage: teamclaude warmup <off|seconds>');
       process.exit(1);
     }
-    if (seconds > 0 && seconds < 60) {
-      console.error('Minimum keep-warm interval is 60s.');
-      process.exit(1);
-    }
   }
 
-  config.warmupSeconds = seconds;
-  delete config.warmupSchedule;
+  applyOrExit(() => setWarmupSeconds(config, seconds));
   await saveConfig(config);
   console.log(seconds > 0
     ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
@@ -1725,25 +1831,6 @@ async function warmupCommand() {
 }
 
 // ── threshold ───────────────────────────────────────────────
-
-/** The stored form of a percentage: a 0–1 ratio quantised to tenths of a
- *  percent, so a value set here reads back identically on the settings screen
- *  (tui.js quantises the same way). Returns null when the input is not a
- *  percentage this setting accepts. */
-function thresholdRatio(text) {
-  const pct = Number(text);
-  if (!Number.isFinite(pct) || pct < 1 || pct > 100) return null;
-  return Math.round(pct * 10) / 1000;
-}
-
-/** The threshold table as `{ default, ...buckets }`, whatever shape it is
- *  stored in — a bare number is the default with no bucket overrides. */
-function thresholdTable(value) {
-  if (value && typeof value === 'object') {
-    return { default: DEFAULT_SWITCH_THRESHOLD, ...value };
-  }
-  return { default: typeof value === 'number' ? value : DEFAULT_SWITCH_THRESHOLD };
-}
 
 function printThresholds(value) {
   const table = thresholdTable(value);
@@ -1779,51 +1866,33 @@ async function thresholdCommand() {
       console.error(THRESHOLD_USAGE);
       process.exit(1);
     }
-    const ratio = thresholdRatio(rest[0]);
-    if (ratio === null) {
+    if (thresholdRatio(rest[0]) === null) {
       console.error(THRESHOLD_USAGE);
       process.exit(1);
     }
-    const dropped = Object.keys(thresholdTable(config.switchThreshold)).filter(b => b !== 'default');
-    config.switchThreshold = ratio;
+    const { dropped } = applyOrExit(() => setThreshold(config, rest[0]));
     await saveConfig(config);
     if (dropped.length) {
       console.log(`Dropped the per-bucket thresholds (${dropped.join(', ')}) — one number governs every bucket.`);
     }
-    console.log(`Switch threshold set to ${formatPercent(ratio)}.`);
+    console.log(`Switch threshold set to ${formatPercent(config.switchThreshold)}.`);
     await notifyRunningServer(config);
     return;
   }
 
-  const table = thresholdTable(config.switchThreshold);
-  for (const pair of keyed) {
+  // `bucket=default` is the command's spelling of "drop this override".
+  const pairs = keyed.map(pair => {
     const at = pair.indexOf('=');
-    const bucket = pair.slice(0, at);
     const value = pair.slice(at + 1);
-    if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket)) {
-      console.error(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}`);
-      process.exit(1);
-    }
-    if (value === 'default') {
-      if (bucket === 'default') {
-        console.error('The default threshold is the fallback — set it to a number instead of dropping it.');
-        process.exit(1);
-      }
-      delete table[bucket];
-      continue;
-    }
-    const ratio = thresholdRatio(value);
-    if (ratio === null) {
-      console.error(THRESHOLD_USAGE);
-      process.exit(1);
-    }
-    table[bucket] = ratio;
+    return /** @type {[string, unknown]} */ ([pair.slice(0, at), value === 'default' ? null : value]);
+  });
+  // A value that is not a percentage gets the usage text, as it always has;
+  // what a bucket may be called is the shared rule's to say.
+  if (pairs.some(([, value]) => value !== null && thresholdRatio(value) === null)) {
+    console.error(THRESHOLD_USAGE);
+    process.exit(1);
   }
-
-  // Back to the plain form once the last override is gone: an object holding
-  // only `default` is the same setting written the long way.
-  const overrides = Object.keys(table).filter(b => b !== 'default');
-  config.switchThreshold = overrides.length ? table : table.default;
+  applyOrExit(() => setBucketThresholds(config, pairs));
   await saveConfig(config);
   printThresholds(config.switchThreshold);
   await notifyRunningServer(config);
@@ -1861,10 +1930,7 @@ async function distributeCommand() {
   // An unchanged setting is not rewritten — the config file is a
   // read-modify-write shared with the running server — but the server is still
   // notified, so a config that already says `on` can be made to take effect.
-  if (next !== current) {
-    config.distributeSessions = DISTRIBUTE_MODES[next].value;
-    await saveConfig(config);
-  }
+  if (setDistribution(config, next)) await saveConfig(config);
   console.log(DISTRIBUTE_MODES[next].said);
   await notifyRunningServer(config);
 }
@@ -1875,7 +1941,7 @@ async function updateCommand() {
   const cur = currentVersion();
   console.log(`Current version: ${cur || 'unknown'}`);
 
-  const kind = installKind();
+  const kind = await installKind();
   if (kind === 'git') {
     console.log('This is a git checkout — update it with `git pull`, not npm.');
     return;
@@ -1893,7 +1959,7 @@ async function updateCommand() {
   }
 
   console.log(`Updating ${info.current} → ${info.latest} …`);
-  const ok = runUpdate(info.latest);
+  const ok = await runUpdate(info.latest);
   if (ok) {
     console.log(`Updated to ${info.latest}. Restart teamclaude to use the new version.`);
   } else {
@@ -1980,24 +2046,9 @@ async function routeCommand() {
       console.error(ROUTE_USAGE);
       process.exit(1);
     }
-    if (color && !ROUTE_COLORS.includes(color.toLowerCase())) {
-      console.error(`Unknown color "${color}" — expected one of: ${ROUTE_COLORS.join(', ')}`);
-      process.exit(1);
-    }
-    const known = new Set(config.accounts.map(a => a.name));
-    for (const a of accounts) {
-      if (!known.has(a) && !/^\d+$/.test(a)) console.error(`Warning: no account named "${a}" (yet)`);
-    }
-    const at = config.routes.findIndex(r => r.name === name);
-    // Spread the row as loaded: `add` on an existing name is an edit, and
-    // rebuilding the route from the flags alone silently dropped everything the
-    // flags cannot express — an `override` above all.
-    const route = { ...(at >= 0 ? config.routes[at] : {}), name, match };
-    if (accounts.length) route.accounts = accounts; else delete route.accounts;
-    if (bucket) route.bucket = bucket; else delete route.bucket;
-    if (color) route.color = color.toLowerCase(); else delete route.color;
-    if (at >= 0) { config.routes[at] = route; console.log(`Updated route "${name}"`); }
-    else { config.routes.push(route); console.log(`Added route "${name}"`); }
+    const { route, updated, unknownAccounts } = applyOrExit(() => upsertRoute(config, { name, match, accounts, bucket, color }));
+    for (const a of unknownAccounts) console.error(`Warning: no account named "${a}" (yet)`);
+    console.log(`${updated ? 'Updated' : 'Added'} route "${route.name}"`);
     await saveConfig(config);
     await notifyRunningServer(config);
     return;
@@ -2005,9 +2056,7 @@ async function routeCommand() {
 
   if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
     const name = args[2];
-    const before = config.routes.length;
-    config.routes = config.routes.filter(r => r.name !== name);
-    if (config.routes.length === before) { console.error(`Route "${name}" not found`); process.exit(1); }
+    applyOrExit(() => removeRoute(config, name));
     await saveConfig(config);
     await notifyRunningServer(config);
     console.log(`Removed route "${name}"`);
@@ -2100,10 +2149,12 @@ Commands:
   login               OAuth login via browser
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --api         Add an API key account
-  env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
-                      'eval "$(teamclaude env)"' (MITM forward-proxy by default;
-                      --no-mitm for base-URL only). Handy for agent multiplexers
-                      that spawn claude themselves instead of via 'teamclaude run'
+  env [--mitm|--no-mitm]
+                      Print export lines to point Claude Code at the proxy, for
+                      'eval "$(teamclaude env)"'. MITM forward-proxy unless the
+                      config's defaultClientMode is "base-url"; a flag decides
+                      per call. Handy for agent multiplexers that spawn claude
+                      themselves instead of via 'teamclaude run'
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
@@ -2121,6 +2172,7 @@ Commands:
                       Use --color=always|never to control ANSI colors
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
+  dashboard           Open the web dashboard of a running server in the browser
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
@@ -2184,6 +2236,16 @@ A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
 POST /teamclaude/switch {"account": "<name>"} makes one account the preferred
 one, which is what 'teamclaude switch' calls.
+
+MCP endpoint (off by default). With "proxy": { "mcp": "read" } the server
+serves its status, quota and settings as MCP tools at /teamclaude/mcp; "full"
+adds the tools that change them (switch, enable/disable, priority, remove,
+threshold, distribute, probe, warmup, routes, blocked models, client mode).
+Connect Claude Code with:
+  claude mcp add --transport http teamclaude http://localhost:3456/teamclaude/mcp
+Same gates as the other /teamclaude/ routes. A named client key is served
+read-only even in "full" mode: the write tools answer to the shared proxy key
+and to local callers. With no proxy key configured, only local callers are served.
 
 Upstream proxy. On a host with no direct route to the internet, set
 "upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
@@ -2370,6 +2432,22 @@ function argValue(flag) {
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
 }
 
+/**
+ * Apply a settings change, exiting with its message when the change is refused.
+ * @template T
+ * @param {() => T} change
+ * @returns {T}
+ */
+function applyOrExit(change) {
+  try {
+    return change();
+  } catch (err) {
+    if (!(err instanceof ConfigOpError)) throw err;
+    console.error(err.message);
+    process.exit(1);
+  }
+}
+
 // Keep the terminal title in sync with the active account (e.g. "teamclaude 2/4
 // work") so a backgrounded or tabbed `teamclaude server` is glanceable. TTY-only
 // — never emit escapes into a pipe, a `--log-to` redirect, or a systemd journal;
@@ -2409,7 +2487,8 @@ function startTerminalTitleUpdater(accountManager) {
 // CLI changes take effect without a restart. A closed local port refuses the
 // connection immediately, so this is a no-op (and near-instant) when nothing is
 // running. Reload picks up new accounts, credential, priority, and enable/disable
-// changes; account removals still need a restart.
+// changes, plus eventLogging and blockedModels edits; account removals still
+// need a restart.
 async function notifyRunningServer(config) {
   const port = config?.proxy?.port;
   if (!port) return;
