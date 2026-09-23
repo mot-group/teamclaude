@@ -2,6 +2,8 @@
 
 This page tracks additions and fixes maintained in [mot-group/teamclaude](https://github.com/mot-group/teamclaude), based on [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude). The upstream npm package retains its original name and publisher. Its version number does not identify which MOT changes are installed. Use the reviewed Git commit to identify a fork deployment.
 
+This fork is synced to upstream 1.1.21 through the merge of `upstream/master` at `3d5bb6f`. The `.github/workflows/docker.yml` job is gated off on this fork.
+
 ## Merged features and fixes
 
 | Change | Behavior | Reference |
@@ -23,7 +25,7 @@ A desktop login can retain access to a remote target while the target routes mod
 
 ## Deployment boundaries and known limits
 
-The features above are merged into this fork. Additional account-listing, account-resolver, and API-command provider guards exist in the maintained Linux installation as reviewed local overlays. Those extra guards are not all merged into this repository. A fresh checkout must not be described as containing them, and a full reinstall must not replace a guarded installation without reviewing and preserving its overlays.
+The CLI account listing in `src/account-list.js` and the `teamclaude api` provider boundary are in this repository. The account resolver and quota prober use the provider guards supplied by upstream.
 
 The fork does not publish a separate npm package. For fork deployments, disable npm self-updates with `"autoUpdate": false` or `TEAMCLAUDE_DISABLE_AUTOUPDATE=1`, and deploy reviewed source commits. The explicit `teamclaude update` command still targets the upstream npm package. Do not use it to update a guarded fork deployment.
 

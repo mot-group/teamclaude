@@ -5,8 +5,9 @@
 // /teamclaude/status (same origin) with the proxy key and re-renders every few
 // seconds. That split is what lets the asset be served without the key (a
 // browser address bar cannot send x-api-key) while every byte of actual status
-// stays behind the existing gate. The key is asked for once and kept in
-// localStorage; a 401 (wrong or rotated key) brings the prompt back.
+// stays behind the existing gate. The key is asked for only when the server
+// refuses the page without one (401/403; loopback browsers are exempt), and is
+// kept in localStorage; a later refusal (wrong or rotated key) asks again.
 //
 // Self-contained on purpose: no external scripts, styles, or fonts, so the
 // page works on air-gapped deployments and adds no third-party surface. All
@@ -14,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
 
 export function renderDashboardHtml({ sessionAuth = false } = {}) {
   return PAGE.replace("var SESSION_AUTH = false;", `var SESSION_AUTH = ${sessionAuth};`);
@@ -82,17 +83,153 @@ export function accountTokens(usage) {
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
 }
 
-// One row per session, from `sessions.items` (proxy.sessionDetail). The token
-// columns are #192's numbers — what each response actually reported, cache
-// included — summed across the weekly buckets the session touched. `pins` is a
-// bucket→account map rather than one index, because a session spending two
-// model families is served by two accounts at the same time.
+/** @param {string|null|undefined} provider */
+export function providerLabel(provider) {
+  if (provider === 'codex') return 'Codex';
+  if (provider === 'anthropic') return 'Claude';
+  return provider || 'Unknown';
+}
+
+// Every bucket switchThreshold can be keyed by, plus the short names the
+// threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
+// and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
+// imported, because the browser never runs an import. It does not see this
+// module's scope either: a helper reaches the page as its own source text, so
+// these two are written into the page by SHARED_CONSTS below. Without that the
+// first table-form override throws a ReferenceError inside render() and takes
+// the accounts pane with it.
+export var THRESHOLD_BUCKET_KEYS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+/** @type {Object<string, string>} */
+export var THRESHOLD_BUCKET_LABELS = {
+  unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
+  tokens: 'tokens', requests: 'requests',
+};
+
+/**
+ * "switch at 100%" / "switch 7d 90%, fable 80%" — an account's OWN
+ * switchThreshold (issue #409), or '' when it has none or every override it
+ * carries merely repeats what the fleet already resolves to. `fleetThreshold`
+ * and `fleetThresholds` are the status payload's own top-level fields
+ * (`status.switchThreshold` / `status.switchThresholds`), so the comparison
+ * uses the exact fleet value the live server is gating on.
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {string}
+ */
+export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresholds) {
+  /** @param {string} bucket */
+  function fleetFor(bucket) {
+    if (fleetThresholds && typeof fleetThresholds === 'object') {
+      var v = fleetThresholds[bucket];
+      if (v == null) v = fleetThresholds.default;
+      if (typeof v === 'number' && isFinite(v)) return v;
+    }
+    return typeof fleetThreshold === 'number' && isFinite(fleetThreshold) ? fleetThreshold : 0.98;
+  }
+  /** @param {number} v */
+  function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  /** @param {unknown} v */
+  function valid(v) { return typeof v === 'number' && isFinite(v); }
+  /** @type {string[]} */
+  var parts = [];
+  /** @type {Object<string, any>} */
+  var table = {};
+  /** @type {any} */
+  var ownDefault = null;
+  if (typeof accountThreshold === 'number') {
+    if (!valid(accountThreshold)) return '';
+    ownDefault = accountThreshold;
+    if (accountThreshold !== fleetFor('default')) parts.push('at ' + pct(accountThreshold));
+  } else if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    table = accountThreshold;
+    ownDefault = table.default;
+    Object.keys(table).forEach(function (key) {
+      var v = table[key];
+      if (!valid(v)) return;
+      if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
+      if (v !== fleetFor(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
+    });
+  }
+  // As switchThresholdDiffs in model.js: the account's own default outranks a
+  // bucket entry in the FLEET table, so a default equal to the fleet's can
+  // still move a bucket the fleet names (fleet 7d at 85%, account 0.98 puts
+  // that account's 7d at 98%). When the defaults differ, "at N%" already
+  // covers every bucket the account does not list.
+  if (valid(ownDefault) && ownDefault === fleetFor('default')) {
+    THRESHOLD_BUCKET_KEYS.forEach(function (key) {
+      if (valid(table[key])) return;
+      if (ownDefault !== fleetFor(key)) parts.push(THRESHOLD_BUCKET_LABELS[key] + ' ' + pct(ownDefault));
+    });
+  }
+  return parts.length ? 'switch ' + parts.join(', ') : '';
+}
+
+/**
+ * `now` keeps the fourth slot master's reset-credit callers already use; the
+ * fleet threshold pair (#409) follows it.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {string|null} [current]
+ * @param {Record<string, string>|null} [currentAccounts]
+ * @param {number|null} [now]  ms epoch a reset-credit reading's age is measured from
+ * @param {number|null|undefined} [fleetThreshold]
+ * @param {Object<string, number>|null|undefined} [fleetThresholds]
+ */
+export function accountBadges(account, current, currentAccounts, now, fleetThreshold, fleetThresholds) {
+  var a = account || {};
+  var isCurrent = currentAccounts
+    ? currentAccounts[a.provider] === a.name
+    : a.name === current;
+  var status = a.disabled ? 'disabled' : (a.status || 'unknown');
+  var recent = Number.isFinite(a.sessions) ? a.sessions : 0;
+  var known = Number.isFinite(a.knownSessions) ? a.knownSessions : 0;
+  var badges = [
+    { cls: 'provider ' + (a.provider || 'unknown'), text: providerLabel(a.provider) },
+    { cls: 'meta', text: a.type || 'unknown' },
+    { cls: 'meta priority', text: 'prio ' + (a.priority || 0) },
+  ];
+  if (isCurrent) badges.push({ cls: 'current', text: 'current' });
+  badges.push({ cls: status, text: status });
+  if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
+  if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
+  // Free Codex rate-limit reset credits this account holds — what it could
+  // spend to undo an exhausted window rather than wait one out. The count is
+  // the account's holdings, not what upstream would apply this instant.
+  // A reading past RESET_CREDIT_MAX_AGE_MS is dropped, as it is on the status
+  // screen and the TUI row: only the usage probe refreshes the count, so an old
+  // one may describe a credit that has since been redeemed or has expired.
+  var reading = (a.quota || {}).resetCredits || {};
+  var credits = reading.available;
+  var stale = Number.isFinite(reading.seenAt) && (now == null ? Date.now() : now) - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
+  if (Number.isFinite(credits) && credits > 0 && !stale) {
+    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') });
+  }
+  // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
+  // no account switchThreshold at all — the common case — thresholdBadgeText
+  // returns '' regardless of what the fleet args are, so an old caller sees no
+  // new badge. A caller that DOES set switchThreshold on the account is
+  // expected to pass the fleet's own value too, the way `render()` does below,
+  // or the comparison falls back to thresholdBadgeText's own 0.98 default.
+  var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
+  if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
+  return badges;
+}
+
+// One row per conversation, from `sessions.items` (proxy.sessionDetail). A
+// Claude Code session that fans out to nine subagents is nine rows, because a
+// conversation is what holds a pin and a prompt cache. The visible identity
+// keeps the session name and a short conversation digest in separate fields.
+// Token columns sum what responses reported across every weekly bucket.
 export function sessionRows(sessions) {
   var items = (sessions && sessions.items) || [];
   return items.map(function (s) {
     var buckets = s.tokens || {};
     var row = {
       id: s.id,
+      session: s.session || s.id || '',
+      // Enough of the digest to separate one session's live conversations; the
+      // whole of it is a column read to the end by nobody.
+      conversation: String(s.conversation || '').slice(0, 8),
       client: s.client || '',
       project: (s.dimensions || {}).project || '',
       active: !!s.active,
@@ -166,9 +303,9 @@ export function switchOutcome(res) {
   return { kind: 'ok', text: 'Starting account recorded: ' + res.account + '. Normal routing still applies.' };
 }
 
-// One row per route the server reports — each model family the fleet meters
-// separately, autocreated or configured — plus a trailing row for everything
-// else, which goes to the current account. `target` is the server's own answer
+// One row per route the server reports, each model family the fleet meters
+// separately, autocreated or configured, plus a trailing default row for each
+// provider. Older payloads keep one "Everything else" row. `target` is the server's own answer
 // to "where does a request for this family land right now", so the page does
 // not re-derive routing from quota bars; the eligible split says why a family
 // is where it is.
@@ -191,8 +328,9 @@ export function routingCards(status) {
 
 export function routeRows(status) {
   var s = status || {};
+  var rows;
   if (Array.isArray(s.providerRouting)) {
-    return (s.routes || []).flatMap(function (route) {
+    rows = (s.routes || []).flatMap(function (route) {
       // `members` is the route's resolved membership: index references already
       // resolved to names, and an unrestricted route resolved to every account,
       // which is the list the endpoint compares against. A preview's accounts
@@ -203,7 +341,7 @@ export function routeRows(status) {
         : (((route.previews || [])[0] || {}).accounts || route.accounts || []);
       return (route.previews || []).map(function (preview) {
         var accounts = preview.accounts || [];
-        return { kind: 'route', name: route.name,
+        return { kind: 'route', name: route.name, provider: preview.provider,
           label: (preview.provider === 'codex' ? 'Codex' : 'Claude') + ' / ' + route.name,
           match: preview.label, sampleModel: preview.model,
           target: preview.target || null, pinned: preview.pinned || null,
@@ -217,50 +355,64 @@ export function routeRows(status) {
           ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }) };
       });
     });
+  } else {
+    var blockedModels = s.blockedModels || [];
+    rows = (s.routes || []).map(function (r) {
+      var accounts = r.accounts || [];
+      var name = r.name || '';
+      var match = r.match || [];
+      var target = r.target || null;
+      var pinned = r.pinned || null;
+      return {
+        kind: 'route',
+        name: name,
+        provider: r.provider || 'anthropic',
+        label: name.charAt(0).toUpperCase() + name.slice(1),
+        match: match.join(', '),
+        target: target,
+        pinned: pinned,
+        // A pin the server is not honouring (its account cannot serve the
+        // family right now): routing went elsewhere, and the row must say so
+        // rather than let "pinned" read as "this is the pin".
+        pinMismatch: !!pinned && pinned !== target,
+        // The blocklist answers 400 before selection, so a route whose every
+        // glob is blocked has a target no request will reach. A literal glob
+        // comparison covers the common case; the server's overlap logic is not
+        // shipped to the page.
+        blocked: match.length > 0 && match.every(function (g) { return blockedModels.indexOf(g) !== -1; }),
+        autocreated: !!r.autocreated,
+        id: r.id || null, override: r.override || null, persisted: r.persisted || null,
+        globs: match,
+        members: (Array.isArray(r.members) ? r.members : accounts).map(function (a) { return typeof a === 'string' ? a : (a || {}).name; }),
+        accounts: accounts.map(function (a) { return typeof a === 'string' ? a : (a || {}).name; }),
+        eligible: accounts.filter(function (a) { return a.eligible; }).map(function (a) { return a.name; }),
+        ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }),
+      };
+    });
   }
-  var blockedModels = s.blockedModels || [];
-  var rows = (s.routes || []).map(function (r) {
-    var accounts = r.accounts || [];
-    var name = r.name || '';
-    var match = r.match || [];
-    var target = r.target || null;
-    var pinned = r.pinned || null;
-    return {
-      kind: 'route',
-      name: name,
-      label: name.charAt(0).toUpperCase() + name.slice(1),
-      match: match.join(', '),
-      target: target,
-      pinned: pinned,
-      // A pin the server is not honouring (its account cannot serve the
-      // family right now): routing went elsewhere, and the row must say so
-      // rather than let "pinned" read as "this is the pin".
-      pinMismatch: !!pinned && pinned !== target,
-      // The blocklist answers 400 before selection, so a route whose every
-      // glob is blocked has a target no request will reach. A literal glob
-      // comparison covers the common case; the server's overlap logic is not
-      // shipped to the page.
-      blocked: match.length > 0 && match.every(function (g) { return blockedModels.indexOf(g) !== -1; }),
-      autocreated: !!r.autocreated,
-      id: r.id || null, override: r.override || null, persisted: r.persisted || null,
-      globs: match,
-      members: (Array.isArray(r.members) ? r.members : accounts).map(function (a) { return typeof a === 'string' ? a : (a || {}).name; }),
-      accounts: accounts.map(function (a) { return typeof a === 'string' ? a : (a || {}).name; }),
-      eligible: accounts.filter(function (a) { return a.eligible; }).map(function (a) { return a.name; }),
-      ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }),
-    };
-  });
   if (rows.length) {
-    // The default row is the server's answer too (`defaultTarget`), not an
-    // assumption that unrouted traffic lands on the current account: a
-    // blocked or outranked current account is skipped by the next request.
-    var current = s.currentAccount || null;
-    var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
-    rows.push({
-      kind: 'default', name: '', label: 'Everything else', match: '',
-      target: s.defaultTarget || current, current: current,
-      currentUnavailable: (cur && cur.unavailable) || null,
-      pinned: null, pinMismatch: false, blocked: false, autocreated: false, eligible: [], ineligible: [],
+    // The server reports one default per provider. A mixed Claude/Codex fleet
+    // has two independent cursors, so collapsing these into one global row is
+    // the exact ambiguity this table exists to remove. Older servers retain
+    // the original single-row fallback.
+    var defaults = s.defaultTargets || null;
+    var providers = defaults ? Object.keys(defaults).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    if (!providers.length) providers = [rows[0].provider || 'anthropic'];
+    providers.forEach(function (provider) {
+      var current = (s.currentAccounts && s.currentAccounts[provider]) || s.currentAccount || null;
+      var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
+      rows.push({
+        kind: 'default', name: '',
+        label: defaults ? providerLabel(provider) + ' default' : 'Everything else',
+        provider: provider, match: '',
+        target: defaults ? defaults[provider] : (s.defaultTarget || current), current: current,
+        currentUnavailable: (cur && cur.unavailable) || null,
+        pinned: null, pinMismatch: false, blocked: false, autocreated: false, eligible: [], ineligible: [],
+      });
     });
   }
   return rows;
@@ -370,9 +522,10 @@ export function overrideOutcome(res) {
 // delay a true positive.
 export var STARVED_MIN = 5;
 // The failure that makes this fire is usually fleet-wide, so every active
-// session starves at once. Naming all of them would bury the dashboard at the
-// moment it matters most; the count carries the scale, three names carry enough
-// to go and ask someone.
+// conversation starves at once — and one fan-out is a dozen of them under one
+// session's name. Naming all of them would bury the dashboard at the moment it
+// matters most; the count carries the scale, three names carry enough to go and
+// ask someone.
 export var STARVED_LIST_MAX = 3;
 
 /**
@@ -406,7 +559,12 @@ export function problems(status) {
   named.slice(0, STARVED_LIST_MAX).forEach(function (r) {
     out.push({
       severity: 'bad', kind: 'starved-session',
-      text: (r.client ? r.client + "'s session " : 'Session ') + String(r.id || '').slice(0, 8)
+      // The session first, since that is the name an operator can go and find,
+      // and the conversation after it, because a streak belongs to one agent of
+      // a fan-out: without it three lines of one session read as the same line
+      // three times. Omitted when the record carries no conversation.
+      text: (r.client ? r.client + "'s session " : 'Session ') + r.session.slice(0, 8)
+        + (r.conversation ? ', conversation ' + r.conversation + ',' : '')
         + ' has had ' + r.starved + ' requests in a row come back with nothing'
         + (r.project ? ' (' + r.project + ')' : '') + why,
     });
@@ -414,13 +572,15 @@ export function problems(status) {
   if (named.length > STARVED_LIST_MAX) {
     out.push({
       severity: 'bad', kind: 'starved-more',
-      text: 'and ' + (named.length - STARVED_LIST_MAX) + ' more sessions are getting nothing back.',
+      text: 'and ' + (named.length - STARVED_LIST_MAX) + ' more conversations are getting nothing back.',
     });
   }
   if (!named.length && (sessions.starvedMax || 0) >= STARVED_MIN) {
     out.push({
       severity: 'bad', kind: 'starved-session',
-      text: 'A session has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
+      // A conversation, not a session: the streak is counted per conversation,
+      // and a session whose other agents are answering fine is not starving.
+      text: 'A conversation has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
         + ' Turn on proxy.sessionDetail to see which.',
     });
   }
@@ -497,14 +657,22 @@ export function sessionActivityText(sessions) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
-// The threshold rides along: `problems` closes over it, so a page without it
-// would ReferenceError on first render.
-const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};`;
+// The constants ride along: `problems` closes over the thresholds and
+// `accountBadges` over the reset-credit cut-off, so a page without them would
+// ReferenceError on first render. The same goes for the two tables
+// `thresholdBadgeText` reads.
+const SHARED_CONSTS = [
+  `var STARVED_MIN = ${STARVED_MIN};`,
+  `var STARVED_LIST_MAX = ${STARVED_LIST_MAX};`,
+  `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
+  `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
+  `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
+].join('\n');
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -541,9 +709,11 @@ const PAGE = `<!doctype html>
   .main-content { padding:32px 38px; max-width:1560px; width:100%; margin:0 auto; min-width:0; }
   .topline,.section-head { display:flex; align-items:center; justify-content:space-between; gap:18px; }
   .topline { margin-bottom:28px; }
+  .topline>div:first-child { min-width:0; flex:1 1 auto; }
   .eyebrow { color:var(--dim); font-size:11px; letter-spacing:1.4px; text-transform:uppercase; margin-bottom:8px; }
   .sub,.routing-help { color:var(--dim); font-size:13px; margin-top:8px; }
   .toolbar,.account-tools { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .toolbar { flex:0 0 auto; }
   .live { color:var(--dim); font-size:12px; }
   .route-panel { background:var(--panel); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
   .route-panel .section-head { padding:17px 20px; margin:0; border-bottom:1px solid var(--line); }
@@ -581,7 +751,12 @@ const PAGE = `<!doctype html>
   #resetAccounts .card p.usage { margin-top:6px; line-height:1.5; }
   .account-name { font-size:13px; font-weight:600; display:block; overflow-wrap:anywhere; margin-bottom:7px; }
   .account-meta { color:var(--dim); font-size:11px; margin-top:6px; }
+  .badges { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
   .badge { display:inline-block; font-size:11px; border-radius:5px; border:1px solid var(--line); padding:3px 7px; color:var(--dim); }
+  .badge.provider { color:var(--text); }
+  .badge.provider.codex { color:var(--accent); border-color:var(--accent); }
+  .badge.meta { color:var(--dim); }
+  .badge.current { color:var(--accent); border-color:var(--accent); }
   .badge.active { color:var(--ok); background:#192c24; border-color:#2e4c3c; }
   .badge.throttled,.badge.exhausted { color:var(--warn); background:#30271e; border-color:#51412b; }
   .badge.error { color:var(--bad); border-color:#68423f; }
@@ -684,11 +859,11 @@ const PAGE = `<!doctype html>
     <nav aria-label="Dashboard sections"><a href="#overview" data-view="overview" aria-current="page">Overview</a><a href="#accounts" data-view="accounts">Accounts</a><a href="#activity" data-view="activity">Activity</a><a href="#routing" data-view="routing">Routing</a><a href="#resets" data-view="resets">Resets</a><a href="#forecast" data-view="forecast">Forecast</a><a href="#diagnostics" data-view="diagnostics">Diagnostics</a></nav>
   </aside>
   <main id="mainContent" class="main-content">
-    <header class="topline"><div><div class="eyebrow" id="breadcrumb">Dashboard / Overview</div><h1 id="pageTitle">Routing & capacity</h1><p class="sub" id="summary">Where requests are expected to go. How much quota each account has used.</p></div><div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="logout">Sign out</button></div></header>
+    <header class="topline"><div><div class="eyebrow" id="breadcrumb">Dashboard / Overview</div><h1 id="pageTitle">Routing & capacity</h1><p class="sub" id="summary">Where requests are expected to go. How much quota each account has used.</p></div><div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="reload" type="button">Reload config</button><button id="probe" type="button">Probe quotas</button><button id="logout">Sign out</button></div></header>
     <div id="err" role="alert"></div><div id="problems" role="status"></div><div id="note" role="status"></div>
     <section aria-labelledby="modelRoutingTitle" id="modelRouting" class="route-panel" data-section="overview routing">
       <div class="section-head"><div><h2 id="modelRoutingTitle">Expected routing</h2><p class="sub">Representative models, based on the latest router status</p></div><button id="manualSelection">Manual selection</button></div>
-      <div class="provider-routing" id="providerRouting"></div><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
+      <div class="provider-routing" id="providerRouting"></div><p class="routing-help" id="currentAccounts" role="status" hidden></p><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
     </section>
     <section id="accountSection" data-section="overview accounts">
       <div class="section-head"><div><h2>Account capacity <span class="tag" id="accountCount"></span></h2><p class="sub" id="quotaHelp">Bars and percentages show quota spent.</p></div><div class="account-tools"><div class="quota-toggle" role="group" aria-label="Quota display"><button id="quotaSpent" aria-pressed="true">Spent</button><button id="quotaLeft" aria-pressed="false">Left</button></div><input class="search" id="accountSearch" type="search" aria-label="Find an account" placeholder="Find an account"></div></div>
@@ -841,6 +1016,21 @@ ${SHARED_HELPERS}
     return a.provider === 'anthropic' ? 'Claude' : a.provider === 'codex' ? 'Codex' : a.provider || 'Other';
   }
 
+  function accountBadgeRow(a, s) {
+    var row = el('div', 'badges');
+    row.appendChild(accountBadge(a));
+    var showProvider = uniqSorted((s.accounts || []).map(providerName)).length > 1;
+    var badges = accountBadges(a, s.currentAccount, s.currentAccounts || null, null, s.switchThreshold, s.switchThresholds);
+    ['current', 'provider', 'meta threshold'].forEach(function (kind) {
+      var badge = badges.filter(function (item) {
+        if (kind === 'provider') return showProvider && item.cls.indexOf('provider ') === 0;
+        return item.cls === kind;
+      })[0];
+      if (badge) row.appendChild(el('span', 'badge ' + badge.cls, badge.text));
+    });
+    return row;
+  }
+
   function renderAccounts(s) {
     var wrap = document.getElementById('accounts'); wrap.textContent = '';
     var query = document.getElementById('accountSearch').value.toLowerCase();
@@ -863,7 +1053,7 @@ ${SHARED_HELPERS}
       var group = el('tr', 'provider-heading'); var title = el('th', '', provider + ' / ' + members.length + ' accounts'); title.colSpan = 5; title.scope = 'rowgroup'; group.appendChild(title); body.appendChild(group);
       members.forEach(function (a) {
         var tr = el('tr', 'account-row');
-        var identity = el('td'); identity.appendChild(el('span', 'account-name', a.name)); identity.appendChild(accountBadge(a));
+        var identity = el('td'); identity.appendChild(el('span', 'account-name', a.name)); identity.appendChild(accountBadgeRow(a, s));
         identity.appendChild(el('div', 'account-meta', a.type === 'oauth' ? 'Subscription' : a.type === 'api_key' ? 'API account' : a.type));
         var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0];
         identity.appendChild(el('div', 'account-meta', probe && probe.lastProbedAt ? 'Last probe ' + fmtAgo(probe.lastProbedAt) + (probe.error ? ' · Failed' : '') : 'Quota reading time not reported'));
@@ -887,7 +1077,7 @@ ${SHARED_HELPERS}
     document.getElementById('accountManual').disabled = !connected || !a;
     if (!a) { wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
     document.getElementById('accountDialogTitle').textContent = a.name;
-    wrap.appendChild(accountBadge(a));
+    wrap.appendChild(accountBadgeRow(a, lastStatus || {}));
     if (!connected) { var warning = el('p', 'warnt', 'Connection lost. These quota values may be stale.'); warning.setAttribute('role', 'status'); wrap.appendChild(warning); }
     wrap.appendChild(el('p', 'usage', providerName(a) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
     var groups = accountQuotaGroups(a);
@@ -922,7 +1112,7 @@ ${SHARED_HELPERS}
     var table = document.getElementById('clients');
     table.textContent = '';
     var hr = el('tr');
-    ['Client', 'Requests', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
+    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
       hr.appendChild(el('th', i ? 'num' : '', h));
     });
     table.appendChild(hr);
@@ -931,6 +1121,7 @@ ${SHARED_HELPERS}
       var tr = el('tr');
       tr.appendChild(el('td', '', n));
       tr.appendChild(el('td', 'num', fmtNum(c.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(c.connections || 0)));
       tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
       tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
       tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
@@ -955,8 +1146,13 @@ ${SHARED_HELPERS}
     tr.appendChild(th);
   }
 
+  // Session and conversation are two columns rather than one composite: sorting
+  // by Session brings a fan-out's rows together (the sort is stable, so they
+  // stay in recency order inside it) and Conv is the only column that differs
+  // between them. Narrow on purpose — it is a digest, not a name.
   var SESSION_COLUMNS = [
-    { key: 'id', label: 'Session' },
+    { key: 'session', label: 'Session' },
+    { key: 'conversation', label: 'Conv' },
     { key: 'client', label: 'Client' },
     { key: 'project', label: 'Project' },
     { key: 'accounts', label: 'Accounts' },
@@ -986,7 +1182,10 @@ ${SHARED_HELPERS}
     sessionFilters.client = clientSel.value;
 
     var rows = sortRows(filterSessionRows(all, sessionFilters), sortState.sessions.key, sortState.sessions.dir);
-    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' sessions';
+    // Conversations, not sessions: one client session contributes a row per
+    // agent it has in flight, and counting rows as sessions would report a
+    // fleet carrying several times the clients it has.
+    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' conversations';
 
     var table = document.getElementById('sessions');
     table.textContent = '';
@@ -996,7 +1195,8 @@ ${SHARED_HELPERS}
     if (!rows.length) { var empty = el('tr'); var cell = el('td', '', 'No sessions match these filters.'); cell.colSpan = SESSION_COLUMNS.length; empty.appendChild(cell); table.appendChild(empty); }
     rows.forEach(function (r) {
       var tr = el('tr');
-      tr.appendChild(el('td', r.active ? '' : 'dim', r.id));
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.session));
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.conversation || '—'));
       tr.appendChild(el('td', '', r.client || '—'));
       tr.appendChild(el('td', '', r.project || '—'));
       tr.appendChild(el('td', '', r.accounts || '—'));
@@ -1118,6 +1318,7 @@ ${SHARED_HELPERS}
           ? ' · current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
           : ' · outranks the current account ' + r.current));
       }
+      if (r.provider) to.appendChild(el('span', 'tag', ' · ' + providerLabel(r.provider)));
       tr.appendChild(to);
       var can = el('td', r.kind === 'default' ? 'dim' : '');
       if (r.kind === 'default') can.textContent = 'no route of its own';
@@ -1195,16 +1396,37 @@ ${SHARED_HELPERS}
   function renderProviderRouting(s) {
     var wrap = document.getElementById('providerRouting'); wrap.textContent = '';
     var cards = routingCards(s);
-    if (!cards.length) { wrap.appendChild(el('p', 'empty', 'Provider routing is unavailable on this proxy.')); return; }
-    cards.forEach(function (provider) {
-      provider.groups.forEach(function (group) {
-        var card = el('div', 'provider-card'); card.setAttribute('data-provider', provider.provider);
-        card.appendChild(el('h3', '', provider.label + ' · ' + group.labels.join(', ')));
-        card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), group.target || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
-        var models = el('div', 'provider-models', group.models.join(', ')); models.title = 'Representative models'; card.appendChild(models);
-        wrap.appendChild(card);
+    if (!cards.length) wrap.appendChild(el('p', 'empty', 'Provider routing is unavailable on this proxy.'));
+    else {
+      cards.forEach(function (provider) {
+        provider.groups.forEach(function (group) {
+          var card = el('div', 'provider-card'); card.setAttribute('data-provider', provider.provider);
+          card.appendChild(el('h3', '', provider.label + ' · ' + group.labels.join(', ')));
+          card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), group.target || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
+          var models = el('div', 'provider-models', group.models.join(', ')); models.title = 'Representative models'; card.appendChild(models);
+          wrap.appendChild(card);
+        });
       });
-    });
+    }
+    var current = document.getElementById('currentAccounts');
+    var currentAccounts = s.currentAccounts || null;
+    var providers = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    if (providers.length) {
+      current.textContent = 'Current account · ' + providers.map(function (provider) {
+        return providerLabel(provider) + ': ' + (currentAccounts[provider] || 'none');
+      }).join(' · ');
+      current.hidden = false;
+    } else if (s.currentAccount) {
+      current.textContent = 'Current account · ' + s.currentAccount;
+      current.hidden = false;
+    } else {
+      current.textContent = '';
+      current.hidden = true;
+    }
   }
 
   function renderOverview(s) {
@@ -1395,6 +1617,11 @@ ${SHARED_HELPERS}
 
   function render(s) {
     lastStatus = s;
+    var probe = s.probe || {};
+    var probeButton = document.getElementById('probe');
+    probeButton.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
+    probeButton.disabled = !!probe.running;
+    document.getElementById('reload').disabled = false;
     renderProviderRouting(s);
     renderAccounts(s);
     if (document.getElementById('accountDialog').open) renderAccountDetails();
@@ -1589,6 +1816,29 @@ ${SHARED_HELPERS}
     document.querySelectorAll('[data-view]').forEach(function (link) { if (link.getAttribute('data-view') === name) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
   }
 
+  async function doControl(path, label, button) {
+    button.disabled = true;
+    var generation = authGeneration;
+    try {
+      var res = await fetch(path, {
+        method: 'POST',
+        headers: SESSION_AUTH ? {} : { 'x-api-key': localStorage.getItem(KEY) || '' },
+        signal: AbortSignal.timeout(12000),
+      });
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      if (generation !== authGeneration) return;
+      if (json.ok !== true) { note('error', label + ' failed' + (json.error ? ': ' + json.error : '')); return; }
+      note('ok', label + ' complete');
+      await poll(true);
+    } catch (e) {
+      if (generation === authGeneration) note('error', label + ' failed: ' + e.message);
+    } finally {
+      button.disabled = !connected || (path === '/teamclaude/probe' && !!((lastStatus || {}).probe || {}).running);
+    }
+  }
+
   function showKeybox() {
     authGeneration++; connected = false;
     document.querySelectorAll('dialog[open]').forEach(function (dialog) { dialog.close(); });
@@ -1606,7 +1856,7 @@ ${SHARED_HELPERS}
     try {
       var res = await fetch('/teamclaude/status', { headers: SESSION_AUTH ? {} : { 'x-api-key': localStorage.getItem(KEY) || '' }, signal: AbortSignal.timeout(12000) });
       if (generation !== authGeneration) return;
-      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      if (res.status === 401 || res.status === 403) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       if (!res.ok) throw new Error('status ' + res.status);
       var s = await res.json();
       if (generation !== authGeneration) return;
@@ -1615,20 +1865,26 @@ ${SHARED_HELPERS}
       document.getElementById('err').style.display = 'none';
       connected = true; lastUpdated = Date.now(); document.body.classList.remove('stale');
       document.getElementById('manualSelection').disabled = false;
+      document.getElementById('reload').disabled = false;
       document.getElementById('connection').textContent = 'Connected · 5s refresh';
       recordActivity(s); render(s);
       if (!timer) timer = setInterval(poll, POLL_MS);
     } catch (e) {
       if (generation !== authGeneration) return;
-      if (!lastStatus) showKeybox();
       connected = false; document.body.classList.add('stale');
       document.getElementById('manualSelection').disabled = true;
+      document.getElementById('reload').disabled = true;
+      document.getElementById('probe').disabled = true;
       document.getElementById('accountManual').disabled = true; updateSwitchHelp(); updateForceHelp();
       if (document.getElementById('accountDialog').open) renderAccountDetails();
       if (lastStatus) renderRoutes(lastStatus);
       document.getElementById('connection').textContent = 'Disconnected';
       var err = document.getElementById('err'); err.style.display = 'block';
-      err.textContent = 'Connection lost. ' + (lastUpdated ? 'Showing status received ' + fmtAgo(lastUpdated) + '. Routing and quota may have changed. ' : '') + e.message;
+      if (lastStatus) err.textContent = 'Connection lost. ' + (lastUpdated ? 'Showing status received ' + fmtAgo(lastUpdated) + '. Routing and quota may have changed. ' : '') + e.message;
+      else {
+        err.textContent = 'Cannot reach the proxy: ' + e.message;
+        if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
+      }
       document.getElementById('loginError').textContent = 'Cannot reach the proxy. Try again shortly.';
     } finally {
       polling = false;
@@ -1660,6 +1916,8 @@ ${SHARED_HELPERS}
     if (e.key === 'Enter') document.getElementById('go').click();
   });
   document.getElementById('refresh').addEventListener('click', poll);
+  document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'Config reload', this); });
+  document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'Quota probe', this); });
   window.addEventListener('hashchange', showView);
   showView();
   document.getElementById('quotaTimezone').textContent = 'Reset times shown in ' + Intl.DateTimeFormat().resolvedOptions().timeZone + '.';
@@ -1704,8 +1962,10 @@ ${SHARED_HELPERS}
   if (SESSION_AUTH) {
     document.getElementById('loginHelp').textContent = 'Sign in to monitor account capacity and routing.';
     document.getElementById('keyLabel').textContent = 'Dashboard password';
-    start();
-  } else if (localStorage.getItem(KEY)) start(); else showKeybox();
+  }
+  document.getElementById('reload').hidden = SESSION_AUTH;
+  document.getElementById('probe').hidden = SESSION_AUTH;
+  start();
 })();
 </script>
 </body>

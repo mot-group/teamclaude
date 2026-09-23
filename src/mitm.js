@@ -20,10 +20,11 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -128,6 +129,11 @@ export function hostMode(host, config) {
   // Explicitly never intercepted, even though it sits under a provider's domain
   // — checked before anything else so no later rule can claim it.
   if (isNeverIntercepted(host)) return 'tunnel';
+  // In terminal-only mode the MITM must never terminate ChatGPT Desktop's
+  // connection. Terminal Codex uses the explicit /backend-api/codex base URL;
+  // this host-level bypass keeps Desktop's native auth and feature endpoints
+  // outside TeamClaude entirely.
+  if (config?.proxy?.terminalOnly === true && host === 'chatgpt.com') return 'tunnel';
   if (host === upstreamHostOf(config)) return 'rewrite';
   // A second provider's host, and only when an account actually uses that
   // provider. MITM is the mode that works without the client cooperating — a
@@ -191,7 +197,17 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
 /**
  * Build a `connect` event handler implementing the terminating MITM described at
  * the top of this file.
- * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
+ * @param {Object} opts
+ * @param {Object} opts.config
+ * @param {Object} opts.accountManager
+ * @param {() => Promise<{ key: string, cert: string }>} opts.ensureLeaf  current leaf PEMs
+ * @param {string|null} [opts.logDir]
+ * @param {Object} [opts.hooks]
+ * @param {(line: string) => void} [opts.log]
+ * @param {Object|null} [opts.sx]
+ * @param {Object|null} [opts.egress]
+ * @param {Object|null} [opts.clientUsage]
+ * @param {Object|null} [opts.dimensionUsage]
  */
 export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -236,20 +252,42 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       key, cert, allowHTTP1: true,
       ...(http1Only ? { ALPNProtocols: ['http/1.1'] } : {}),
     });
+    // The same client pools sit in front of this server as the base listener,
+    // so it holds an idle connection for the same time. Set on the h2 server,
+    // which passes it to the internal HTTP/1 server that `allowHTTP1` clients
+    // actually land on. Left unset, the two halves of one proxy disagree:
+    // measured on node 24, the base listener advertises `Keep-Alive:
+    // timeout=120` and this one advertises nothing at all, so the idle window
+    // is whatever that runtime happens to default to (node 26: 5s).
+    // @types/node does not declare keepAliveTimeout on Http2SecureServer, but
+    // the runtime honours it for the HTTP/1 connections allowHTTP1 accepts —
+    // asserted end-to-end through a real tunnel in mitm-integration.test.js,
+    // so the cast is checked by a test rather than taken on trust.
+    /** @type {any} */ (srv).keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
     srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
     // needed since WS clients negotiate h1 for the handshake).
+    // Guarded for the same reason the listener in server.js is: an uncaught
+    // throw here exits the process (#340).
     srv.on('upgrade', (req, socket, head) => {
-      const target = upgradeUpstreamFor(req.headers.host, config, upstream);
-      if (!target) {
-        log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
-        try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+      try {
+        const target = upgradeUpstreamFor(req.headers.host, config, upstream);
+        if (!target) {
+          log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
+          try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+          socket.destroy();
+          return;
+        }
+        // The CONNECT's client identity is bound to this listener (see getServer),
+        // so the channel is attributed the way the requests in the tunnel are.
+        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
+      } catch (err) {
+        log(`[TeamClaude] MITM: WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
+        try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
         socket.destroy();
-        return;
       }
-      relayUpgrade(req, socket, head, target, sx);
     });
     // Make the h2-WebSocket dead end audible. Without this the only evidence is
     // a message that never arrives, which is what made #164 cost a day to
@@ -354,7 +392,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
-      up.on('error', (err) => {
+      up.on('error', (/** @type {CodedError} */ err) => {
         if (err.code === FORBIDDEN_FORWARD) {
           log(`[TeamClaude] CONNECT ${host}:${port} refused: ${err.message}`);
           teardown('403 Forbidden');
@@ -492,8 +530,9 @@ export function resolveConnectAuth(req, socket, proxyConfig) {
   }
   // Loopback is exempt from the key requirement, but a valid key it DID present
   // still names it (matching the HTTP gate, where a local caller with a client
-  // key is attributed like any other).
-  if (!auth.ok && isLoopbackAddr(socket?.remoteAddress)) return { ok: true, client: null };
+  // key is attributed like any other). Same exemption as the other two gates,
+  // so a forwarded request or `trustLoopback: false` closes it here too.
+  if (!auth.ok && loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return { ok: true, client: null };
   return auth;
 }
 

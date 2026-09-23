@@ -100,6 +100,22 @@ test('uses exactly the configured actual Fable cutoff, unaffected by route bucke
   assert.equal(am.getActiveAccount(null, OPUS).index, 0);
 });
 
+test('Fable depletion uses each account\'s resolved threshold', t => {
+  clock(t);
+  const am = new AccountManager([
+    { ...oauth('a0'), switchThreshold: { unified7dFable: 0.8 } },
+    { ...oauth('a1'), switchThreshold: { unified7dFable: 0.9 } },
+  ], 0.98, { preferFableDepletedAccounts: true });
+  confirm(am, 0, 0.85);
+  confirm(am, 1, 0.85);
+  am.currentIndex = 1;
+
+  assert.equal(am.thresholdFor('unified7dFable', am.accounts[0]), 0.8);
+  assert.equal(am.thresholdFor('unified7dFable', am.accounts[1]), 0.9);
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'a0');
+  assert.equal(am.getStatus().fableDepletionRouting.models[0].reason, 'fable-depleted');
+});
+
 test('depletion follows quota state and ranks multiple preferred candidates normally', t => {
   clock(t);
   const am = fleet({ distributeSessions: true }, 3);

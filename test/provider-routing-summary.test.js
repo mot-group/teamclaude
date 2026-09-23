@@ -27,7 +27,25 @@ test('header separates providers and groups model-specific Claude targets', () =
   const fable = status.routes.find(r => r.name === 'fable');
   assert.deepEqual(fable.accounts.map(a => a.name), ['claude-a', 'claude-b']);
   assert.equal(fable.target, 'claude-b');
-  assert.ok(routeRows(status).every(row => row.kind !== 'default'));
+  assert.deepEqual(routeRows(status).filter(row => row.kind === 'default').map(row => row.provider), ['anthropic', 'codex']);
+});
+
+test('status carries provider targets without borrowing Codex for Anthropic', () => {
+  const am = new AccountManager([oauth('codex', 'codex'), oauth('claude')], .98, {
+    preferFableDepletedAccounts: true,
+  });
+  am.currentIndex = 0;
+  am.providerCursors.set('anthropic', 0);
+  const status = am.getStatus();
+
+  assert.equal(status.currentAccount, 'codex');
+  assert.equal(status.currentAccounts.anthropic, 'claude');
+  assert.equal(status.currentAccounts.codex, 'codex');
+  assert.equal(status.currentIndexes.anthropic, 1);
+  assert.equal(status.currentIndexes.codex, 0);
+  assert.deepEqual(Object.keys(status.defaultTargets).sort(), ['anthropic', 'codex']);
+  assert.ok(Object.hasOwn(status, 'defaultTarget'));
+  assert.ok(Object.hasOwn(status, 'fableDepletionRouting'));
 });
 
 test('preview mirrors provider cursor and priority without changing routing state', () => {

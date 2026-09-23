@@ -76,6 +76,19 @@ test('dashboard gates every data route, including loopback, and never serves as 
   assert.equal((await fetch(url + '/teamclaude/status', { headers })).status, 401);
 });
 
+test('LAN dashboard refuses reload and probe without forwarding them', async t => {
+  const { url, requests, login } = await fixture(t);
+  const cookie = (await login()).headers.get('set-cookie').split(';')[0];
+  const headers = { cookie, origin: url };
+
+  for (const path of ['/teamclaude/reload', '/teamclaude/probe']) {
+    const response = await fetch(url + path, { method: 'POST', headers });
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: 'Not found' });
+  }
+  assert.deepEqual(requests, []);
+});
+
 test('LAN browser origin fallback works without Sec-Fetch-Site; cross-origin requests and DNS rebinding fail', async t => {
   const { url, login, requests } = await fixture(t);
   assert.equal((await login('test-dashboard-password', { origin: 'http://attacker.test' })).status, 403);

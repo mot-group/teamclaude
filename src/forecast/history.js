@@ -1,7 +1,9 @@
 import { Worker } from 'node:worker_threads';
 
 export class ForecastHistory {
-  constructor(file, { maxBytes } = {}) {
+  /** @param {{ maxBytes?: number }} [opts] */
+  constructor(file, opts = {}) {
+    const { maxBytes } = opts;
     this.pending = new Map();
     this.sequence = 0;
     this.error = null;
