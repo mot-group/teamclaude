@@ -40,6 +40,8 @@ test('a manual entry with a bare date expires at the start of that day, local ti
     { expiresAt: '2026-10-22', title: 'Explore Opus 5.5' },
     { expiresAt: 'not a date' },
     { title: 'missing expiry' },
+    { expiresAt: '2026-02-30' },
+    { expiresAt: '2026-13-01' },
     'junk',
   ]);
   assert.equal(credits.length, 1);
@@ -110,4 +112,22 @@ test('a bankedResets edit on disk reaches the running account on reload, and its
   await syncAccountsFromDisk({ accounts: [{ ...config[0], bankedResets: undefined }] }, { accounts: config }, am);
   assert.equal(am.accounts[0].bankedResets, null);
   assert.equal('bankedResets' in config[0], false);
+});
+
+test('a response without a cedar_ember section keeps the grants seen before, so their return is not announced again', async () => {
+  const now = { value: start };
+  const account = { name: 'claude-main', index: 0, type: 'oauth', credential: 'test' };
+  const { tracker, prober } = probeHarness(account, now);
+  const listed = normalizeClaudeResetGrants({ eligible: true, grants: [{ id: 'g1', title: 'Explore Opus 5.5', expires_at: '2026-11-30T00:00:00Z' }] });
+  const usage = { fiveHour: { utilization: .2, resetAt: start + 3 * HOUR }, sevenDay: { utilization: .3, resetAt: start + 5 * 24 * HOUR } };
+  prober.probeFn = async () => ({ ...usage, resetGrants: listed });
+  await prober.probeAll();
+  prober.probeFn = async () => ({ ...usage, resetGrants: null });
+  now.value += 10 * 60_000;
+  await prober.probeAll();
+  assert.equal(tracker.getStatus([account]).accounts[0].credits.availableCount, 1, 'the grant is still held');
+  prober.probeFn = async () => ({ ...usage, resetGrants: listed });
+  now.value += 10 * 60_000;
+  await prober.probeAll();
+  assert.equal(tracker.state.outbox.length, 0, 'no false "available" alert when the section comes back');
 });

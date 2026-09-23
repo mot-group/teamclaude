@@ -25,7 +25,12 @@ function timestamp(value) {
   // A bare date is the day claude.ai prints ("Expires Oct 22"). Read it as the
   // start of that day in local time, so an expiry alert fires early, not late.
   const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (day) return new Date(Number(day[1]), Number(day[2]) - 1, Number(day[3])).getTime();
+  if (day) {
+    const [year, month, date] = [Number(day[1]), Number(day[2]) - 1, Number(day[3])];
+    const local = new Date(year, month, date);
+    // The Date constructor rolls 2026-02-30 over to March 2; refuse it instead.
+    return local.getFullYear() === year && local.getMonth() === month && local.getDate() === date ? local.getTime() : null;
+  }
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -94,11 +99,18 @@ export function manualResetCredits(entries) {
 /**
  * The inventory the reset tracker stores and alerts on: every available credit
  * from both sources, plus whether Anthropic listed grants to this OAuth token.
+ * A response without a `cedar_ember` section says nothing about grants, so the
+ * OAuth half of `previous` carries over rather than being read as "none left",
+ * which would announce the same grants as new when the section returns.
  * @param {ClaudeResetGrants|null|undefined} grants
  * @param {unknown} bankedResets
  * @param {number} [now]
+ * @param {{ credits?: ClaudeResetCredit[], oauth?: { eligible: boolean, reason: string|null }|null }|null} [previous]
  */
-export function claudeResetInventory(grants, bankedResets, now = Date.now()) {
+export function claudeResetInventory(grants, bankedResets, now = Date.now(), previous = null) {
+  if (!grants && previous?.oauth) {
+    grants = { ...previous.oauth, credits: (previous.credits || []).filter(c => c.source === 'oauth') };
+  }
   const credits = [...(grants?.credits || []), ...manualResetCredits(bankedResets)];
   const availableCount = credits.filter(c => c.status === 'available' && (c.expiresAt === null || c.expiresAt > now)).length;
   return { availableCount, credits, oauth: grants ? { eligible: grants.eligible, reason: grants.reason } : null };

@@ -190,7 +190,8 @@ export class Prober {
       if (this.resetTracker) {
         try {
           this.resetTracker.observe(account, usage, { maxGapMs: Math.min(3600_000, Math.max(900_000, this.intervalMs * 3)) });
-          this.resetTracker.observeCredits(account, claudeResetInventory(usage.resetGrants, account.bankedResets));
+          const previous = this.resetTracker.getStatus([account]).accounts[0]?.credits || null;
+          this.resetTracker.observeCredits(account, claudeResetInventory(usage.resetGrants, account.bankedResets, Date.now(), previous));
           this.resetTracker.error = null;
         } catch {
           this.resetTracker.error = 'Reset tracking failed; check the private state file and disk access';
