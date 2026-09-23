@@ -250,6 +250,9 @@ function makeAccount(acct, index) {
     // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
     // thresholdFor() for the resolution order.
     switchThreshold: accountSwitchThreshold(acct),
+    // Claude banked resets the operator recorded from claude.ai (the OAuth
+    // usage endpoint does not list them). Read by the prober on each probe.
+    bankedResets: Array.isArray(acct.bankedResets) ? acct.bankedResets : null,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams

@@ -150,6 +150,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // Read per request like the two above (server.js rewriteRequestBody), and
     // missing from this sync until #374: an edit waited for a restart.
     mgr.stripRequestFields = diskAcct.stripRequestFields || null;
+    // Read by the prober on the next probe, so a banked reset entered or
+    // removed on disk shows up without a restart.
+    mgr.bankedResets = Array.isArray(diskAcct.bankedResets) ? diskAcct.bankedResets : null;
     mgr.messageThreads = diskAcct.messageThreads === true;
     // Mirror onto the memConfig entry: the TUI save stencil rebuilds
     // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
@@ -162,6 +165,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
+      if (Array.isArray(diskAcct.bankedResets)) cfgAcct.bankedResets = diskAcct.bankedResets; else delete cfgAcct.bankedResets;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
       if (diskAcct.models?.length) cfgAcct.models = diskAcct.models; else delete cfgAcct.models;
