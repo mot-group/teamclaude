@@ -31,6 +31,7 @@ import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
+import { loadAccountProfiles, usesAnthropicAccountMetadata, formatAccountSummary } from './account-list.js';
 import { ForecastService } from './forecast/service.js';
 import { ResetTracker } from './reset-tracker.js';
 import { Warmer } from './warmer.js';
@@ -1492,43 +1493,25 @@ async function accountsCommand() {
   // so a file written before ids existed needs its ids on disk first.
   await persistMintedAccountIds(config);
 
-  // Refresh expired tokens before fetching profiles
-  const refreshed = [];
-  await Promise.all(config.accounts.map(async (a) => {
-    if (a.type !== 'oauth' || !a.refreshToken) return;
-    if (!isTokenExpiringSoon(a.expiresAt)) return;
-    try {
-      const newTokens = await refreshAccessToken(a.refreshToken);
-      a.accessToken = newTokens.accessToken;
-      a.refreshToken = newTokens.refreshToken;
-      a.expiresAt = newTokens.expiresAt;
-      refreshed.push(a);
-    } catch {
-      // refresh failed — fetchProfile will report the specific error
-    }
-  }));
-  // Only the refreshed rows are written, each onto the on-disk row with its id.
-  // Saving the whole in-memory list here would put back whatever a running
-  // server rotated on disk since the load — a refresh token that is now dead,
-  // and an account lost on its next restart.
-  if (refreshed.length > 0) {
-    await atomicConfigUpdate(disk => {
-      for (const a of refreshed) {
-        const i = findConfigAccount(disk, a);
-        if (i < 0) continue; // no row of its own; any other row would be another account's
-        disk.accounts[i].accessToken = a.accessToken;
-        disk.accounts[i].refreshToken = a.refreshToken;
-        disk.accounts[i].expiresAt = a.expiresAt;
-      }
-    });
-  }
-
-  // Fetch profiles in parallel for all OAuth accounts
-  const profiles = await Promise.all(
-    config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken) : null
-    )
-  );
+  const { profiles } = await loadAccountProfiles(config.accounts, {
+    isTokenExpiringSoon,
+    refreshAccessToken,
+    persistRefreshed: async refreshed => {
+      // Save each rotated grant before profile I/O. An interruption after the
+      // refresh must not leave the old refresh token on disk.
+      if (refreshed.length === 0) return;
+      await atomicConfigUpdate(disk => {
+        for (const a of refreshed) {
+          const i = findConfigAccount(disk, a);
+          if (i < 0) continue; // no row of its own; any other row would be another account's
+          disk.accounts[i].accessToken = a.accessToken;
+          disk.accounts[i].refreshToken = a.refreshToken;
+          disk.accounts[i].expiresAt = a.expiresAt;
+        }
+      });
+    },
+    fetchProfile,
+  });
 
   // Backfill account+org identity from profiles, then deduplicate by
   // (accountUuid, org): the same person in a different org is a distinct
@@ -1541,6 +1524,7 @@ async function accountsCommand() {
   for (let i = config.accounts.length - 1; i >= 0; i--) {
     const a = config.accounts[i];
     const p = profiles[i];
+    if (!usesAnthropicAccountMetadata(a)) continue;
     if (p && !p.error) {
       if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touchedIds.add(a.id); }
       if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touchedIds.add(a.id); }
@@ -1567,9 +1551,12 @@ async function accountsCommand() {
   // unique — they are the user-facing key for remove/api/selection.
   const orgCount = new Map();
   for (const a of config.accounts) {
-    if (a.accountUuid) orgCount.set(a.accountUuid, (orgCount.get(a.accountUuid) || 0) + 1);
+    if (usesAnthropicAccountMetadata(a) && a.accountUuid) {
+      orgCount.set(a.accountUuid, (orgCount.get(a.accountUuid) || 0) + 1);
+    }
   }
   for (const [i, a] of config.accounts.entries()) {
+    if (!usesAnthropicAccountMetadata(a)) continue;
     const p = profiles[i];
     const email = (p && !p.error && p.email) ? p.email : null;
     if (!email) continue;
@@ -1596,20 +1583,10 @@ async function accountsCommand() {
 
   for (const [i, a] of config.accounts.entries()) {
     const p = profiles[i];
-
-    if (a.type === 'apikey') {
-      console.log(`  [${i + 1}] ${a.name} (apikey)  ${a.apiKey?.slice(0, 15)}...`);
-      continue;
-    }
+    for (const line of formatAccountSummary(a, p, i)) console.log(line);
+    if (a.type === 'apikey') continue;
 
     // OAuth account
-    const hasProfile = p && !p.error;
-    const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
-    const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
-    const src = a.source ? `, ${a.source}` : '';
-    console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
-    if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
-    if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
     // The stable pin identity (TC_ACCT), unlike the display name above.
     if (a.accountUuid) console.log(`       ID:    ${a.accountUuid}`);
     if (verbose && a.expiresAt) {
@@ -1651,6 +1628,11 @@ async function apiCommand() {
   } else {
     account = accounts.find(a => a.type === 'oauth') || accounts[0];
     if (!account) { console.error('No accounts configured'); process.exit(1); }
+  }
+
+  if (account.type === 'oauth' && !usesAnthropicAccountMetadata(account)) {
+    console.error('teamclaude api supports only first-party Anthropic OAuth accounts and API keys.');
+    process.exit(1);
   }
 
   const credential = account.accessToken || account.apiKey;
