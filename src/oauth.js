@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
+import { normalizeClaudeResetGrants } from './claude-reset-grants.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -129,7 +130,9 @@ export async function importCredentials(filePath, {
 }
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
-const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+// `cedar_ember=1` asks the same response to include the banked-reset grant list
+// (see claude-reset-grants.js), so reading it costs no extra request.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1';
 const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
@@ -522,6 +525,8 @@ export function normalizeUsagePayload(data) {
     // caps and that family was not among them. Without the list, a missing
     // family is our own ignorance and nothing may be concluded from it.
     scopedWeeklyListed: Array.isArray(data?.limits),
+    // Banked "Reset for free" grants, or null when the payload had no section.
+    resetGrants: normalizeClaudeResetGrants(data?.cedar_ember),
   };
 }
 

@@ -8,6 +8,7 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
+import { claudeResetInventory } from './claude-reset-grants.js';
 import { fetchCodexUsage, fetchCodexResetCredits } from './codex-usage.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 import { providerOf } from './provider.js';
@@ -189,6 +190,8 @@ export class Prober {
       if (this.resetTracker) {
         try {
           this.resetTracker.observe(account, usage, { maxGapMs: Math.min(3600_000, Math.max(900_000, this.intervalMs * 3)) });
+          const previous = this.resetTracker.getStatus([account]).accounts[0]?.credits || null;
+          this.resetTracker.observeCredits(account, claudeResetInventory(usage.resetGrants, account.bankedResets, Date.now(), previous));
           this.resetTracker.error = null;
         } catch {
           this.resetTracker.error = 'Reset tracking failed; check the private state file and disk access';

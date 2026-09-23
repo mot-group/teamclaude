@@ -1499,12 +1499,18 @@ ${SHARED_HELPERS}
       (account.pending || []).forEach(function (pending) {
         card.appendChild(el('p', 'warnt', 'Possible early reset on ' + pending.after.label + ', ' + pct(pending.before) + '% → ' + pct(pending.after) + '% spent. Waiting for the next probe to confirm.'));
       });
-      if (account.provider === 'codex') {
+      if (account.provider === 'codex' || account.provider === 'anthropic') {
         var inventory = account.credits;
         card.appendChild(el('p', '', inventory ? 'Banked resets: ' + inventory.availableCount + ' available' + (inventory.observedAt ? ', checked ' + fmtAgo(inventory.observedAt) : '') : 'Banked resets: unknown'));
         if (inventory) inventory.credits.filter(function (credit) { return credit.status === 'available'; }).forEach(function (credit) {
-          card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'expired ' : 'expires ') + shortDate(credit.expiresAt) : 'no expiry reported')));
+          card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'expired ' : 'expires ') + shortDate(credit.expiresAt) : 'no expiry reported')
+            + (credit.source === 'manual' ? ' · entered manually' : '')));
         });
+        // Anthropic lists web-issued banked resets to claude.ai sessions only.
+        if (inventory && inventory.oauth && !inventory.oauth.eligible) {
+          card.appendChild(el('p', 'usage dim', 'Anthropic does not list banked resets for this account to the proxy' + (inventory.oauth.reason ? ' (' + inventory.oauth.reason + ')' : '')
+            + '. Add one you see in claude.ai Settings > Usage under bankedResets in the config.'));
+        }
         if (account.creditError) card.appendChild(el('p', 'warnt', account.creditError + '. Showing the last successful inventory.'));
       }
       card.appendChild(el('p', 'usage', account.lastObservedAt ? 'Last probed ' + fmtAgo(account.lastObservedAt) : 'Not probed yet'));

@@ -19,7 +19,19 @@ Windows that reset over the same observed interval and share a timing classifica
 
 ## Banked Codex resets
 
-The prober also reads Codex's reset credit inventory. It displays the available count, individual credit titles, expiry times, last successful check, and any current lookup error. A lookup failure preserves the previous inventory and does not fail the usage probe. Claude's endpoint does not provide a confirmed banked reset inventory.
+The prober also reads Codex's reset credit inventory. It displays the available count, individual credit titles, expiry times, last successful check, and any current lookup error. A lookup failure preserves the previous inventory and does not fail the usage probe.
+
+## Banked Claude resets
+
+Anthropic gives paid plans occasional banked limit resets, redeemed with **Reset for free** in claude.ai Settings > Usage or Claude Desktop. The Claude probe asks the OAuth usage endpoint for its grant list (`?cedar_ember=1`, part of the same request). Anthropic currently answers OAuth tokens with `eligible: false` and reason `surface`, and lists no grants: web-issued resets are only shown to claude.ai sessions. The Resets view says so on each Claude account. If Anthropic starts listing grants to OAuth tokens, they appear with no further change.
+
+Until then, record a banked reset you see in claude.ai on the account's config row and reload:
+
+```json
+{ "name": "claude-main", "type": "oauth", "bankedResets": [{ "expiresAt": "2026-10-22", "title": "Explore Opus 5.5" }] }
+```
+
+`expiresAt` takes an ISO timestamp or a bare date. A bare date means the start of that day in the proxy's local time, so the expiry alert fires early rather than late. The entry then behaves like a Codex credit: it is listed in the Resets view marked "entered manually", a Chat alert goes out when one is added after the first probe, and one more when it is within 24 hours of expiring. Remove the entry after redeeming the reset; using it also shows up as an early reset.
 
 This integration only reads inventory. It contains no purchase links or redemption actions.
 
