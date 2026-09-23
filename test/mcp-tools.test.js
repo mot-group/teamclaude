@@ -40,7 +40,7 @@ async function fixture({ mode = 'full', hooks = {}, fleet = accounts, options = 
   };
   const tools = createToolSet(mode, { accountManager: am, config, hooks: spies, client: 'ci' }, options);
   const disk = async () => JSON.parse(await readFile(configPath, 'utf8'));
-  return { tools, am, config, calls, disk };
+  return { tools, am, config, calls, disk, configPath };
 }
 
 /** Call a tool and hand back its structured result, failing on isError. */
@@ -310,6 +310,42 @@ test('write tools run one at a time, so a removal cannot race a reload', async (
   }
   await Promise.all([first, second]);
   assert.deepEqual(order, ['reload:start', 'reload:end', 'persist']);
+});
+
+test('a reload queued behind account persistence reads the MCP mutation', async () => {
+  const order = [];
+  let state;
+  let releasePersist;
+  let markPersisting;
+  const persisting = new Promise(resolve => { markPersisting = resolve; });
+  const hooks = {
+    persistAccounts: async () => {
+      order.push('persist:start');
+      markPersisting();
+      await new Promise(resolve => { releasePersist = resolve; });
+      await writeFile(state.configPath, JSON.stringify(state.config));
+      order.push('persist:end');
+    },
+    reload: async () => {
+      order.push('reload');
+      const saved = await state.disk();
+      state.am.accounts[0].priority = saved.accounts[0].priority;
+      return 0;
+    },
+  };
+  state = await fixture({ hooks });
+
+  const mutation = ok(state.tools, 'set_account_priority', { account: 'alice@example.com', priority: 2 });
+  await persisting;
+  const reload = ok(state.tools, 'reload_config');
+  await Promise.resolve();
+  assert.deepEqual(order, ['persist:start']);
+  releasePersist();
+  await Promise.all([mutation, reload]);
+
+  assert.equal((await state.disk()).accounts[0].priority, 2);
+  assert.equal(state.am.accounts[0].priority, 2);
+  assert.deepEqual(order, ['persist:start', 'persist:end', 'reload']);
 });
 
 test('a write that never settles is answered, and the queue moves on without it', async () => {

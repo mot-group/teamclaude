@@ -185,6 +185,28 @@ test('fallback honours a session affinity the request has not excluded', () => {
   assert.equal(am.getActiveAccount(new Set([0]), 'claude-opus-4', null, 's1').name, 'c');
 });
 
+test('a forced route decides before the untagged spread and fallback stays in the route', () => {
+  const untagged = whenSpent => new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98, {
+    distributeSessions: true,
+    routes: [{
+      name: 'bulk', match: ['*opus*'], accounts: ['a', 'b'],
+      override: { account: 'b', whenSpent },
+    }],
+  });
+
+  const serving = untagged('fallback');
+  assert.equal(serving.getActiveAccount(null, 'claude-opus-4').name, 'b');
+
+  const held = untagged('hold');
+  spend(held.accounts[1]);
+  assert.equal(held.getActiveAccount(null, 'claude-opus-4'), null);
+
+  const fallback = untagged('fallback');
+  spend(fallback.accounts[1]);
+  fallback._untaggedCursor = 1;
+  assert.equal(fallback.getActiveAccount(null, 'claude-opus-4').name, 'a');
+});
+
 test('returning to the forced account re-arms the ramp exactly once', () => {
   const am = forced('fallback');
   am.ramp = { enabled: true, windowMs: 60_000, floor: 1 };

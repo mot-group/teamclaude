@@ -276,6 +276,29 @@ test('Codex probe refreshes on 401 once through the Codex refresh function', asy
   assert.equal(am.accounts[0].usage.totalRequests, 0);
 });
 
+test('Codex probe observers run in order and cannot fail a successful quota read', async () => {
+  const am = new AccountManager([account('codex')]);
+  const order = [];
+  const resetTracker = {
+    error: null,
+    observe: () => { order.push('reset'); },
+    observeCredits: () => { order.push('credits:observe'); },
+    getStatus: () => null,
+  };
+  const prober = new Prober(am, {
+    codexProbeFn: async () => normalized,
+    onObservation: () => { order.push('forecast'); throw new Error('forecast failed'); },
+    resetTracker,
+    creditsFn: async () => { order.push('credits:read'); return { availableCount: 0, credits: [] }; },
+  });
+
+  await prober.probeAccount(am.accounts[0]);
+
+  assert.deepEqual(order, ['forecast', 'reset', 'credits:read', 'credits:observe']);
+  assert.equal(prober.getStatus().accounts[0].status, 'ok');
+  assert.equal(am.accounts[0].quota.unified7d, 0.78);
+});
+
 test('disabled, dead-token, and custom-upstream Codex accounts are skipped even by direct probes', async () => {
   const am = new AccountManager([account('disabled', { disabled: true }), account('dead'), account('custom', { upstream: 'https://custom.invalid' })]);
   am.accounts[1]._deadRefreshToken = am.accounts[1].refreshToken;
