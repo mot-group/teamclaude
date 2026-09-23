@@ -30,6 +30,7 @@ env:
 jobs:
   docker:
     name: build and push
+    if: github.repository == 'KarpelesLab/teamclaude'
     runs-on: ubuntu-latest
     permissions:
       contents: read
