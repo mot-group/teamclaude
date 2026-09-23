@@ -1626,8 +1626,11 @@ async function apiCommand() {
     account = resolveAccount(accounts, accountName, argValue('--org'));
     if (!account) { console.error(`Account "${accountName}" not found`); process.exit(1); }
   } else {
-    account = accounts.find(a => a.type === 'oauth') || accounts[0];
-    if (!account) { console.error('No accounts configured'); process.exit(1); }
+    // Skip OAuth accounts from other providers here rather than rejecting the
+    // first OAuth row below: a pool that lists Codex first still has a usable
+    // Anthropic account further down.
+    account = accounts.find(usesAnthropicAccountMetadata) || accounts.find(a => a.type !== 'oauth');
+    if (!account) { console.error('No first-party Anthropic OAuth account or API key configured'); process.exit(1); }
   }
 
   if (account.type === 'oauth' && !usesAnthropicAccountMetadata(account)) {

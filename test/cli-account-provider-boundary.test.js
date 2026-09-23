@@ -15,7 +15,7 @@ async function runAccountCommand(accounts, command = ['accounts', '--verbose']) 
   const configPath = join(directory, 'config.json');
   const connections = [];
   const proxy = http.createServer((request, response) => {
-    connections.push(`HTTP ${request.url}`);
+    connections.push(`HTTP ${request.url} ${request.headers.authorization || ''}`);
     response.writeHead(502);
     response.end();
   });
@@ -105,4 +105,15 @@ test('Anthropic API convenience command rejects Codex credentials before connect
     assert.deepEqual(result.saved.accounts, accounts);
     assert.doesNotMatch(result.stdout + result.stderr, /synthetic-access-|synthetic-refresh-/);
   }
+});
+
+test('Anthropic API convenience command skips a Codex account listed first when none is named', async () => {
+  const accounts = [
+    oauth('codex', { provider: 'codex', accountId: 'synthetic-codex-account' }),
+    oauth('claude', { expiresAt: Date.now() + 3_600_000 }),
+  ];
+  const result = await runAccountCommand(accounts, ['api', '/v1/models']);
+  assert.ok(result.connections.length > 0, 'the Anthropic account behind the Codex row must be used');
+  assert.ok(result.connections.every(c => c.includes('synthetic-access-claude')), 'only the Anthropic credential may be sent');
+  assert.ok(result.connections.every(c => !c.includes('synthetic-access-codex')));
 });
