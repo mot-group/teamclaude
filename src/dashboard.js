@@ -923,7 +923,6 @@ const PAGE = `<!doctype html>
   :root {
     color-scheme:dark;
     --bg:#0d1015; --panel:#151920; --panel-2:#1b2029; --line:#2a313d; --text:#f0f2f7; --dim:#a0abba; --accent:#b5c7ff;
-    --ok:#8cd7b0; --warn:#efc17b; --bad:#ffaaa6;
     /* provider tints: identity only (rails, group headers, provider badges). Never a bar fill. */
     --claude:#e8956a; --claude-soft:#2a1d16;
     --codex:#3fbfd0; --codex-soft:#12242a;
@@ -954,11 +953,13 @@ const PAGE = `<!doctype html>
   #app { display:grid; grid-template-columns:204px minmax(0,1fr); min-height:100vh; }
   .sidebar { min-width:0; background:#10141a; border-right:1px solid var(--line); padding:30px 18px; }
   .brand { color:var(--text); font-size:20px; letter-spacing:-.5px; font-weight:650; display:flex; align-items:center; gap:10px; padding:0 10px; text-decoration:none; }
-  .brand-mark { width:22px; height:22px; display:inline-block; border:2px solid var(--accent); border-radius:5px; box-shadow:6px 6px 0 -2px var(--bg),6px 6px 0 0 var(--accent); margin-right:5px; }
+  /* Two-tint mark: Claude clay top-left, Codex teal bottom-right. */
+  .brand-mark { width:22px; height:22px; display:inline-block; flex:0 0 auto; border-radius:5px; background:linear-gradient(135deg,var(--claude) 0 50%,var(--codex) 50% 100%); }
   .nav-label { margin:42px 12px 12px; color:var(--dim); font-size:11px; letter-spacing:1.2px; text-transform:uppercase; }
   nav { display:flex; flex-direction:column; gap:5px; }
-  nav a { text-decoration:none; color:var(--dim); padding:11px 13px; min-height:44px; border-radius:7px; font-size:13px; }
-  nav a[aria-current] { color:#e0e8ff; background:#242d40; }
+  nav a { text-decoration:none; color:var(--dim); padding:11px 13px; min-height:44px; border-radius:7px; font-size:13px; border-left:3px solid transparent; }
+  /* The current item is neutral: the accent is kept for links and focus rings. */
+  nav a[aria-current] { color:var(--text); background:var(--panel-2); border-left-color:var(--text); font-weight:600; }
   nav a:hover { background:#1b2330; }
   .main-content { padding:32px 38px; max-width:1560px; width:100%; margin:0 auto; min-width:0; }
   .topline,.section-head { display:flex; align-items:center; justify-content:space-between; gap:18px; }
@@ -968,7 +969,10 @@ const PAGE = `<!doctype html>
   .sub,.routing-help { color:var(--dim); font-size:13px; margin-top:8px; }
   .toolbar,.account-tools { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .toolbar { flex:0 0 auto; }
-  .live { color:var(--dim); font-size:12px; }
+  .live { color:var(--dim); font-size:12px; display:inline-flex; align-items:center; gap:7px; }
+  .live::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--dim); flex:0 0 auto; }
+  .live.on::before { background:var(--grade-ok); }
+  .stale .live::before { background:var(--grade-at); }
   .route-panel { background:var(--panel); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
   .route-panel .section-head { padding:17px 20px; margin:0; border-bottom:1px solid var(--line); }
   .provider-routing { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
@@ -1004,9 +1008,9 @@ const PAGE = `<!doctype html>
   .search,input,select { background:#11161e; border:1px solid var(--line); color:var(--text); border-radius:7px; padding:9px 12px; }
   .search { width:200px; min-height:40px; font-size:12px; }
   .search::placeholder { color:var(--dim); }
-  .quota-toggle { display:inline-flex; align-items:center; border:1px solid #424d62; border-radius:7px; padding:3px; background:#11161e; }
-  .quota-toggle button { min-height:32px; padding:5px 12px; border:0; background:none; font-size:12px; color:var(--dim); }
-  .quota-toggle button[aria-pressed="true"] { background:#c2d0f6; color:#19243a; font-weight:600; }
+  .quota-toggle { display:inline-flex; align-items:center; border:1px solid #424d62; border-radius:7px; padding:2px; background:#11161e; }
+  .quota-toggle button { min-height:40px; padding:5px 12px; border:0; background:none; font-size:12px; color:var(--dim); }
+  .quota-toggle button[aria-pressed="true"] { background:var(--text); color:var(--bg); font-weight:600; }
   .account-table-wrap { border:1px solid var(--line); border-radius:11px; overflow:auto; background:var(--panel); }
   table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
   th,td { text-align:left; padding:14px 16px; font-size:13px; border-bottom:1px solid var(--line); vertical-align:top; }
@@ -1139,10 +1143,10 @@ const PAGE = `<!doctype html>
   td.num,th.num { text-align:right; }
   .dim,.no { color:var(--dim); }
   .no { text-decoration:line-through; }
-  .ok { color:var(--ok); }
-  .pin { color:var(--accent); }
-  .warnt,.blocked { color:var(--warn); }
-  .badt { color:var(--bad); }
+  .ok { color:var(--grade-ok-ink); }
+  .pin { color:var(--text); }
+  .warnt,.blocked { color:var(--grade-near-ink); }
+  .badt { color:var(--grade-at-ink); }
   .empty { color:var(--dim); padding:28px; text-align:center; }
   .history { height:90px; display:flex; align-items:end; gap:3px; margin:20px 0 12px; }
   /* A request count carries neither provider nor grade, so the bars stay dim. */
@@ -1150,7 +1154,7 @@ const PAGE = `<!doctype html>
   .history.empty-chart { border:1px dashed var(--line); border-radius:8px; align-items:center; justify-content:center; color:var(--dim); font-size:12px; }
   .history-label { color:var(--dim); font-size:12px; }
   #err,#note,#problems { display:none; margin:0 0 20px; font-size:13px; }
-  #err { border:1px solid #68503c; background:#282019; padding:14px 17px; border-radius:8px; color:var(--warn); }
+  #err { border:1px solid #5a4a1e; background:var(--grade-near-soft); padding:14px 17px; border-radius:8px; color:var(--grade-near-ink); }
   #problems>div { border:1px solid #5a4a1e; border-left-width:3px; background:var(--grade-near-soft); padding:12px 17px 12px 14px; border-radius:8px; margin-bottom:9px; color:var(--grade-near-ink); }
   #problems>div[data-provider] { border-left-color:var(--other); }
   #problems>div[data-provider="anthropic"] { border-left-color:var(--claude); }
@@ -1160,15 +1164,18 @@ const PAGE = `<!doctype html>
   #problems>div[data-provider="codex"] .pv { color:var(--codex); }
   #problems>.bad { border-color:#6b2f3c; background:var(--grade-at-soft); color:var(--grade-at-ink); }
   #note { padding:13px 17px; border:1px solid var(--line); border-radius:8px; }
-  #note.warn,.dialog-result.warn { color:var(--warn); } #note.error,.dialog-result.error { color:var(--bad); }
+  #note.warn,.dialog-result.warn { color:var(--grade-near-ink); } #note.error,.dialog-result.error { color:var(--grade-at-ink); }
   .stale .route-strip,.stale .provider-routing { opacity:.6; }
   .stale .bar i { background:#7f8799; background-image:none; }
-  #keybox { display:none; max-width:440px; margin:12vh auto; padding:30px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+  .stale-note { display:none; border:1px solid #6b2f3c; background:var(--grade-at-soft); color:var(--grade-at-ink); padding:12px 17px; border-radius:8px; margin:0 0 20px; font-size:13px; }
+  .stale .stale-note { display:block; }
+  #keybox { display:none; max-width:440px; margin:12vh auto; padding:30px; border:1px solid var(--line); border-top:3px solid var(--claude); border-radius:12px; background:var(--panel); }
+  #keybox .brand-mark { margin-bottom:18px; }
   #keybox input { width:100%; min-height:44px; margin:8px 0 16px; }
   #keybox label { display:block; margin-top:22px; }
   #keybox button { width:100%; }
-  #loginError { color:var(--bad); margin-top:12px; }
-  .primary { background:#c0cfff; color:#172239; border-color:#c0cfff; font-weight:600; }
+  #loginError { color:var(--grade-at-ink); margin-top:12px; }
+  .primary { background:var(--text); color:var(--bg); border-color:var(--text); font-weight:600; }
   dialog { width:550px; max-width:calc(100% - 32px); max-height:calc(100dvh - 40px); color:var(--text); background:#171c24; border:1px solid #3a4556; border-radius:14px; padding:27px; }
   dialog::backdrop { background:#03060aba; backdrop-filter:blur(3px); }
   dialog[data-provider="anthropic"] { border-top:3px solid var(--claude); }
@@ -1187,11 +1194,11 @@ const PAGE = `<!doctype html>
   fieldset { border:1px solid var(--line); border-radius:8px; margin:20px 0 0; padding:6px 15px 14px; }
   legend { color:var(--dim); font-size:12px; padding:0 6px; }
   .force-modes label { display:flex; align-items:center; gap:9px; margin:10px 0 0; font-size:13px; }
-  .force-modes input { width:16px; height:16px; padding:0; flex:0 0 auto; accent-color:#c0cfff; }
+  .force-modes input { width:16px; height:16px; padding:0; flex:0 0 auto; accent-color:var(--text); }
   .force-modes p { margin:5px 0 0 25px; }
   /* Force controls live in the route's target cell, not a column of their own. */
   .route-actions { display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-top:6px; }
-  .route-actions .act { min-height:32px; padding:2px 0; }
+  .route-actions .act { min-height:40px; padding:2px 0; }
   #routes .chip { display:inline-block; }
   #routes .chip.chip-line { display:block; margin-top:4px; }
   #routes tr[data-provider] td:first-child { border-left:3px solid var(--other); padding-left:13px; }
@@ -1205,15 +1212,16 @@ const PAGE = `<!doctype html>
   .section-body>h2,#routesWrap>h2 { margin:26px 0 12px; }
   footer { color:var(--dim); font-size:11px; margin-top:28px; }
   @media(max-width:1150px) { .main-content { padding:26px; } #app { grid-template-columns:175px minmax(0,1fr); } .sidebar { padding:28px 12px; } .section-head { align-items:start; } .account-tools { justify-content:flex-end; } .account-table th:first-child { width:24%; } .account-table th:last-child { width:68px; } th,td { padding:14px 12px; } .strip-line { grid-template-columns:120px minmax(0,1fr); } }
-  @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; overflow:auto; margin-top:18px; } nav a { white-space:nowrap; flex-shrink:0; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; }
+  @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); grid-template-rows:auto 1fr; } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; flex-wrap:wrap; gap:6px; margin-top:16px; } nav a { padding:10px 12px; border:1px solid var(--line); border-left-width:3px; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; }
     #routes thead { display:none; } #routes,#routes tbody,#routes tr,#routes td { display:block; width:100%; } #routes tr { padding:12px 0; border-bottom:1px solid var(--line); } #routes tr:last-child { border-bottom:0; } #routes tr[data-provider] { border-left:3px solid var(--other); } #routes tr[data-provider="anthropic"] { border-left-color:var(--claude); } #routes tr[data-provider="codex"] { border-left-color:var(--codex); } #routes tr[data-provider] td:first-child { border-left:0; padding-left:16px; } #routes td { border:0; padding:3px 16px; } #routes td[data-label]::before { content:attr(data-label) ": "; color:var(--dim); } #routes .route-actions { padding-top:4px; gap:0 8px; } #routes .route-actions .chip { flex-basis:100%; } #routes .route-actions .act { min-height:44px; } }
-  @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:38px; padding:6px 13px; } .route-panel .section-head,.route-strip .section-head { flex-direction:row; flex-wrap:wrap; } .strip-line { grid-template-columns:1fr; gap:4px; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .route-actions .act { width:auto; border-top:0; padding:2px 0; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } }
+  @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:40px; padding:6px 13px; } .route-panel .section-head,.route-strip .section-head { flex-direction:row; flex-wrap:wrap; } .strip-line { grid-template-columns:1fr; gap:4px; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .route-actions .act { width:auto; border-top:0; padding:2px 0; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } #keybox { margin:10vh 16px; padding:24px; } }
   @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } .reset-table tr[data-provider] { border-left:3px solid var(--other); } .reset-table tr[data-provider="anthropic"] { border-left-color:var(--claude); } .reset-table tr[data-provider="codex"] { border-left-color:var(--codex); } .reset-table tr[data-provider] td:first-child { border-left:0; padding-left:16px; } .mini { grid-template-columns:90px minmax(0,1fr) 96px; } .reveal { width:100%; min-height:44px; } }
 </style>
 </head>
 <body>
 <a class="skip" href="#mainContent">Skip to dashboard</a>
 <div id="keybox">
+  <i class="brand-mark" aria-hidden="true"></i>
   <div class="eyebrow">Private workspace</div><h1>TeamClaude</h1>
   <p class="sub" id="loginHelp">Enter your proxy key to view status.</p>
   <label for="key" id="keyLabel">Proxy key</label><input id="key" type="password" autocomplete="current-password">
@@ -1226,7 +1234,7 @@ const PAGE = `<!doctype html>
   </aside>
   <main id="mainContent" class="main-content">
     <header class="topline"><div><div class="eyebrow" id="breadcrumb">Dashboard / Overview</div><h1 id="pageTitle">Routing & capacity</h1><p class="sub" id="summary">Where requests are expected to go. How much quota each account has used.</p></div><div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="reload" type="button">Reload config</button><button id="probe" type="button">Probe quotas</button><button id="logout">Sign out</button></div></header>
-    <div id="err" role="alert"></div><div id="problems" role="status"></div><div id="note" role="status"></div>
+    <div id="err" role="alert"></div><p class="stale-note" role="status">Bars are gray because these readings may be stale. They return to color when the connection does.</p><div id="problems" role="status"></div><div id="note" role="status"></div>
     <section aria-labelledby="routeStripTitle" id="routeStrip" class="route-strip" data-section="overview">
       <div class="section-head"><div><h2 id="routeStripTitle">Next request goes to</h2><p class="sub">Where each provider's representative models land, from the latest router status</p></div><button id="manualSelection">Manual selection</button></div>
       <div id="routeStripLines"></div><p class="routing-help">Routing forecast, not live traffic. Sessions, request pins and retries can use another account. Per-model targets and configured routes are under Routing.</p>
@@ -1781,6 +1789,7 @@ ${SHARED_HELPERS}
     if (clearConfirmRoute === r.name) {
       cell.appendChild(el('span', 'hint', 'Clear force on ' + r.name + '?'));
       var yes = el('button', 'act', 'Clear');
+      yes.disabled = !connected;
       yes.addEventListener('click', function () {
         clearConfirmRoute = null;
         sendOverride(r.name, expectedFor(r), { clear: true }, null);
@@ -2447,6 +2456,7 @@ ${SHARED_HELPERS}
       document.getElementById('routingManualSelection').disabled = false;
       document.getElementById('reload').disabled = false;
       document.getElementById('connection').textContent = 'Connected · 5s refresh';
+      document.getElementById('connection').className = 'live on';
       recordActivity(s); render(s);
       if (!timer) timer = setInterval(poll, POLL_MS);
     } catch (e) {
@@ -2460,6 +2470,7 @@ ${SHARED_HELPERS}
       if (document.getElementById('accountDialog').open) renderAccountDetails();
       if (lastStatus) renderRoutes(lastStatus);
       document.getElementById('connection').textContent = 'Disconnected';
+      document.getElementById('connection').className = 'live';
       var err = document.getElementById('err'); err.style.display = 'block';
       if (lastStatus) err.textContent = 'Connection lost. ' + (lastUpdated ? 'Showing status received ' + fmtAgo(lastUpdated) + '. Routing and quota may have changed. ' : '') + e.message;
       else {

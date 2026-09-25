@@ -1174,7 +1174,7 @@ function fakeDom() {
     constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attrs = {}; this.style = {}; this.listeners = {}; this.parentNode = null; this.value = ''; this.open = false; this.disabled = false; this.hidden = false; }
     get className() { return this.attrs.class || ''; }
     set className(v) { this.attrs.class = v; }
-    get classList() { const n = this; return { contains: c => n.className.split(/\s+/).includes(c), add() {}, remove() {} }; }
+    get classList() { const n = this, list = () => n.className.split(/\s+/).filter(Boolean); return { contains: c => list().includes(c), add: c => { if (!list().includes(c)) n.className = list().concat(c).join(' '); }, remove: c => { n.className = list().filter(x => x !== c).join(' '); } }; }
     setAttribute(k, v) { this.attrs[k] = String(v); }
     getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
     removeAttribute(k) { delete this.attrs[k]; }
@@ -1994,4 +1994,89 @@ test('T5: bucketLabel names each bucket the way its quota row does; unknown keys
   const rows = groups.shared.concat(groups.session, groups.models).filter(r => r.bucket);
   assert.equal(rows.length, 6);
   for (const r of rows) assert.equal(r.label, bucketLabel(r.bucket));
+});
+
+// The served CSS as { selector, body } rules, media queries flattened.
+function cssRules(html) {
+  const css = html.slice(html.indexOf('<style>') + 7, html.indexOf('</style>')).replace(/\/\*[\s\S]*?\*\//g, '').replace(/@media[^{]*\{/g, '');
+  return [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(m => ({ selector: m[1].trim(), body: m[2] }));
+}
+const rootTokens = html => Object.fromEntries([...cssRules(html).find(r => r.selector === ':root').body.matchAll(/--([\w-]+):\s*(#[0-9a-f]{6})/gi)].map(m => [m[1], m[2].toLowerCase()]));
+
+test('T6: the palette tokens are all in :root, and provider and grade tokens never cross slots', () => {
+  const html = renderDashboardHtml();
+  const tokens = rootTokens(html);
+  const palette = { bg: '#0d1015', panel: '#151920', 'panel-2': '#1b2029', line: '#2a313d', text: '#f0f2f7', dim: '#a0abba', accent: '#b5c7ff',
+    claude: '#e8956a', 'claude-soft': '#2a1d16', codex: '#3fbfd0', 'codex-soft': '#12242a', other: '#a0abba',
+    'grade-ok': '#9ad46e', 'grade-ok-ink': '#b9e394', 'grade-ok-soft': '#1c2a19', 'grade-near': '#f2d060', 'grade-near-ink': '#f5db85', 'grade-near-soft': '#2e2814',
+    'grade-at': '#e8506a', 'grade-at-ink': '#ff9aae', 'grade-at-soft': '#33181e', 'grade-spent': '#e8506a', track: '#262d39' };
+  for (const [name, hex] of Object.entries(palette)) assert.equal(tokens[name], hex, '--' + name);
+  const rules = cssRules(html);
+  for (const r of rules.filter(r => r.selector.includes('[data-provider'))) assert.doesNotMatch(r.body, /--grade-/, r.selector);
+  for (const r of rules.filter(r => r.selector.includes('[data-grade'))) assert.doesNotMatch(r.body, /--claude|--codex/, r.selector);
+  // The legacy status colors are gone; status text uses the grade inks.
+  assert.doesNotMatch(html, /--ok:|--warn:|--bad:|#c0cfff|#c2d0f6|#e0e8ff/);
+});
+
+test('T6: FR 33 contrast of the shipped :root values: text 4.5:1, fills and borders 3:1 on every surface', () => {
+  const t = rootTokens(renderDashboardHtml());
+  const lum = h => { const c = [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255).map(v => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4)); return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
+  const ratio = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  const surfaces = ['bg', 'panel', 'panel-2', 'track', 'claude-soft', 'codex-soft', 'grade-ok-soft', 'grade-near-soft', 'grade-at-soft'].map(k => t[k]).concat('#171c24');
+  const text = ['text', 'dim', 'accent', 'claude', 'codex', 'grade-ok-ink', 'grade-near-ink', 'grade-at-ink'];
+  const fills = ['grade-ok', 'grade-near', 'grade-at', 'grade-spent'];
+  for (const [names, min] of [[text, 4.5], [fills, 3]]) for (const n of names) for (const s of surfaces) assert.ok(ratio(t[n], s) >= min, `--${n} on ${s}: ${ratio(t[n], s).toFixed(2)}`);
+});
+
+test('T6: chrome markup keeps its ids and roles; the nav wraps into chips at 900 px; the login mark carries both tints', () => {
+  const html = renderDashboardHtml();
+  assert.equal(html.split('<script>').length, 2, 'one script block');
+  for (const id of ['keybox', 'key', 'go', 'loginError', 'loginHelp', 'keyLabel', 'app', 'err', 'refresh', 'reload', 'probe', 'logout', 'foot', 'connection']) assert.match(html, new RegExp(`id="${id}"`), id);
+  assert.match(html, /<div id="keybox">\s*<i class="brand-mark" aria-hidden="true"><\/i>/);
+  assert.match(html, /\.brand-mark \{[^}]*linear-gradient\(135deg,var\(--claude\) 0 50%,var\(--codex\) 50% 100%\)/);
+  assert.match(html, /<p id="loginError" role="alert">/);
+  assert.match(html, /#loginError \{ color:var\(--grade-at-ink\);/);
+  assert.match(html, /<div id="err" role="alert">/);
+  assert.match(html, /<p class="stale-note" role="status">/);
+  assert.match(html, /id="connection" role="status"/);
+  assert.match(html, /nav a\[aria-current\] \{ color:var\(--text\); background:var\(--panel-2\); border-left-color:var\(--text\);/);
+  const mobile = html.slice(html.indexOf('@media(max-width:900px)'), html.indexOf('@media(max-width:650px)'));
+  assert.match(mobile, /#app \{ grid-template-columns:minmax\(0,1fr\); grid-template-rows:auto 1fr; \}/);
+  assert.match(mobile, /nav \{ flex-direction:row; flex-wrap:wrap;/);
+  assert.doesNotMatch(mobile, /nowrap|overflow:auto/);
+  assert.match(html, /\.live\.on::before \{ background:var\(--grade-ok\); \}/);
+  assert.match(html, /\.stale \.live::before \{ background:var\(--grade-at\); \}/);
+});
+
+test('T6: a failed poll marks the page stale, disables the write controls but not Refresh, reddens the dot; the next good poll clears it', async () => {
+  const page = await renderPage(routedStatus());
+  const { dom } = page;
+  const controls = ['reload', 'probe', 'manualSelection', 'routingManualSelection'];
+  const routeButtons = () => dom.getElementById('routes').querySelectorAll('button');
+  assert.equal(dom.body.classList.contains('stale'), false);
+  assert.equal(dom.getElementById('connection').className, 'live on');
+  assert.ok(routeButtons().length > 0 && routeButtons().every(b => !b.disabled));
+  await page.refresh({}, 500);
+  assert.equal(dom.body.classList.contains('stale'), true);
+  assert.equal(dom.getElementById('connection').textContent, 'Disconnected');
+  assert.equal(dom.getElementById('connection').className, 'live');
+  for (const id of controls) assert.equal(dom.getElementById(id).disabled, true, id);
+  // Refresh only polls, so it stays the operator's manual retry.
+  assert.equal(dom.getElementById('refresh').disabled, false);
+  assert.ok(routeButtons().every(b => b.disabled), 'Force and Clear follow connected');
+  // Identity survives: rows keep data-provider while the bars go gray.
+  assert.ok(dom.querySelectorAll('tr.account-row').every(r => r.getAttribute('data-provider')));
+  await page.refresh(routedStatus());
+  assert.equal(dom.body.classList.contains('stale'), false);
+  assert.equal(dom.getElementById('connection').className, 'live on');
+  for (const id of ['refresh', 'reload', 'manualSelection', 'routingManualSelection']) assert.equal(dom.getElementById(id).disabled, false, id);
+  assert.ok(routeButtons().every(b => !b.disabled));
+  // A Clear confirmation open when the poll fails: its Clear button goes disabled too.
+  const clearCell = () => dom.getElementById('routes').querySelector('tbody tr').querySelectorAll('td')[1];
+  clearCell().querySelectorAll('.route-actions button')[1].click();
+  assert.equal(clearCell().querySelector('.route-actions').textContent, 'Clear force on codex-default?ClearKeep');
+  assert.equal(clearCell().querySelectorAll('.route-actions button')[0].disabled, false);
+  await page.refresh({}, 500);
+  const confirm = clearCell().querySelectorAll('.route-actions button');
+  assert.deepEqual(confirm.map(b => [b.textContent, b.disabled]), [['Clear', true], ['Keep', false]]);
 });
