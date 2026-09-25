@@ -10,7 +10,7 @@ import {
   accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routeStripLines, problems, STARVED_MIN, STARVED_LIST_MAX,
-  chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows,
+  chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows, RESET_WINDOW_BUCKETS,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder,
 } from '../src/dashboard.js';
 
@@ -1146,13 +1146,14 @@ test('reset history rows date scheduled rolls by the window and early resets by 
     { account: 'b', timing: 'early', windows: [{ ...w, type: 'quota-refill' }, w] },
     { account: 'c', timing: 'uncertain', windows: [w] },
   ]);
+  // Newest first (T4, RT 2); equal times keep their event order.
   assert.deepEqual(rows.map(r => [r.account, r.when, r.what, r.kind]), [
-    ['a', 150, 'Rolled over on schedule', ''],
     ['b', 200, 'Reset early, quota refilled', 'warn'],
     ['b', 200, 'Reset early, window restarted', 'warn'],
     ['c', 200, 'Reset, timing unclear', 'dim'],
+    ['a', 150, 'Rolled over on schedule', ''],
   ]);
-  assert.deepEqual([rows[0].before, rows[0].after, rows[0].window, rows[0].observed, rows[0].resetAt], [19, 2, '5-hour', [100, 200], [150, 900]]);
+  assert.deepEqual([rows[3].before, rows[3].after, rows[3].window, rows[3].observed, rows[3].resetAt], [19, 2, '5-hour', [100, 200], [150, 900]]);
   assert.deepEqual(resetHistoryRows(undefined), []);
   const html = renderDashboardHtml();
   assert.match(html, /id="resetEvents" class="reset-table"/);
@@ -1658,4 +1659,168 @@ test('T3: switch and force dialog options keep the reason the router may skip an
   const force = dom.getElementById('forceAccount').querySelectorAll('option').map(o => o.textContent);
   assert.match(force[0], new RegExp('^Codex · codex-primary · weekly .* · ' + UNAVAILABLE_TEXT.capped.replace(/[()]/g, '\\$&') + '$'));
   assert.doesNotMatch(force[1], /usage cap/);
+});
+
+// ---- T4: Resets view ----
+
+// n reset events, one window each, at shuffled times an hour apart. Every third
+// is early and every fifth unclear, so each row style shows up.
+function resetEvents(n) {
+  const base = Date.now() - 100 * 3600e3;
+  const order = Array.from({ length: n }, (_, i) => (i * 7) % n);
+  return order.map(i => {
+    const timing = i % 3 === 0 ? 'early' : i % 5 === 0 ? 'uncertain' : 'scheduled';
+    const at = base + i * 3600e3;
+    return {
+      account: i % 2 ? 'codex-primary' : 'alex@personal.dev', provider: i % 2 ? 'codex' : 'anthropic', timing,
+      windows: [{ key: 'sevenDay', type: 'restarted-window', before: { label: 'Weekly', utilization: 0.4, at: at - 600e3, resetAt: at }, after: { label: 'Weekly', utilization: 0.01, at, resetAt: at + 7 * 86400e3 } }],
+    };
+  });
+}
+
+function resetStatus(events = resetEvents(25), accounts) {
+  const s = fixtureStatus();
+  const now = Date.now();
+  s.probe.resets = {
+    startedAt: now - 30 * 86400e3, notifications: { enabled: false }, events,
+    accounts: accounts || [
+      { name: 'alex@personal.dev', provider: 'anthropic', totals: { scheduled: 32, early: 1, uncertain: 0 }, lastObservedAt: now - 60e3,
+        windows: { sevenDay: { label: 'Weekly', utilization: 0.6, resetAt: now + 3.6 * 86400e3 }, sevenDayFable: { label: 'Fable weekly', utilization: 0.95, resetAt: now + 3.6 * 86400e3 }, fiveHour: { label: '5-hour', utilization: 0.1, resetAt: now + 3600e3 } },
+        pending: [{ before: { utilization: 0.5 }, after: { label: 'Weekly', utilization: 0.02 } }],
+        credits: { availableCount: 0, credits: [], oauth: { eligible: false, reason: 'surface' }, observedAt: now - 60e3 } },
+      { name: 'codex-primary', provider: 'codex', totals: { scheduled: 4, early: 0, uncertain: 2 }, lastObservedAt: now - 60e3,
+        windows: { sevenDay: { label: 'Weekly', utilization: 0.72, resetAt: now + 1.4 * 86400e3 } }, pending: [],
+        credits: { availableCount: 1, credits: [{ status: 'available', title: 'Rate limit reset', expiresAt: now + 5 * 86400e3 }], observedAt: now - 60e3 } },
+    ],
+  };
+  return s;
+}
+
+const whatCell = tr => tr.querySelectorAll('td').find(td => td.getAttribute('data-label') === 'What happened');
+
+test('T4: the window-to-bucket map names the four watched limits', () => {
+  assert.deepEqual(RESET_WINDOW_BUCKETS, { sevenDay: 'unified7d', fiveHour: 'unified5h', sevenDayFable: 'unified7dFable', sevenDaySonnet: 'unified7dSonnet' });
+  for (const bucket of Object.values(RESET_WINDOW_BUCKETS)) assert.ok(THRESHOLD_BUCKET_KEYS.includes(bucket), bucket);
+  const html = renderDashboardHtml();
+  assert.match(html, /var RESET_WINDOW_BUCKETS = \{/);
+  assert.match(html, /var RESET_HISTORY_DEFAULT = 20;\s*var resetHistoryExpanded = false;/);
+  assert.match(html, /<table id="resetEvents" class="reset-table"><\/table><div id="resetReveal"><\/div>/);
+});
+
+test('T4: the history opens on the newest 20 of 25 rows; the reveal shows all in the same order and survives a re-render', async () => {
+  const events = resetEvents(25);
+  const sorted = resetHistoryRows(events);
+  const { dom, refresh } = await renderPage(resetStatus(events));
+  const bodyRows = () => dom.getElementById('resetEvents').querySelectorAll('tbody tr');
+  const times = () => bodyRows().map(tr => tr.querySelector('td').children[0]);
+  assert.equal(bodyRows().length, 20);
+  const all = sorted.map(r => new Date(r.when).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }));
+  assert.deepEqual(times(), all.slice(0, 20));
+  assert.ok(sorted.every((r, i) => i === 0 || sorted[i - 1].when >= r.when), 'time-descending');
+  const button = () => dom.getElementById('resetReveal').querySelector('#resetShowAll');
+  assert.equal(button().textContent, 'Show all 25 rows');
+  assert.equal(button().getAttribute('aria-expanded'), 'false');
+  assert.equal(button().getAttribute('aria-controls'), 'resetEvents');
+  const opened = button();
+  opened.click();
+  assert.equal(button(), opened, 'the same button, so focus stays on it');
+  assert.equal(bodyRows().length, 25);
+  assert.deepEqual(times(), all);
+  assert.equal(button().textContent, 'Show the latest 20');
+  assert.equal(button().getAttribute('aria-expanded'), 'true');
+  await refresh(resetStatus(events));
+  assert.equal(bodyRows().length, 25, 'the poll re-render keeps the expanded state');
+  assert.equal(button(), opened, 'a poll re-render does not detach the focused button');
+  assert.equal(button().textContent, 'Show the latest 20');
+  button().click();
+  assert.equal(bodyRows().length, 20);
+  assert.equal(button().textContent, 'Show all 25 rows');
+});
+
+test('T4: 20 rows or fewer have no reveal; none reads "No resets seen yet."; a truncated feed keeps the 500 note', async () => {
+  let page = await renderPage(resetStatus(resetEvents(20)));
+  assert.equal(page.dom.getElementById('resetEvents').querySelectorAll('tbody tr').length, 20);
+  assert.equal(page.dom.querySelectorAll('#resetShowAll').length, 0);
+  page = await renderPage(resetStatus([]));
+  assert.equal(page.dom.getElementById('resetEvents').querySelector('tbody').textContent, 'No resets seen yet.');
+  assert.equal(page.dom.querySelectorAll('#resetShowAll').length, 0);
+  page = await renderPage(resetStatus(resetEvents(500)));
+  assert.equal(page.dom.getElementById('resetEvents').querySelectorAll('tbody tr').length, 20);
+  assert.match(page.dom.getElementById('resetHistoryNote').textContent, /Showing the latest 500 events/);
+  assert.equal(page.dom.getElementById('resetReveal').querySelector('#resetShowAll').textContent, 'Show all 500 rows');
+});
+
+test('T4: history rows carry the provider and its label; early is warnt, unclear dim, scheduled neither', async () => {
+  const { dom } = await renderPage(resetStatus(resetEvents(12)));
+  const rows = dom.getElementById('resetEvents').querySelectorAll('tbody tr');
+  for (const tr of rows) {
+    const provider = tr.getAttribute('data-provider');
+    const account = tr.querySelector('td[data-label="Account"]');
+    assert.equal(account.textContent, (provider === 'codex' ? 'codex-primary · Codex' : 'alex@personal.dev · Claude'));
+    assert.equal(account.querySelector('.pv').textContent, provider === 'codex' ? 'Codex' : 'Claude');
+    const what = whatCell(tr);
+    const expected = /early/.test(what.textContent) ? 'warnt' : /unclear/.test(what.textContent) ? 'dim' : '';
+    assert.equal(what.className, expected, what.textContent);
+  }
+  assert.deepEqual(new Set(rows.map(tr => whatCell(tr).className)), new Set(['warnt', 'dim', '']));
+  const html = renderDashboardHtml();
+  assert.match(html, /#resetsSection \.warnt \{ color:var\(--grade-near-ink\); \}/);
+  assert.match(html, /\.reset-table tr\[data-provider="anthropic"\] td:first-child \{ border-left-color:var\(--claude\); \}/);
+});
+
+test('T4: each card has the rail, badge, one totals line, a graded mini bar per window, banked and last-probe lines', async () => {
+  const { dom } = await renderPage(resetStatus());
+  const cards = dom.getElementById('resetAccounts').querySelectorAll('.card');
+  assert.deepEqual(cards.map(c => c.getAttribute('data-provider')), ['anthropic', 'codex']);
+  assert.deepEqual(cards.map(c => c.querySelector('.card-head .badge.provider').textContent), ['Claude', 'Codex']);
+  assert.deepEqual(cards.map(c => c.querySelector('.totals').textContent), ['32 on schedule · 1 early · 0 unclear', '4 on schedule · 0 early · 2 unclear']);
+  assert.equal(cards[0].querySelector('.totals .early b').textContent, '1', 'a non-zero early count is marked for near ink');
+  assert.equal(cards[1].querySelectorAll('.totals .early').length, 0);
+  // Fable weekly grades against its own 100% fleet threshold, the rest at 98%.
+  const minis = cards[0].querySelectorAll('.mini');
+  assert.deepEqual(minis.map(m => [m.querySelector('.lbl').textContent, m.querySelector('.bar').getAttribute('data-grade'), m.querySelector('.bar b').style.left]),
+    [['Weekly', 'ok', '98%'], ['Fable weekly', 'near', '100%'], ['5-hour', 'ok', '98%']]);
+  assert.equal(minis[1].querySelector('.bar').getAttribute('role'), 'meter');
+  assert.match(minis[1].querySelector('.bar').getAttribute('aria-valuetext'), /^95% spent, near, switch at 100%, resets in 3\.6d$/);
+  assert.match(minis[1].querySelector('.num').textContent, /^95% spent · 3\.6d$/);
+  assert.equal(cards[1].querySelectorAll('.mini').length, 1);
+  const lines = c => c.querySelectorAll('p').map(p => p.textContent);
+  assert.deepEqual(lines(cards[0]).slice(1), [
+    'Possible early reset on Weekly, 50% → 2% spent, waiting for the next probe.',
+    'Banked resets: 0 available, checked 1m ago',
+    'Not listed to the proxy by Anthropic; add them under bankedResets in the config.',
+    'Last probed 1m ago',
+  ]);
+  assert.equal(cards[0].querySelectorAll('p.warnt').length, 1, 'the pending early reset is a near-ink line');
+  assert.match(lines(cards[1])[2], /^Rate limit reset · expires /);
+  // One fact per line: no card paragraph runs to a second sentence.
+  for (const text of cards.flatMap(lines)) assert.doesNotMatch(text, /\.\s+\S/, text);
+});
+
+test('T4: no cards waits for the first probe; a cap binds the mini bar tick', async () => {
+  let page = await renderPage(resetStatus([], []));
+  assert.equal(page.dom.getElementById('resetAccounts').textContent, 'Waiting for the first successful quota probe.');
+  const s = resetStatus();
+  s.accounts[2].maxUsage = 0.6;
+  page = await renderPage(s);
+  const bar = page.dom.getElementById('resetAccounts').querySelectorAll('.card')[1].querySelector('.mini .bar');
+  assert.equal(bar.getAttribute('data-grade'), 'at');
+  assert.equal(bar.querySelector('b').className, 'cap');
+  assert.equal(bar.querySelector('b').style.left, '60%');
+  const html = renderDashboardHtml();
+  assert.match(html, /\.mini \{ grid-template-columns:90px minmax\(0,1fr\) 96px; \}/);
+});
+
+test('T4: a Claude and a Codex account with the same name grade their cards against their own limits', async () => {
+  const now = Date.now();
+  const s = resetStatus([], [
+    { name: 'shared', provider: 'anthropic', totals: {}, windows: { sevenDay: { label: 'Weekly', utilization: 0.7, resetAt: now + 86400e3 } }, pending: [], lastObservedAt: now },
+    { name: 'shared', provider: 'codex', totals: {}, windows: { sevenDay: { label: 'Weekly', utilization: 0.7, resetAt: now + 86400e3 } }, pending: [], lastObservedAt: now },
+  ]);
+  s.accounts[0] = { ...s.accounts[0], name: 'shared', switchThreshold: 0.8 };
+  s.accounts[2] = { ...s.accounts[2], name: 'shared', maxUsage: 0.6 };
+  const { dom } = await renderPage(s);
+  const bars = dom.getElementById('resetAccounts').querySelectorAll('.card').map(c => c.querySelector('.mini .bar'));
+  assert.deepEqual(bars.map(b => [b.getAttribute('data-grade'), b.querySelector('b').style.left, b.querySelector('b').className]),
+    [['near', '80%', ''], ['at', '60%', 'cap']]);
 });

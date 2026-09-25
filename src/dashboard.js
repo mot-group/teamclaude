@@ -823,10 +823,18 @@ export function bindingLimit(account, fleetThreshold, fleetThresholds) {
   return best;
 }
 
-// One table row per reset-event window for the Resets view. `when` is the
+// The reset tracker names its watched windows by limit; the grading helpers
+// name them by status bucket. This maps one onto the other so a Resets-view
+// mini bar grades exactly like the account bar for the same limit (FR 21).
+// A window missing here grades against the account's default limit.
+export var RESET_WINDOW_BUCKETS = { sevenDay: 'unified7d', fiveHour: 'unified5h', sevenDayFable: 'unified7dFable', sevenDaySonnet: 'unified7dSonnet' };
+
+// One table row per reset-event window for the Resets view, newest first
+// (RT 2), so the page can cap the table at its head. `when` is the
 // moment the reader cares about: a scheduled roll is the window's own reset
 // time, while an early or unclear reset is only known to lie between two
-// probes, so the probe that confirmed it dates it.
+// probes, so the probe that confirmed it dates it. A row with no readable
+// time sorts last.
 export function resetHistoryRows(events) {
   var rows = [];
   (events || []).forEach(function (event) {
@@ -837,13 +845,15 @@ export function resetHistoryRows(events) {
       else { what = 'Reset, timing unclear'; kind = 'dim'; }
       rows.push({
         when: event.timing === 'scheduled' ? w.before.resetAt : w.after.at,
-        account: event.account, window: w.after.label, what: what, kind: kind,
+        account: event.account, provider: event.provider || null, window: w.after.label, what: what, kind: kind,
         before: Math.round(w.before.utilization * 100), after: Math.round(w.after.utilization * 100),
         observed: [w.before.at, w.after.at], resetAt: [w.before.resetAt, w.after.resetAt],
       });
     });
   });
-  return rows;
+  /** @param {any} v */
+  function time(v) { var t = typeof v === 'number' ? v : Date.parse(v); return isFinite(t) ? t : -Infinity; }
+  return rows.sort(function (a, b) { var ta = time(a.when), tb = time(b.when); return ta === tb ? 0 : tb > ta ? 1 : -1; });
 }
 
 export function sessionActivityText(sessions) {
@@ -871,6 +881,7 @@ const SHARED_CONSTS = [
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var QUOTA_NEAR_BAND = ${QUOTA_NEAR_BAND};`,
+  `var RESET_WINDOW_BUCKETS = ${JSON.stringify(RESET_WINDOW_BUCKETS)};`,
   `var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};`,
 ].join('\n');
 
@@ -995,6 +1006,30 @@ const PAGE = `<!doctype html>
   .reset-table td small { display:block; font-size:11px; margin-top:3px; }
   #resetAccounts .card p { margin-top:8px; }
   #resetAccounts .card p.usage { margin-top:6px; line-height:1.5; }
+  /* Resets: the rail and the provider word are identity; the mini bars are grades. */
+  .card[data-provider] { border-left:3px solid var(--other); }
+  .card[data-provider="anthropic"] { border-left-color:var(--claude); }
+  .card[data-provider="codex"] { border-left-color:var(--codex); }
+  .card-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+  .card-head h3 { font-size:14px; overflow-wrap:anywhere; }
+  #resetAccounts .card p.totals { margin:0 0 4px; font-family:var(--mono); font-size:12px; color:var(--dim); }
+  .totals b { color:var(--text); font-weight:600; }
+  .totals .early b { color:var(--grade-near-ink); }
+  .mini { display:grid; grid-template-columns:110px minmax(0,1fr) 120px; gap:10px; align-items:center; margin-top:10px; font-size:12px; }
+  .mini .lbl { color:var(--dim); }
+  .mini .num { text-align:right; color:var(--dim); font-size:11px; white-space:nowrap; }
+  .mini .num b { color:var(--text); font-weight:600; }
+  #resetAccounts .card .mini + p { margin-top:12px; }
+  #resetAccounts { margin:14px 0; }
+  #resetAccounts .card { margin:0; }
+  #resetAccounts .card p.warnt { font-size:12px; line-height:1.5; }
+  #resetsSection .warnt { color:var(--grade-near-ink); }
+  .reset-table tr[data-provider] td:first-child { border-left:3px solid var(--other); padding-left:13px; }
+  .reset-table tr[data-provider="anthropic"] td:first-child { border-left-color:var(--claude); }
+  .reset-table tr[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
+  .reset-table tr[data-provider="anthropic"] .pv { color:var(--claude); }
+  .reset-table tr[data-provider="codex"] .pv { color:var(--codex); }
+  .reveal { margin:12px 0 0; }
   .account-name { font-size:13px; font-weight:600; display:block; overflow-wrap:anywhere; margin-bottom:7px; }
   .account-meta { color:var(--dim); font-size:11px; margin-top:6px; }
   .badges { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
@@ -1131,7 +1166,7 @@ const PAGE = `<!doctype html>
   @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; overflow:auto; margin-top:18px; } nav a { white-space:nowrap; flex-shrink:0; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; }
     #routes thead { display:none; } #routes,#routes tbody,#routes tr,#routes td { display:block; width:100%; } #routes tr { padding:12px 0; border-bottom:1px solid var(--line); } #routes tr:last-child { border-bottom:0; } #routes tr[data-provider] { border-left:3px solid var(--other); } #routes tr[data-provider="anthropic"] { border-left-color:var(--claude); } #routes tr[data-provider="codex"] { border-left-color:var(--codex); } #routes tr[data-provider] td:first-child { border-left:0; padding-left:16px; } #routes td { border:0; padding:3px 16px; } #routes td[data-label]::before { content:attr(data-label) ": "; color:var(--dim); } #routes .route-actions { padding-top:4px; gap:0 8px; } #routes .route-actions .chip { flex-basis:100%; } #routes .route-actions .act { min-height:44px; } }
   @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:38px; padding:6px 13px; } .route-panel .section-head,.route-strip .section-head { flex-direction:row; flex-wrap:wrap; } .strip-line { grid-template-columns:1fr; gap:4px; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .route-actions .act { width:auto; border-top:0; padding:2px 0; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } }
-  @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } }
+  @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } .reset-table tr[data-provider] { border-left:3px solid var(--other); } .reset-table tr[data-provider="anthropic"] { border-left-color:var(--claude); } .reset-table tr[data-provider="codex"] { border-left-color:var(--codex); } .reset-table tr[data-provider] td:first-child { border-left:0; padding-left:16px; } .mini { grid-template-columns:90px minmax(0,1fr) 96px; } .reveal { width:100%; min-height:44px; } }
 </style>
 </head>
 <body>
@@ -1169,7 +1204,7 @@ const PAGE = `<!doctype html>
         <div class="provider-routing" id="providerRouting"></div><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
       </section>
       <div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
-    <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table></div><p class="usage" id="resetHistoryNote"></p></section>
+    <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table><div id="resetReveal"></div></div><p class="usage" id="resetHistoryNote"></p></section>
     <section data-section="forecast" hidden class="section-body" id="forecastSection">
       <div class="section-head"><div><h2>Subscription forecasts</h2><p class="sub">Account usage includes every machine using that subscription.</p></div><label>Work horizon <select id="forecastHorizon"><option value="2">2 hours</option><option value="8" selected>8 hours</option><option value="24">1 day</option><option value="72">3 days</option><option value="168">7 days</option></select></label></div>
       <div class="card"><p id="forecastSummary" role="status"></p><p class="usage" id="forecastCoverage"></p><p class="usage" id="forecastAssumptions"></p></div>
@@ -1213,6 +1248,11 @@ const PAGE = `<!doctype html>
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
+  // The reset history opens on its newest rows (FR 22); the reveal is page
+  // state kept out here so the 5 s full re-render does not collapse it.
+  var RESET_HISTORY_DEFAULT = 20;
+  var resetHistoryExpanded = false;
+  var resetShowAll = null;
 
 ${SHARED_CONSTS}
 
@@ -1270,6 +1310,24 @@ ${SHARED_HELPERS}
     return ts > Date.now() ? 'resets in ' + fmtIn((ts - Date.now()) / 1000) : 'reset time passed';
   }
 
+  // The graded meter for one bucket (FR 4-6), shared by the account table and
+  // the Resets view's mini bars. The fill follows the Spent/Left toggle; the
+  // grade and the screen-reader text stay on the spent ratio.
+  function gradedBar(label, ratio, lim, grade, reset) {
+    var value = quotaDisplay(ratio, quotaMode);
+    var bar = el('div', 'bar');
+    bar.setAttribute('data-grade', grade);
+    bar.setAttribute('role', 'meter');
+    bar.setAttribute('aria-label', label + ', quota ' + quotaMode);
+    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
+    bar.setAttribute('aria-valuenow', String(value));
+    bar.setAttribute('aria-valuetext', quotaDisplay(ratio, 'spent') + '% spent, ' + grade + ', ' + limitText(lim.kind, lim.limit) + ', ' + reset);
+    var fill = el('i', grade); fill.style.width = value + '%'; bar.appendChild(fill);
+    // The tick sits where the router gates; a fill may run past a cap tick, so a bar can be at well short of full (FR 6).
+    var tick = el('b', lim.kind === 'cap' ? 'cap' : ''); tick.style.left = limitPct(lim.limit); tick.title = limitText(lim.kind, lim.limit); bar.appendChild(tick);
+    return bar;
+  }
+
   // One bucket of one account: label, value, the graded bar with its limit
   // tick, and the reset. binding marks the bucket bindingLimit() named for
   // this account (FR 18). Grade is computed on the spent ratio whatever the
@@ -1293,17 +1351,7 @@ ${SHARED_HELPERS}
     val.appendChild(el('span', 'g', grade));
     head.appendChild(val); row.appendChild(head);
     var reset = resetIn(q.resetAt);
-    var bar = el('div', 'bar');
-    bar.setAttribute('data-grade', grade);
-    bar.setAttribute('role', 'meter');
-    bar.setAttribute('aria-label', q.label + ', quota ' + quotaMode);
-    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
-    bar.setAttribute('aria-valuenow', String(value));
-    bar.setAttribute('aria-valuetext', quotaDisplay(q.ratio, 'spent') + '% spent, ' + grade + ', ' + limitText(lim.kind, lim.limit) + ', ' + reset);
-    var fill = el('i', grade); fill.style.width = value + '%'; bar.appendChild(fill);
-    // The tick sits where the router gates; a fill may run past a cap tick, so a bar can be at well short of full (FR 6).
-    var tick = el('b', lim.kind === 'cap' ? 'cap' : ''); tick.style.left = limitPct(lim.limit); tick.title = limitText(lim.kind, lim.limit); bar.appendChild(tick);
-    row.appendChild(bar);
+    row.appendChild(gradedBar(q.label, q.ratio, lim, grade, reset));
     var resetLine = el('div', 'quota-reset');
     resetLine.appendChild(el('span', '', reset.charAt(0).toUpperCase() + reset.slice(1)));
     var ts = parseTs(q.resetAt);
@@ -1838,14 +1886,115 @@ ${SHARED_HELPERS}
 
   function pct(reading) { return Math.round(reading.utilization * 100); }
 
-  // One line per limit the tracker is watching on an account. A window whose
+  // One mini bar per limit the tracker is watching on an account (FR 21),
+  // graded against the same limit as that bucket's account bar. A window whose
   // reset time has passed is the held pre-expiry reading (see reset-tracker):
-  // the account has not been used since, so there is no live window to show.
-  function windowLine(w) {
+  // the account has not been used since, so it reads "ended".
+  function miniRow(key, w, a, s) {
+    var row = el('div', 'mini');
+    row.appendChild(el('span', 'lbl', w.label));
     var shown = quotaDisplay(w.utilization, quotaMode);
     var due = parseTs(w.resetAt);
-    return el('p', 'usage', w.label + ' · ' + (shown == null ? 'unknown' : shown + '% ' + quotaMode) + ' · '
-      + (!isNaN(due) && due <= Date.now() ? 'ended ' + shortDate(due) + ', no new window yet' : 'resets ' + shortDate(due)));
+    var ended = !isNaN(due) && due <= Date.now();
+    var when = isNaN(due) ? 'reset not reported' : ended ? 'ended' : fmtIn((due - Date.now()) / 1000);
+    if (shown == null) {
+      row.appendChild(el('span', 'bar'));
+      row.appendChild(el('span', 'num', 'unknown · ' + when));
+      return row;
+    }
+    var lim = effectiveLimit(a, RESET_WINDOW_BUCKETS[key] || 'default', s.switchThreshold, s.switchThresholds);
+    var grade = quotaGrade(w.utilization, lim.limit);
+    row.appendChild(gradedBar(w.label, w.utilization, lim, grade, ended ? 'ended ' + shortDate(due) + ', no new window yet' : resetIn(w.resetAt)));
+    var num = el('span', 'num');
+    num.appendChild(el('b', '', shown + '%'));
+    num.appendChild(el('span', '', ' ' + quotaMode + ' · ' + when));
+    if (!isNaN(due)) num.title = (ended ? 'Ended ' : 'Resets ') + shortDate(due);
+    row.appendChild(num);
+    return row;
+  }
+
+  // One count per timing on one line; a non-zero early count reads in near ink.
+  function totalsLine(totals) {
+    var line = el('p', 'totals');
+    [[totals.scheduled, 'on schedule', ''], [totals.early, 'early', 'early'], [totals.uncertain, 'unclear', '']].forEach(function (t, i) {
+      if (i) line.appendChild(el('span', 'sep', ' · '));
+      var part = el('span', t[2] && t[0] ? t[2] : '');
+      part.appendChild(el('b', '', String(t[0] || 0)));
+      part.appendChild(el('span', '', ' ' + t[1]));
+      line.appendChild(part);
+    });
+    return line;
+  }
+
+  function resetCard(account, s) {
+    var card = el('div', 'card');
+    card.setAttribute('data-provider', account.provider || 'unknown');
+    var head = el('div', 'card-head');
+    head.appendChild(el('h3', '', account.name));
+    head.appendChild(el('span', 'badge provider ' + (account.provider || 'unknown'), providerLabel(account.provider)));
+    card.appendChild(head);
+    card.appendChild(totalsLine(account.totals || {}));
+    // Names are unique only within a provider, so match on both: a Claude and a
+    // Codex account may share a display name and still gate at different limits.
+    var provider = account.provider || 'unknown';
+    var a = (s.accounts || []).filter(function (x) { return x.name === account.name && (x.provider || 'unknown') === provider; })[0] || {};
+    var windows = account.windows || {};
+    var keys = Object.keys(windows);
+    if (keys.length) keys.forEach(function (key) { card.appendChild(miniRow(key, windows[key], a, s)); });
+    else card.appendChild(el('p', 'usage', 'No limit windows reported yet.'));
+    (account.pending || []).forEach(function (pending) {
+      card.appendChild(el('p', 'warnt', 'Possible early reset on ' + pending.after.label + ', ' + pct(pending.before) + '% → ' + pct(pending.after) + '% spent, waiting for the next probe.'));
+    });
+    if (account.provider === 'codex' || account.provider === 'anthropic') {
+      var inventory = account.credits;
+      card.appendChild(el('p', 'usage', inventory ? 'Banked resets: ' + inventory.availableCount + ' available' + (inventory.observedAt ? ', checked ' + fmtAgo(inventory.observedAt) : '') : 'Banked resets: unknown'));
+      if (inventory) inventory.credits.filter(function (credit) { return credit.status === 'available'; }).forEach(function (credit) {
+        card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'expired ' : 'expires ') + shortDate(credit.expiresAt) : 'no expiry reported')
+          + (credit.source === 'manual' ? ' · entered manually' : '')));
+      });
+      // Anthropic lists web-issued banked resets to claude.ai sessions only.
+      if (inventory && inventory.oauth && !inventory.oauth.eligible) {
+        var hidden = el('p', 'usage dim', 'Not listed to the proxy by Anthropic; add them under bankedResets in the config.');
+        hidden.title = 'Anthropic lists banked resets to claude.ai sessions only' + (inventory.oauth.reason ? ' (' + inventory.oauth.reason + ')' : '') + '. Copy one from claude.ai Settings > Usage.';
+        card.appendChild(hidden);
+      }
+      if (account.creditError) card.appendChild(el('p', 'warnt', account.creditError + ', showing the last good inventory.'));
+    }
+    card.appendChild(el('p', 'usage', account.lastObservedAt ? 'Last probed ' + fmtAgo(account.lastObservedAt) : 'Not probed yet'));
+    return card;
+  }
+
+  function resetHistoryRow(row) {
+    var tr = el('tr');
+    tr.setAttribute('data-provider', row.provider || 'unknown');
+    tr.title = 'Seen between ' + resetDate(row.observed[0]) + ' and ' + resetDate(row.observed[1]) + '. Reset time ' + resetDate(row.resetAt[0]) + ' → ' + resetDate(row.resetAt[1]) + '.';
+    [['When', shortDate(row.when), ''], ['Account', row.account, ''], ['Limit', row.window, ''],
+      ['What happened', row.what, row.kind === 'warn' ? 'warnt' : row.kind === 'dim' ? 'dim' : ''],
+      ['Spent before → after', row.before + '% → ' + row.after + '%', '']].forEach(function (cell) {
+      var td = el('td', cell[2], cell[1]); td.setAttribute('data-label', cell[0]); tr.appendChild(td);
+      // The probe pair that bounds the detection, visible rather than hover-only.
+      if (cell[0] === 'When') td.appendChild(el('small', 'dim', 'probes ' + shortDate(row.observed[0]) + ' and ' + shortDate(row.observed[1])));
+      // The provider word follows the account name (FR 1); the rail carries the tint.
+      if (cell[0] === 'Account') { var tag = el('span', 'tag', ' · '); tag.appendChild(el('span', 'pv', providerLabel(row.provider))); td.appendChild(tag); }
+    });
+    return tr;
+  }
+
+  // The reveal under the history (FR 22). One button lives for as long as the
+  // history outgrows the cap: the table re-renders around it on every poll,
+  // but the button itself is never detached, so it keeps keyboard focus.
+  function syncResetReveal(total) {
+    var reveal = document.getElementById('resetReveal');
+    if (total <= RESET_HISTORY_DEFAULT) { reveal.textContent = ''; resetShowAll = null; return; }
+    if (!resetShowAll) {
+      resetShowAll = el('button', 'reveal');
+      resetShowAll.setAttribute('id', 'resetShowAll'); resetShowAll.setAttribute('type', 'button');
+      resetShowAll.setAttribute('aria-controls', 'resetEvents');
+      resetShowAll.addEventListener('click', function () { resetHistoryExpanded = !resetHistoryExpanded; if (lastStatus) renderResets(lastStatus); });
+      reveal.textContent = ''; reveal.appendChild(resetShowAll);
+    }
+    resetShowAll.textContent = resetHistoryExpanded ? 'Show the latest ' + RESET_HISTORY_DEFAULT : 'Show all ' + total + ' rows';
+    resetShowAll.setAttribute('aria-expanded', String(resetHistoryExpanded));
   }
 
   function renderResets(s) {
@@ -1854,43 +2003,13 @@ ${SHARED_HELPERS}
     var accounts = document.getElementById('resetAccounts'); accounts.textContent = '';
     var history = document.getElementById('resetEvents'); history.textContent = '';
     var note = document.getElementById('resetHistoryNote'); note.textContent = '';
-    if (!data) { summary.textContent = 'Reset tracking is unavailable on this proxy.'; return; }
+    if (!data) { summary.textContent = 'Reset tracking is unavailable on this proxy.'; syncResetReveal(0); return; }
     var probe = s.probe || {}, notifications = data.notifications || {};
     summary.textContent = (probe.enabled ? 'Each account is probed every ' + fmtIn(probe.intervalSeconds) + '. ' : 'Quota probes are off, so nothing here updates. ')
       + 'Tracking since ' + shortDate(data.startedAt) + '. '
       + (notifications.enabled ? 'Early resets go to Google Chat' + (notifications.pending ? ' (' + notifications.pending + ' waiting to send)' : '') + '.' : 'Google Chat alerts are off.')
       + (data.error ? ' ' + data.error : '') + (notifications.error ? ' ' + notifications.error : '');
-    (data.accounts || []).forEach(function (account) {
-      var card = el('div', 'card');
-      card.appendChild(el('h3', '', account.name));
-      var totals = account.totals || {};
-      var early = totals.early || 0, scheduled = totals.scheduled || 0, unclear = totals.uncertain || 0;
-      card.appendChild(el('p', early ? 'warnt' : '', scheduled + ' on-schedule rollover' + (scheduled === 1 ? '' : 's') + ' · ' + early + ' early reset' + (early === 1 ? '' : 's')
-        + (unclear ? ' · ' + unclear + ' with unclear timing' : '')));
-      var windows = account.windows || {};
-      var keys = Object.keys(windows);
-      if (keys.length) keys.forEach(function (key) { card.appendChild(windowLine(windows[key])); });
-      else card.appendChild(el('p', 'usage', 'No limit windows reported yet.'));
-      (account.pending || []).forEach(function (pending) {
-        card.appendChild(el('p', 'warnt', 'Possible early reset on ' + pending.after.label + ', ' + pct(pending.before) + '% → ' + pct(pending.after) + '% spent. Waiting for the next probe to confirm.'));
-      });
-      if (account.provider === 'codex' || account.provider === 'anthropic') {
-        var inventory = account.credits;
-        card.appendChild(el('p', '', inventory ? 'Banked resets: ' + inventory.availableCount + ' available' + (inventory.observedAt ? ', checked ' + fmtAgo(inventory.observedAt) : '') : 'Banked resets: unknown'));
-        if (inventory) inventory.credits.filter(function (credit) { return credit.status === 'available'; }).forEach(function (credit) {
-          card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'expired ' : 'expires ') + shortDate(credit.expiresAt) : 'no expiry reported')
-            + (credit.source === 'manual' ? ' · entered manually' : '')));
-        });
-        // Anthropic lists web-issued banked resets to claude.ai sessions only.
-        if (inventory && inventory.oauth && !inventory.oauth.eligible) {
-          card.appendChild(el('p', 'usage dim', 'Anthropic does not list banked resets for this account to the proxy' + (inventory.oauth.reason ? ' (' + inventory.oauth.reason + ')' : '')
-            + '. Add one you see in claude.ai Settings > Usage under bankedResets in the config.'));
-        }
-        if (account.creditError) card.appendChild(el('p', 'warnt', account.creditError + '. Showing the last successful inventory.'));
-      }
-      card.appendChild(el('p', 'usage', account.lastObservedAt ? 'Last probed ' + fmtAgo(account.lastObservedAt) : 'Not probed yet'));
-      accounts.appendChild(card);
-    });
+    (data.accounts || []).forEach(function (account) { accounts.appendChild(resetCard(account, s)); });
     if (!(data.accounts || []).length) accounts.appendChild(el('p', 'usage', 'Waiting for the first successful quota probe.'));
     var rows = resetHistoryRows(data.events);
     var head = el('thead'), headRow = el('tr');
@@ -1898,19 +2017,10 @@ ${SHARED_HELPERS}
     head.appendChild(headRow); history.appendChild(head);
     var body = el('tbody');
     if (!rows.length) { var emptyRow = el('tr'), empty = el('td', 'empty', 'No resets seen yet.'); empty.colSpan = 5; emptyRow.appendChild(empty); body.appendChild(emptyRow); }
-    rows.forEach(function (row) {
-      var tr = el('tr');
-      tr.title = 'Seen between ' + resetDate(row.observed[0]) + ' and ' + resetDate(row.observed[1]) + '. Reset time ' + resetDate(row.resetAt[0]) + ' → ' + resetDate(row.resetAt[1]) + '.';
-      [['When', shortDate(row.when), ''], ['Account', row.account, ''], ['Limit', row.window, ''],
-        ['What happened', row.what, row.kind === 'warn' ? 'warnt' : row.kind === 'dim' ? 'dim' : ''],
-        ['Spent before → after', row.before + '% → ' + row.after + '%', '']].forEach(function (cell) {
-        var td = el('td', cell[2], cell[1]); td.setAttribute('data-label', cell[0]); tr.appendChild(td);
-        // The probe pair that bounds the detection, visible rather than hover-only.
-        if (cell[0] === 'When') td.appendChild(el('small', 'dim', 'probes ' + shortDate(row.observed[0]) + ' and ' + shortDate(row.observed[1])));
-      });
-      body.appendChild(tr);
-    });
+    // Newest first, capped until the reader asks for the rest (FR 22, RT 2).
+    (resetHistoryExpanded ? rows : rows.slice(0, RESET_HISTORY_DEFAULT)).forEach(function (row) { body.appendChild(resetHistoryRow(row)); });
     history.appendChild(body);
+    syncResetReveal(rows.length);
     note.textContent = 'Resets are inferred from probe readings, so a small drop or a long gap between probes can be missed.'
       + ((data.events || []).length >= 500 ? ' Showing the latest 500 events; the account counts include older ones.' : '');
   }
