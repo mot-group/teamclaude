@@ -105,6 +105,100 @@ export var THRESHOLD_BUCKET_LABELS = {
   tokens: 'tokens', requests: 'requests',
 };
 
+// How far below the effective limit a bucket counts as `near` (FR 5): 15
+// points, so with the 0.98 default `near` starts at 83%. Written into the
+// page by SHARED_CONSTS, like the two tables above.
+export var QUOTA_NEAR_BAND = 0.15;
+
+/**
+ * The fleet-wide switch threshold for one bucket off the status payload's own
+ * two fields — the wire-shape twin of resolveFleetThreshold in model.js
+ * (`switchThresholds` entry, else its `default`, else `switchThreshold`, else
+ * 0.98). Shared by thresholdBadgeText and effectiveLimit so the badge and the
+ * bar grade agree on the number.
+ * @param {string} bucket
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {number}
+ */
+export function fleetFor(bucket, fleetThreshold, fleetThresholds) {
+  if (fleetThresholds && typeof fleetThresholds === 'object') {
+    var v = fleetThresholds[bucket];
+    if (v == null) v = fleetThresholds.default;
+    if (typeof v === 'number' && isFinite(v)) return v;
+  }
+  return typeof fleetThreshold === 'number' && isFinite(fleetThreshold) ? fleetThreshold : 0.98;
+}
+
+// Ported from model.js (resolveSwitchThreshold / resolveMaxUsage) for the same
+// reason THRESHOLD_BUCKET_KEYS is: the browser never runs an import, and the
+// page must grade an account exactly the way the router rotates it.
+/**
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {string} bucket
+ * @param {number} fleetValue
+ * @returns {number}
+ */
+export function resolveSwitchThreshold(accountThreshold, bucket, fleetValue) {
+  if (typeof accountThreshold === 'number' && isFinite(accountThreshold)) return accountThreshold;
+  if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    var v = accountThreshold[bucket];
+    if (v == null) v = accountThreshold.default;
+    if (typeof v === 'number' && isFinite(v)) return v;
+  }
+  return fleetValue;
+}
+
+/**
+ * @param {number|Object<string, number>|null|undefined} maxUsage
+ * @param {string} bucket
+ * @returns {number|null}  null means uncapped
+ */
+export function resolveMaxUsage(maxUsage, bucket) {
+  if (typeof maxUsage === 'number' && isFinite(maxUsage)) return maxUsage;
+  if (maxUsage && typeof maxUsage === 'object') {
+    var v = maxUsage[bucket];
+    if (v == null) v = maxUsage.default;
+    if (typeof v === 'number' && isFinite(v)) return v;
+  }
+  return null;
+}
+
+/**
+ * The ratio a bucket's bar is graded against (FR 4): the lower of the switch
+ * threshold the router would rotate at and the account's hard maxUsage cap.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {string} bucket
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {{ limit: number, kind: 'threshold'|'cap', threshold: number, cap: number|null }}
+ */
+export function effectiveLimit(account, bucket, fleetThreshold, fleetThresholds) {
+  var a = account || {};
+  var threshold = resolveSwitchThreshold(a.switchThreshold, bucket, fleetFor(bucket, fleetThreshold, fleetThresholds));
+  var cap = resolveMaxUsage(a.maxUsage, bucket);
+  var capped = cap != null && cap < threshold;
+  return { limit: capped ? cap : threshold, kind: capped ? 'cap' : 'threshold', threshold: threshold, cap: cap };
+}
+
+/**
+ * The four-grade scale (FR 5): `spent` at ratio >= 1, `at` from the limit up,
+ * `near` within `band` below the limit, `ok` under that; null for a ratio the
+ * account did not report.
+ * @param {number|null|undefined} ratio
+ * @param {number} limit
+ * @param {number} [band]
+ * @returns {'ok'|'near'|'at'|'spent'|null}
+ */
+export function quotaGrade(ratio, limit, band) {
+  if (typeof ratio !== 'number' || !isFinite(ratio)) return null;
+  if (band == null) band = QUOTA_NEAR_BAND;
+  if (ratio >= 1) return 'spent';
+  if (ratio >= limit) return 'at';
+  if (ratio >= limit - band) return 'near';
+  return 'ok';
+}
+
 /**
  * "switch at 100%" / "switch 7d 90%, fable 80%" — an account's OWN
  * switchThreshold (issue #409), or '' when it has none or every override it
@@ -119,14 +213,7 @@ export var THRESHOLD_BUCKET_LABELS = {
  */
 export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresholds) {
   /** @param {string} bucket */
-  function fleetFor(bucket) {
-    if (fleetThresholds && typeof fleetThresholds === 'object') {
-      var v = fleetThresholds[bucket];
-      if (v == null) v = fleetThresholds.default;
-      if (typeof v === 'number' && isFinite(v)) return v;
-    }
-    return typeof fleetThreshold === 'number' && isFinite(fleetThreshold) ? fleetThreshold : 0.98;
-  }
+  function fleet(bucket) { return fleetFor(bucket, fleetThreshold, fleetThresholds); }
   /** @param {number} v */
   function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
   /** @param {unknown} v */
@@ -140,7 +227,7 @@ export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresh
   if (typeof accountThreshold === 'number') {
     if (!valid(accountThreshold)) return '';
     ownDefault = accountThreshold;
-    if (accountThreshold !== fleetFor('default')) parts.push('at ' + pct(accountThreshold));
+    if (accountThreshold !== fleet('default')) parts.push('at ' + pct(accountThreshold));
   } else if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
     table = accountThreshold;
     ownDefault = table.default;
@@ -148,7 +235,7 @@ export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresh
       var v = table[key];
       if (!valid(v)) return;
       if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
-      if (v !== fleetFor(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
+      if (v !== fleet(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
     });
   }
   // As switchThresholdDiffs in model.js: the account's own default outranks a
@@ -156,10 +243,10 @@ export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresh
   // still move a bucket the fleet names (fleet 7d at 85%, account 0.98 puts
   // that account's 7d at 98%). When the defaults differ, "at N%" already
   // covers every bucket the account does not list.
-  if (valid(ownDefault) && ownDefault === fleetFor('default')) {
+  if (valid(ownDefault) && ownDefault === fleet('default')) {
     THRESHOLD_BUCKET_KEYS.forEach(function (key) {
       if (valid(table[key])) return;
-      if (ownDefault !== fleetFor(key)) parts.push(THRESHOLD_BUCKET_LABELS[key] + ' ' + pct(ownDefault));
+      if (ownDefault !== fleet(key)) parts.push(THRESHOLD_BUCKET_LABELS[key] + ' ' + pct(ownDefault));
     });
   }
   return parts.length ? 'switch ' + parts.join(', ') : '';
@@ -614,17 +701,51 @@ export function quotaDisplay(ratio, mode = 'spent') {
 export function accountQuotaGroups(account = {}) {
   var q = account.quota || {};
   var shared = [];
-  if (q.unified7d != null) shared.push({ label: 'Weekly', ratio: q.unified7d, resetAt: q.unified7dReset });
-  if (q.tokensLimit != null) shared.push({ label: 'Tokens', ratio: q.tokensLimit > 0 && q.tokensRemaining != null ? 1 - q.tokensRemaining / q.tokensLimit : null, resetAt: q.resetsAt });
-  var session = q.unified5h == null ? [] : [{ label: '5-hour', ratio: q.unified5h, resetAt: q.unified5hReset }];
+  if (q.unified7d != null) shared.push({ label: 'Weekly', ratio: q.unified7d, resetAt: q.unified7dReset, bucket: 'unified7d' });
+  if (q.tokensLimit != null) shared.push({ label: 'Tokens', ratio: q.tokensLimit > 0 && q.tokensRemaining != null ? 1 - q.tokensRemaining / q.tokensLimit : null, resetAt: q.resetsAt, bucket: 'tokens' });
+  // The router gates on `requests` too (capExceeded / maxUtilization in
+  // account-manager.js, same 1 - remaining / limit ratio), so it is a row and a
+  // binding-limit candidate. Appended after Tokens so existing rows keep their order.
+  if (q.requestsLimit != null) shared.push({ label: 'Requests', ratio: q.requestsLimit > 0 && q.requestsRemaining != null ? 1 - q.requestsRemaining / q.requestsLimit : null, resetAt: q.resetsAt, bucket: 'requests' });
+  var session = q.unified5h == null ? [] : [{ label: '5-hour', ratio: q.unified5h, resetAt: q.unified5hReset, bucket: 'unified5h' }];
+  // `bucket` is the switchThreshold/maxUsage key the row grades against; a
+  // family the router has no key for (Codex per-model) carries null.
   var models = scopedWeeklyRows(q).map(function (row) {
-    return { label: row.label + ' weekly', ratio: row.utilization, resetAt: row.resetAt };
+    var key = 'unified7d' + row.family.charAt(0).toUpperCase() + row.family.slice(1);
+    return { label: row.label + ' weekly', ratio: row.utilization, resetAt: row.resetAt, bucket: THRESHOLD_BUCKET_KEYS.indexOf(key) === -1 ? null : key };
   });
   Object.keys(q.codexModelBuckets || {}).forEach(function (slug) {
     var bucket = q.codexModelBuckets[slug];
-    models.push({ label: (bucket.name || slug) + ' weekly', ratio: bucket.utilization, resetAt: bucket.resetAt });
+    models.push({ label: (bucket.name || slug) + ' weekly', ratio: bucket.utilization, resetAt: bucket.resetAt, bucket: null });
   });
   return { shared: shared, session: session, models: models };
+}
+
+/**
+ * The one bucket that gates this account's routing soonest (FR 9, 10): of the
+ * THRESHOLD_BUCKET_KEYS buckets the account reports a finite ratio for, the
+ * least headroom (effective limit minus spent ratio); ties go to the earlier
+ * key. Per-model rows (`bucket: null`) never bind. Null when nothing gates.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {{ bucket: string, label: string, ratio: number, limit: number, limitKind: 'threshold'|'cap', headroom: number, grade: 'ok'|'near'|'at'|'spent'|null, resetAt: any }|null}
+ */
+export function bindingLimit(account, fleetThreshold, fleetThresholds) {
+  var groups = accountQuotaGroups(account || {});
+  var best = null;
+  groups.shared.concat(groups.session, groups.models).forEach(function (row) {
+    var order = row.bucket ? THRESHOLD_BUCKET_KEYS.indexOf(row.bucket) : -1;
+    if (order === -1 || typeof row.ratio !== 'number' || !isFinite(row.ratio)) return;
+    var lim = effectiveLimit(account, row.bucket, fleetThreshold, fleetThresholds);
+    var headroom = lim.limit - row.ratio;
+    if (best && (headroom > best.headroom || (headroom === best.headroom && order > THRESHOLD_BUCKET_KEYS.indexOf(best.bucket)))) return;
+    best = {
+      bucket: row.bucket, label: row.label, ratio: row.ratio, limit: lim.limit, limitKind: lim.kind,
+      headroom: headroom, grade: quotaGrade(row.ratio, lim.limit, QUOTA_NEAR_BAND), resetAt: row.resetAt,
+    };
+  });
+  return best;
 }
 
 // One table row per reset-event window for the Resets view. `when` is the
@@ -660,6 +781,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
+  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -672,6 +794,7 @@ const SHARED_CONSTS = [
   `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
+  `var QUOTA_NEAR_BAND = ${QUOTA_NEAR_BAND};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -681,7 +804,21 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TeamClaude</title>
 <style>
-  :root { color-scheme:dark; --bg:#0d1015; --panel:#151920; --line:#2a313d; --text:#f0f2f7; --dim:#a0abba; --accent:#b5c7ff; --ok:#8cd7b0; --warn:#efc17b; --bad:#ffaaa6; }
+  :root {
+    color-scheme:dark;
+    --bg:#0d1015; --panel:#151920; --panel-2:#1b2029; --line:#2a313d; --text:#f0f2f7; --dim:#a0abba; --accent:#b5c7ff;
+    --ok:#8cd7b0; --warn:#efc17b; --bad:#ffaaa6;
+    /* provider tints: identity only (rails, group headers, provider badges). Never a bar fill. */
+    --claude:#e8956a; --claude-soft:#2a1d16;
+    --codex:#3fbfd0; --codex-soft:#12242a;
+    --other:#a0abba; --other-soft:#1b2029;
+    /* quota grades: measurement only (bar fill, grade word, status badge). Never on identity elements. */
+    --grade-ok:#9ad46e; --grade-ok-ink:#b9e394; --grade-ok-soft:#1c2a19;
+    --grade-near:#f2d060; --grade-near-ink:#f5db85; --grade-near-soft:#2e2814;
+    --grade-at:#e8506a; --grade-at-ink:#ff9aae; --grade-at-soft:#33181e;
+    --grade-spent:#e8506a; --grade-spent-ink:#ff9aae; --grade-spent-soft:#33181e;
+    --track:#262d39;
+  }
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 ui-sans-serif,system-ui,sans-serif; }

@@ -10,6 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows,
+  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -772,7 +773,8 @@ test('the page ships the same helper implementations it is tested against', () =
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems,
-    chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome]) {
+    chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
+    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
@@ -937,17 +939,194 @@ test('comparison groups preserve every model limit and independent reset', async
     unified7dFable: 1, unified7dFableReset: 400,
     codexModelBuckets: { spark: { name: 'Spark', utilization: 0.3, resetAt: 500 } },
   } });
-  assert.deepEqual(groups.shared, [{ label: 'Weekly', ratio: 0.2, resetAt: 100 }]);
-  assert.deepEqual(groups.session, [{ label: '5-hour', ratio: 0.1, resetAt: 200 }]);
+  // `bucket` is the switchThreshold/maxUsage key each row grades against;
+  // label, ratio, resetAt and order are what the four page callers read.
+  assert.deepEqual(groups.shared, [{ label: 'Weekly', ratio: 0.2, resetAt: 100, bucket: 'unified7d' }]);
+  assert.deepEqual(groups.session, [{ label: '5-hour', ratio: 0.1, resetAt: 200, bucket: 'unified5h' }]);
   assert.deepEqual(groups.models, [
-    { label: 'Fable weekly', ratio: 1, resetAt: 400 },
-    { label: 'Sonnet weekly', ratio: 0.4, resetAt: 300 },
-    { label: 'Spark weekly', ratio: 0.3, resetAt: 500 },
+    { label: 'Fable weekly', ratio: 1, resetAt: 400, bucket: 'unified7dFable' },
+    { label: 'Sonnet weekly', ratio: 0.4, resetAt: 300, bucket: 'unified7dSonnet' },
+    { label: 'Spark weekly', ratio: 0.3, resetAt: 500, bucket: null },
   ]);
+  assert.equal(accountQuotaGroups({ quota: { tokensLimit: 100, tokensRemaining: 25 } }).shared[0].bucket, 'tokens');
+  assert.deepEqual(accountQuotaGroups({ quota: { unified7d: 0.1, tokensLimit: 10, tokensRemaining: 5, requestsLimit: 40, requestsRemaining: 10, resetsAt: 7 } }).shared.map(r => [r.label, r.ratio, r.bucket, r.resetAt]),
+    [['Weekly', 0.1, 'unified7d', undefined], ['Tokens', 0.5, 'tokens', 7], ['Requests', 0.75, 'requests', 7]]);
+  assert.equal(accountQuotaGroups({ quota: { requestsLimit: 0, requestsRemaining: 0 } }).shared[0].ratio, null);
+  assert.equal(accountQuotaGroups({ quota: { requestsLimit: 10 } }).shared[0].ratio, null);
+  // A family upstream starts metering that the router has no key for is informational.
+  assert.equal(accountQuotaGroups({ quota: { scopedWeekly: { opus: { utilization: 0.1 } } } }).models[0].bucket, null);
   assert.deepEqual(accountQuotaGroups(), { shared: [], session: [], models: [] });
   assert.deepEqual(accountQuotaGroups({}), { shared: [], session: [], models: [] });
   assert.equal(accountQuotaGroups({ quota: { tokensLimit: 0, tokensRemaining: 0 } }).shared[0].ratio, null);
   assert.equal(accountQuotaGroups({ quota: { tokensLimit: 100, tokensRemaining: 25 } }).shared[0].ratio, 0.75);
+});
+
+// The grade, limit and binding-limit helpers (FR 4, 5, 9, 10). The fixture at
+// artifacts/e2e-pm/dashboard-redesign/ux/status-fixture.json has the fleet at
+// { default: 0.98, unified7dFable: 1 } and maxUsage null on every account.
+const FLEET = { threshold: 0.98, table: { default: 0.98, unified7dFable: 1 } };
+const fixtureAlex = { name: 'alex@personal.dev', provider: 'anthropic', quota: {
+  unified5h: 0.01, unified5hReset: 10, unified7d: 0.59, unified7dReset: 20,
+  unified7dFable: 0.95, unified7dFableReset: 30, scopedWeekly: { fable: { utilization: 0.95, resetAt: 30 } },
+} };
+
+test('quotaGrade: four grades, band edge inclusive, at-limit is at, ratio 1 is spent', () => {
+  assert.equal(QUOTA_NEAR_BAND, 0.15);
+  assert.equal(quotaGrade(0.23, 0.98), 'ok');
+  assert.equal(quotaGrade(0.83, 0.98), 'near');
+  assert.equal(quotaGrade(0.829, 0.98), 'ok');
+  assert.equal(quotaGrade(0.98, 0.98), 'at');
+  assert.equal(quotaGrade(0.979, 0.98), 'near');
+  assert.equal(quotaGrade(1, 0.98), 'spent');
+  assert.equal(quotaGrade(1.2, 0.98), 'spent');
+  assert.equal(quotaGrade(0.999, 1), 'near');
+  assert.equal(quotaGrade(1, 1), 'spent');
+  for (const missing of [null, undefined, NaN, '0.5']) assert.equal(quotaGrade(missing, 0.98), null);
+  // Fixture values (FR 5).
+  assert.equal(quotaGrade(0.95, 1.0, QUOTA_NEAR_BAND), 'near');
+  assert.equal(quotaGrade(0.91, 0.98, QUOTA_NEAR_BAND), 'near');
+  assert.equal(quotaGrade(0.23, 0.98, QUOTA_NEAR_BAND), 'ok');
+  // An explicit band is honoured.
+  assert.equal(quotaGrade(0.9, 0.98, 0.05), 'ok');
+  assert.equal(quotaGrade(0.93, 0.98, 0.05), 'near');
+});
+
+test('effectiveLimit: the cap wins only when it is below the threshold', () => {
+  assert.deepEqual(effectiveLimit({ maxUsage: 0.6 }, 'unified7d', 0.98, null), { limit: 0.6, kind: 'cap', threshold: 0.98, cap: 0.6 });
+  assert.deepEqual(effectiveLimit({ maxUsage: 0.99 }, 'unified7d', 0.98, null), { limit: 0.98, kind: 'threshold', threshold: 0.98, cap: 0.99 });
+  assert.deepEqual(effectiveLimit({ maxUsage: null }, 'unified7d', 0.98, null), { limit: 0.98, kind: 'threshold', threshold: 0.98, cap: null });
+  assert.deepEqual(effectiveLimit({}, 'unified7d', 0.98, null), { limit: 0.98, kind: 'threshold', threshold: 0.98, cap: null });
+  // Table form resolves per bucket, `default` covering the rest.
+  const table = { maxUsage: { unified7dFable: 0.5, default: 0.9 } };
+  assert.deepEqual(effectiveLimit(table, 'unified7dFable', FLEET.threshold, FLEET.table), { limit: 0.5, kind: 'cap', threshold: 1, cap: 0.5 });
+  assert.deepEqual(effectiveLimit(table, 'unified7d', FLEET.threshold, FLEET.table), { limit: 0.9, kind: 'cap', threshold: 0.98, cap: 0.9 });
+  // A cap equal to the threshold is not "below" it: the threshold names the limit.
+  assert.equal(effectiveLimit({ maxUsage: 0.98 }, 'unified7d', 0.98, null).kind, 'threshold');
+  // FR 5: maxUsage 0.6 and weekly 0.62 grades `at` even though the threshold is 0.98.
+  assert.equal(quotaGrade(0.62, effectiveLimit({ maxUsage: 0.6 }, 'unified7d', 0.98, null).limit), 'at');
+  assert.equal(resolveMaxUsage({ default: 'x' }, 'unified7d'), null);
+  assert.equal(resolveMaxUsage(Infinity, 'unified7d'), null);
+});
+
+test('switch-threshold precedence: account entry > account default > fleet bucket > fleet default > 0.98', () => {
+  const bucket = 'unified7dFable';
+  const at = (account, threshold = FLEET.threshold, table = FLEET.table) => effectiveLimit(account, bucket, threshold, table).threshold;
+  assert.equal(at({ switchThreshold: { unified7dFable: 0.7, default: 0.8 } }), 0.7);
+  assert.equal(at({ switchThreshold: { default: 0.8 } }), 0.8);
+  assert.equal(at({ switchThreshold: 0.75 }), 0.75);
+  assert.equal(at({}), 1);                 // the fixture's fleet unified7dFable: 1
+  assert.equal(at({}, 0.98, { default: 0.9 }), 0.9);
+  assert.equal(at({}, 0.95, null), 0.95);
+  assert.equal(effectiveLimit({}, bucket, undefined, undefined).threshold, 0.98);
+  // The fleet entry for a bucket outranks the fleet default, but never the account's own default.
+  assert.equal(fleetFor('unified7dFable', 0.98, FLEET.table), 1);
+  assert.equal(fleetFor('unified7d', 0.98, FLEET.table), 0.98);
+  assert.equal(resolveSwitchThreshold({ default: 0.8 }, bucket, 1), 0.8);
+  // An array or garbage account value falls through to the fleet, as in model.js.
+  assert.equal(resolveSwitchThreshold([0.9], bucket, 1), 1);
+  assert.equal(resolveSwitchThreshold({ unified7dFable: 'high' }, bucket, 1), 1);
+  // Per-model Codex buckets grade against the account's default limit.
+  assert.equal(effectiveLimit({ switchThreshold: { default: 0.9 } }, 'default', FLEET.threshold, FLEET.table).limit, 0.9);
+  assert.equal(effectiveLimit({}, 'default', FLEET.threshold, FLEET.table).limit, 0.98);
+});
+
+test('bindingLimit picks the least headroom among gating buckets, never a per-model row', () => {
+  assert.deepEqual(bindingLimit(fixtureAlex, FLEET.threshold, FLEET.table), {
+    bucket: 'unified7dFable', label: 'Fable weekly', ratio: 0.95, limit: 1, limitKind: 'threshold',
+    headroom: 1 - 0.95, grade: 'near', resetAt: 30,
+  });
+  // A Codex account with only per-model buckets reported binds on the shared weekly bucket.
+  const codex = { name: 'codex-secondary', provider: 'codex', quota: {
+    unified7d: 0.91, unified7dReset: 5, codexModelBuckets: { spark: { name: 'Spark', utilization: 0.99, resetAt: 6 } },
+  } };
+  const codexBinding = bindingLimit(codex, FLEET.threshold, FLEET.table);
+  assert.equal(codexBinding.bucket, 'unified7d');
+  assert.equal(codexBinding.grade, 'near');
+  assert.equal(bindingLimit({ quota: { codexModelBuckets: { spark: { utilization: 1 } } } }, 0.98, null), null);
+  // Tie on headroom: the earlier THRESHOLD_BUCKET_KEYS entry wins (5h before 7d, both ahead of Fable).
+  assert.deepEqual(THRESHOLD_BUCKET_KEYS.slice(0, 4), ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable']);
+  assert.equal(bindingLimit({ quota: { unified7d: 0.5, unified5h: 0.5 } }, 0.98, null).bucket, 'unified5h');
+  assert.equal(bindingLimit({ quota: { unified7d: 0.5, unified7dFable: 0.5, unified7dSonnet: 0.5 } }, 0.98, null).bucket, 'unified7d');
+  // Nothing gating reported: null, not a zero-ratio row.
+  assert.equal(bindingLimit({}, 0.98, null), null);
+  assert.equal(bindingLimit({ quota: { unified7d: null, tokensLimit: 0, tokensRemaining: 0 } }, 0.98, null), null);
+  assert.equal(bindingLimit(null, 0.98, null), null);
+  // Headroom is measured against the effective limit, so a capped bucket can bind below a fuller one.
+  const capped = bindingLimit({ maxUsage: { unified7d: 0.6 }, quota: { unified7d: 0.55, unified5h: 0.9 } }, 0.98, null);
+  assert.equal(capped.bucket, 'unified7d');
+  assert.equal(capped.limitKind, 'cap');
+  assert.equal(capped.grade, 'near');
+});
+
+test('an account the server reports as capped or out of quota binds at grade at or spent', () => {
+  // maxUsage is null on every fixture account, so both cap shapes are built by hand.
+  const bare = { name: 'c', unavailable: 'capped', maxUsage: 0.6, quota: { unified7d: 0.62, unified5h: 0.1 } };
+  const table = { name: 't', unavailable: 'capped', maxUsage: { unified7dFable: 0.6, default: 0.95 }, quota: { unified7d: 0.3, unified7dFable: 0.61 } };
+  const quota = { name: 'q', unavailable: 'quota', quota: { unified7d: 1, unified5h: 0.2 } };
+  for (const account of [bare, table, quota]) {
+    const b = bindingLimit(account, FLEET.threshold, FLEET.table);
+    assert.ok(b.grade === 'at' || b.grade === 'spent', `${account.name} binds at ${b.grade}`);
+  }
+  assert.deepEqual([bindingLimit(bare, 0.98, null).bucket, bindingLimit(bare, 0.98, null).limitKind], ['unified7d', 'cap']);
+  assert.deepEqual([bindingLimit(table, 0.98, null).bucket, bindingLimit(table, 0.98, null).limit], ['unified7dFable', 0.6]);
+  assert.equal(bindingLimit(quota, 0.98, null).grade, 'spent');
+  // A requests-only account: the router gates on `requests` (capExceeded in
+  // account-manager.js), so the page must find a binding limit there too.
+  const reqCapped = { name: 'r', unavailable: 'capped', maxUsage: { requests: 0.5 }, quota: { requestsLimit: 100, requestsRemaining: 45, resetsAt: 9 } };
+  assert.deepEqual(bindingLimit(reqCapped, 0.98, null), {
+    bucket: 'requests', label: 'Requests', ratio: 0.55, limit: 0.5, limitKind: 'cap', headroom: 0.5 - 0.55, grade: 'at', resetAt: 9,
+  });
+  const reqSpent = { name: 's', unavailable: 'quota', quota: { requestsLimit: 100, requestsRemaining: 0 } };
+  assert.equal(bindingLimit(reqSpent, 0.98, null).grade, 'spent');
+  assert.equal(bindingLimit({ quota: { requestsLimit: 0, requestsRemaining: 0 } }, 0.98, null), null);
+});
+
+test('requests takes part in least-headroom selection and is last in the tie-break', () => {
+  assert.equal(THRESHOLD_BUCKET_KEYS[THRESHOLD_BUCKET_KEYS.length - 1], 'requests');
+  // Less headroom than the weekly bucket: requests binds.
+  assert.equal(bindingLimit({ quota: { unified7d: 0.5, requestsLimit: 10, requestsRemaining: 1 } }, 0.98, null).bucket, 'requests');
+  // More headroom: weekly binds.
+  assert.equal(bindingLimit({ quota: { unified7d: 0.9, requestsLimit: 10, requestsRemaining: 5 } }, 0.98, null).bucket, 'unified7d');
+  // Exact tie with tokens (same ratio, same limit): tokens is earlier in THRESHOLD_BUCKET_KEYS.
+  assert.equal(bindingLimit({ quota: { tokensLimit: 10, tokensRemaining: 5, requestsLimit: 10, requestsRemaining: 5 } }, 0.98, null).bucket, 'tokens');
+  assert.equal(bindingLimit({ quota: { unified5h: 0.5, requestsLimit: 10, requestsRemaining: 5 } }, 0.98, null).bucket, 'unified5h');
+  // A per-bucket cap on requests lowers its limit, and so its headroom.
+  const b = bindingLimit({ maxUsage: { requests: 0.6 }, quota: { unified7d: 0.5, requestsLimit: 10, requestsRemaining: 5 } }, 0.98, null);
+  assert.deepEqual([b.bucket, b.limitKind, b.grade], ['requests', 'cap', 'near']);
+});
+
+test('the grade helpers run inside the serialized bundle with fixture data', () => {
+  // Each helper reads QUOTA_NEAR_BAND / THRESHOLD_BUCKET_KEYS, which only reach
+  // the page through SHARED_CONSTS; a ReferenceError here is one at first render.
+  const html = renderDashboardHtml();
+  assert.match(html, /var QUOTA_NEAR_BAND = 0\.15;/);
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const page = new Function(`${bundle}; return { fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, accountQuotaGroups };`)();
+  assert.equal(page.quotaGrade(0.95, 1), 'near');
+  assert.equal(page.fleetFor('unified7dFable', FLEET.threshold, FLEET.table), 1);
+  assert.equal(page.resolveSwitchThreshold({ default: 0.8 }, 'unified7d', 0.98), 0.8);
+  assert.equal(page.resolveMaxUsage({ default: 0.6 }, 'unified7d'), 0.6);
+  assert.deepEqual(page.effectiveLimit({ maxUsage: 0.6 }, 'unified7d', 0.98, null), effectiveLimit({ maxUsage: 0.6 }, 'unified7d', 0.98, null));
+  assert.deepEqual(page.bindingLimit(fixtureAlex, FLEET.threshold, FLEET.table), bindingLimit(fixtureAlex, FLEET.threshold, FLEET.table));
+  assert.deepEqual(page.accountQuotaGroups(fixtureAlex), accountQuotaGroups(fixtureAlex));
+});
+
+test('the palette tokens are defined once in :root', () => {
+  const html = renderDashboardHtml();
+  const root = html.slice(html.indexOf(':root {'), html.indexOf('}', html.indexOf(':root {')));
+  for (const [token, hex] of [
+    ['--claude', '#e8956a'], ['--claude-soft', '#2a1d16'], ['--codex', '#3fbfd0'], ['--codex-soft', '#12242a'], ['--other', '#a0abba'],
+    ['--grade-ok', '#9ad46e'], ['--grade-ok-ink', '#b9e394'], ['--grade-ok-soft', '#1c2a19'],
+    ['--grade-near', '#f2d060'], ['--grade-near-ink', '#f5db85'], ['--grade-near-soft', '#2e2814'],
+    ['--grade-at', '#e8506a'], ['--grade-at-ink', '#ff9aae'], ['--grade-at-soft', '#33181e'],
+    ['--grade-spent', '#e8506a'], ['--track', '#262d39'], ['--panel-2', '#1b2029'],
+  ]) {
+    assert.ok(root.includes(`${token}:${hex};`), `${token} missing from :root`);
+    assert.equal(html.split(`${token}:`).length, 2, `${token} defined more than once`);
+  }
+  // One inline script block: the CSP hashes exactly that one.
+  assert.equal(html.split('<script').length, 2);
 });
 
 test('session activity copy distinguishes no observations from unavailable tracking', async () => {
