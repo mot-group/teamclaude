@@ -1533,9 +1533,11 @@ test('T3: a split, partial or pinned-only provider and an empty fleet', async ()
   split.providerRouting[0].models[3].target = 'alex@work.co';
   split.providerRouting[1].models[0].target = null;
   split.providerRouting[1].models[0].route = null;
+  split.providerRouting[1].models[0].pinned = null;
   split.routes[0].override = null;
   const [claude, codex] = routeStripLines(split);
-  assert.deepEqual([claude.headline, claude.resolved, codex.headline, codex.resolved, codex.tag], ['Multiple targets', false, 'Partially available', false, 'pinned']);
+  assert.deepEqual([claude.headline, claude.resolved, codex.headline, codex.resolved, codex.tag], ['Multiple targets', false, 'Partially available', false, null]);
+  assert.deepEqual(codex.groups.map(g => g.tag), [null, 'pinned'], 'the pinned tag sits on the group it applies to');
   const { dom } = await renderPage(split);
   assert.ok(dom.getElementById('routeStripLines').querySelectorAll('.strip-target').every(t => t.matches('.warnt')), 'summary headlines render in near ink');
   const empty = await renderPage({ accounts: [] });
@@ -1546,6 +1548,40 @@ test('T3: a split, partial or pinned-only provider and an empty fleet', async ()
   const served = await renderPage(real);
   assert.equal(served.dom.getElementById('routeStripLines').textContent, 'No accounts configured on the proxy.');
   assert.equal(served.dom.getElementById('routeStripLines').querySelectorAll('.strip-line').length, 0);
+});
+
+const groupText = line => line.groups.map(g => g.labels + ' → ' + g.target + (g.tag ? ' [' + g.tag + ']' : ''));
+
+test('P8: a split strip line names which families went where', async () => {
+  // The exhausted fixture: Fable weekly is spent on both Claude accounts.
+  const exhausted = routedStatus();
+  exhausted.providerRouting[0].models[3].target = null;
+  const [claude, codex] = routeStripLines(exhausted);
+  assert.equal(claude.headline, 'Partially available');
+  assert.deepEqual(groupText(claude), ['Opus, Sonnet, Haiku → alex@personal.dev', 'Fable → no eligible account']);
+  assert.deepEqual(claude.groups.map(g => g.missing), [false, true]);
+  assert.deepEqual([codex.headline, codex.tag, codex.groups], ['codex-secondary', 'forced', []], 'a single target keeps one headline and no sub-lines');
+  const { dom } = await renderPage(exhausted);
+  const [line, single] = dom.getElementById('routeStripLines').querySelectorAll('.strip-line');
+  const subs = line.querySelectorAll('.strip-group');
+  assert.deepEqual(subs.map(g => g.textContent), ['Opus, Sonnet, Haiku → alex@personal.dev', 'Fable → no eligible account']);
+  assert.ok(subs[1].querySelector('span').matches('.badt') && !subs[0].querySelector('span').matches('.badt'), 'only the missing target is in at-grade ink');
+  assert.equal(line.querySelector('.strip-target').textContent, 'Partially available');
+  assert.equal(single.querySelectorAll('.strip-group').length, 0);
+  assert.equal(single.querySelector('.strip-target').textContent, 'codex-secondaryforced');
+
+  const two = routedStatus();
+  two.providerRouting[0].models[3].target = 'alex@work.co';
+  assert.deepEqual(groupText(routeStripLines(two)[0]), ['Opus, Sonnet, Haiku → alex@personal.dev', 'Fable → alex@work.co']);
+  assert.equal(routeStripLines(two)[0].headline, 'Multiple targets');
+
+  const blocked = routedStatus();
+  Object.assign(blocked.providerRouting[0].models[3], { target: null, blocked: true });
+  assert.deepEqual(groupText(routeStripLines(blocked)[0]), ['Opus, Sonnet, Haiku → alex@personal.dev', 'Fable → blocked by policy']);
+
+  const forced = routedStatus();
+  forced.providerRouting[1].models[0].target = 'codex-primary';
+  assert.deepEqual(groupText(routeStripLines(forced)[1]), ['General → codex-primary [forced]', 'gpt-*, *codex* → codex-secondary [forced]']);
 });
 
 test('T3: Overview owns the strip, Routing owns the cards and the table, and #currentAccounts is gone', async () => {

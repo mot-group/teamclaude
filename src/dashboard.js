@@ -581,14 +581,25 @@ export function routeStripLines(status) {
         : target ? ' · ' + target + ' outranks the current account ' + current : '';
       why.push({ text: 'Current: ' + current + reason, warn: !!reason });
     }
+    var tagOf = function (ms) {
+      return ms.some(function (m) { return m.route && forced[m.route]; }) ? 'forced'
+        : ms.some(function (m) { return m.pinned; }) ? 'pinned' : null;
+    };
+    // One group with a target: the headline names an account, not a summary.
+    var resolved = card.groups.length === 1 && !!card.groups[0].target;
     return {
       provider: card.provider, label: providerLabel(card.provider),
       accounts: (s.accounts || []).filter(function (a) { return a.provider === card.provider; }).length,
       headline: card.headline,
-      // One group with a target: the headline names an account, not a summary.
-      resolved: card.groups.length === 1 && !!card.groups[0].target,
-      tag: models.some(function (m) { return m.route && forced[m.route]; }) ? 'forced'
-        : models.some(function (m) { return m.pinned; }) ? 'pinned' : null,
+      resolved: resolved,
+      tag: resolved ? tagOf(models) : null,
+      // A summary headline hides which families went where, so each of
+      // routingCards' groups gets a sub-line; the tag moves to its group.
+      groups: resolved ? [] : card.groups.map(function (g) {
+        return { labels: g.labels.join(', '),
+          target: g.target || (g.blocked ? 'blocked by policy' : 'no eligible account'), missing: !g.target,
+          tag: tagOf(models.filter(function (m) { return (m.target || null) === g.target && !!m.blocked === g.blocked; })) };
+      }),
       why: why,
     };
   }).sort(function (a, b) { return providerOrder(a.provider, b.provider); });
@@ -990,6 +1001,8 @@ const PAGE = `<!doctype html>
   .strip-target { font-size:15px; font-weight:600; overflow-wrap:anywhere; }
   .strip-target .badge { vertical-align:2px; margin-left:6px; font-weight:400; }
   .strip-why { color:var(--dim); font-size:12px; margin-top:3px; overflow-wrap:anywhere; }
+  .strip-group { font-size:13px; margin-top:3px; overflow-wrap:anywhere; }
+  .strip-group .badge { vertical-align:1px; margin-left:6px; }
   .strip-target.warnt,.strip-why.warnt { color:var(--grade-near-ink); }
   .route-strip>.routing-help { padding:12px 20px; margin:0; border-top:1px solid var(--line); font-size:12px; }
   .provider-card { padding:16px 20px 18px 17px; border-right:1px solid var(--line); min-width:0; border-top:3px solid var(--other); }
@@ -1897,6 +1910,12 @@ ${SHARED_HELPERS}
       var target = el('div', 'strip-target' + (line.resolved ? '' : ' warnt'), line.headline);
       if (line.tag) target.appendChild(el('span', 'badge meta', line.tag));
       what.appendChild(target);
+      line.groups.forEach(function (g) {
+        var sub = el('div', 'strip-group', g.labels + ' → ');
+        sub.appendChild(el('span', g.missing ? 'badt' : '', g.target));
+        if (g.tag) sub.appendChild(el('span', 'badge meta', g.tag));
+        what.appendChild(sub);
+      });
       line.why.forEach(function (w) { what.appendChild(el('div', 'strip-why' + (w.warn ? ' warnt' : ''), w.text)); });
       row.appendChild(what);
       wrap.appendChild(row);
