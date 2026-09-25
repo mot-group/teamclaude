@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
+import { UNAVAILABLE_TEXT } from '../src/status-renderer.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
@@ -10,7 +11,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows,
-  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups,
+  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -774,7 +775,7 @@ test('the page ships the same helper implementations it is tested against', () =
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems,
     chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
-    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit]) {
+    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, providerOrder]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
@@ -784,13 +785,13 @@ test('the page ships the same helper implementations it is tested against', () =
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null } = {}) {
+function bootPage({ storedKey = null, dom = null } = {}) {
   const els = new Map();
   const stubEl = () => {
     const target = { style: {}, value: '', textContent: '', className: '', disabled: false };
     return new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
   };
-  const byId = id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
+  const byId = dom ? dom.getElementById : id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
   const store = new Map(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []);
   const localStorage = {
     getItem: k => (store.has(k) ? store.get(k) : null),
@@ -800,7 +801,7 @@ function bootPage({ storedKey = null } = {}) {
   const requests = [];
   const fetch = (url, init) => new Promise(resolve => requests.push({ url, init, resolve }));
   const classList = { add() {}, remove() {} };
-  const document = {
+  const document = dom || {
     body: { classList },
     getElementById: byId,
     createElement: () => stubEl(),
@@ -1156,4 +1157,299 @@ test('reset history rows date scheduled rolls by the window and early resets by 
   const html = renderDashboardHtml();
   assert.match(html, /id="resetEvents" class="reset-table"/);
   assert.match(html, /function resetHistoryRows/);
+});
+
+// ---- T2: the account table, graded bars, binding line, badges, account dialog ----
+
+// A tree the page can render into: children, class, attributes, style,
+// listeners and a small selector engine (compound selectors, descendant
+// combinator, comma lists). Nothing lays out. Elements looked up by id are
+// created on demand as detached roots, like the stub above; an unmatched
+// document.querySelector hands back a throwaway node so the renderers this
+// task does not touch keep going.
+function fakeDom() {
+  class Node {
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attrs = {}; this.style = {}; this.listeners = {}; this.parentNode = null; this.value = ''; this.open = false; this.disabled = false; this.hidden = false; }
+    get className() { return this.attrs.class || ''; }
+    set className(v) { this.attrs.class = v; }
+    get classList() { const n = this; return { contains: c => n.className.split(/\s+/).includes(c), add() {}, remove() {} }; }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+    removeAttribute(k) { delete this.attrs[k]; }
+    appendChild(c) { this.children.push(c); c.parentNode = this; return c; }
+    replaceChildren() { this.children = []; }
+    get textContent() { return this.children.map(c => (typeof c === 'string' ? c : c.textContent)).join(''); }
+    set textContent(v) { this.children = v == null || v === '' ? [] : [String(v)]; }
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+    dispatch(type) { (this.listeners[type] || []).forEach(fn => fn.call(this, { type, key: '' })); }
+    click() { this.dispatch('click'); }
+    focus() {}
+    showModal() { this.open = true; }
+    close() { this.open = false; }
+    *walk() { for (const c of this.children) if (typeof c !== 'string') { yield c; yield* c.walk(); } }
+    matches(compound) {
+      return compound.split(/(?=[.#[])/).every(part => {
+        if (part[0] === '.') return this.className.split(/\s+/).includes(part.slice(1));
+        if (part[0] === '#') return this.attrs.id === part.slice(1);
+        if (part[0] === '[') { const m = /^\[([\w-]+)(?:="?([^\]"]*)"?)?\]$/.exec(part); return m[2] == null ? m[1] in this.attrs : this.attrs[m[1]] === m[2]; }
+        return this.tagName === part.toUpperCase();
+      });
+    }
+    querySelectorAll(selector) {
+      const out = [];
+      for (const n of this.walk()) {
+        if (selector.split(',').some(sel => {
+          const parts = sel.trim().split(/\s+/);
+          if (!n.matches(parts[parts.length - 1])) return false;
+          let i = parts.length - 2, a = n.parentNode;
+          while (i >= 0 && a) { if (a.matches(parts[i])) i--; a = a.parentNode; }
+          return i < 0;
+        })) out.push(n);
+      }
+      return out;
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  }
+  const root = new Node('html');
+  const body = new Node('body'); root.appendChild(body);
+  const byId = new Map();
+  return {
+    body,
+    createElement: tag => new Node(tag),
+    getElementById: id => { if (!byId.has(id)) { const n = new Node('div'); n.attrs.id = id; root.appendChild(n); byId.set(id, n); } return byId.get(id); },
+    querySelectorAll: sel => root.querySelectorAll(sel),
+    querySelector: sel => root.querySelector(sel) || new Node('div'),
+    contains: () => true,
+  };
+}
+
+// The sanitized fixture's four accounts (artifacts/e2e-pm/dashboard-redesign/
+// ux/status-fixture.json), reset times moved relative to now so the countdown
+// wording does not rot.
+function fixtureStatus() {
+  const day = 86400e3, now = Date.now();
+  const acct = (name, provider, quota, extra = {}) => ({ name, provider, type: 'oauth', status: 'active', priority: 0, unavailable: null, disabled: false, maxUsage: null, switchThreshold: null, quota, usage: {}, ...extra });
+  return {
+    switchThreshold: 0.98, switchThresholds: { default: 0.98, unified7dFable: 1 },
+    currentAccounts: { anthropic: 'alex@personal.dev', codex: 'codex-primary' },
+    defaultTargets: { anthropic: 'alex@personal.dev', codex: 'codex-primary' },
+    probe: { enabled: true, intervalSeconds: 600, accounts: [] },
+    accounts: [
+      acct('alex@personal.dev', 'anthropic', { unified5h: 0.01, unified5hReset: now + 5 * 3600e3, unified7d: 0.59, unified7dReset: now + 3.6 * day, unified7dFable: 0.95, unified7dFableReset: now + 3.6 * day, scopedWeekly: { fable: { utilization: 0.95, resetAt: now + 3.6 * day } } }),
+      acct('alex@work.co', 'anthropic', { unified5h: 0, unified7d: 0.23, unified7dReset: now + 4.6 * day, unified7dFable: 0.25, unified7dFableReset: now + 4.6 * day, scopedWeekly: { fable: { utilization: 0.25, resetAt: now + 4.6 * day } } }),
+      acct('codex-primary', 'codex', { unified7d: 0.72, unified7dReset: now + 1.4 * day, codexModelBuckets: {} }),
+      acct('codex-secondary', 'codex', { unified7d: 0.91, unified7dReset: now + 1.4 * day, codexModelBuckets: {} }),
+    ],
+  };
+}
+
+// Boot the page against the fake DOM and answer its first poll. A render error
+// lands in #err (poll's catch), so it is asserted away here rather than hidden.
+async function renderPage(status = fixtureStatus()) {
+  const dom = fakeDom();
+  const page = bootPage({ dom });
+  await page.answer(200, status);
+  assert.notEqual(dom.getElementById('err').style.display, 'block', dom.getElementById('err').textContent);
+  const rowFor = name => dom.querySelectorAll('tr.account-row').find(r => r.querySelector('.account-name').textContent === name);
+  const quotas = node => node.querySelectorAll('.quota').map(q => ({ label: q.querySelector('.lbl').textContent, marked: q.querySelector('.lbl').matches('.binding-mark'), grade: q.getAttribute('data-grade'), bar: q.querySelector('.bar'), val: q.querySelector('.val') }));
+  return { ...page, dom, rowFor, quotas, refresh: async (nextStatus, code = 200) => { dom.getElementById('refresh').click(); await page.answer(code, nextStatus); } };
+}
+
+test('capBadgeText names a bare cap, a table by bucket, and nothing for no cap', () => {
+  assert.equal(capBadgeText(0.6), 'cap 60%');
+  assert.equal(capBadgeText({ unified7d: 0.6, unified7dFable: 0.5 }), 'cap 7d 60%, fable 50%');
+  assert.equal(capBadgeText({ default: 0.9, junk: 0.1 }), 'cap 90%');
+  for (const none of [null, undefined, NaN, [], {}, { unified7d: 'x' }, 'text']) assert.equal(capBadgeText(none), '');
+});
+
+test('T2: rows group by provider under a tinted heading, Claude first, every row and heading tinted by data-provider', async () => {
+  const { dom } = await renderPage();
+  const order = dom.querySelectorAll('#accounts tr').filter(tr => tr.className).map(tr => tr.className + ':' + tr.getAttribute('data-provider'));
+  assert.deepEqual(order, ['provider-heading:anthropic', 'account-row:anthropic', 'account-row:anthropic', 'provider-heading:codex', 'account-row:codex', 'account-row:codex']);
+  const headings = dom.querySelectorAll('tr.provider-heading');
+  assert.deepEqual(headings.map(h => h.textContent), ['Claude · 2 accounts', 'Codex · 2 accounts']);
+  assert.deepEqual(headings.map(h => h.querySelector('b').textContent), ['Claude', 'Codex']);
+  // Text beside the tint on a mixed fleet: the provider badge.
+  assert.deepEqual(dom.querySelectorAll('tr.account-row .badge.provider').map(b => b.className + '=' + b.textContent), ['badge provider anthropic=Claude', 'badge provider anthropic=Claude', 'badge provider codex=Codex', 'badge provider codex=Codex']);
+  // The page string carries both attributes; the CSS tints by them, never inline.
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('data-grade') && html.includes('data-provider'));
+  assert.doesNotMatch(html, /Within reported limits/);
+});
+
+test('T2: Codex stays second behind Claude ahead of an alphabetically earlier provider; no provider groups last', async () => {
+  const s = fixtureStatus();
+  s.accounts.push({ ...s.accounts[3], name: 'az-1', provider: 'azure' }, { ...s.accounts[3], name: 'nobody', provider: null });
+  s.defaultTargets = { codex: 'codex-primary', azure: 'az-1', anthropic: 'alex@personal.dev' };
+  s.currentAccounts = { azure: 'az-1', codex: 'codex-primary', anthropic: 'alex@personal.dev' };
+  const { dom } = await renderPage(s);
+  assert.deepEqual(dom.querySelectorAll('tr.provider-heading').map(h => h.getAttribute('data-provider') + ':' + h.textContent),
+    ['anthropic:Claude · 2 accounts', 'codex:Codex · 2 accounts', 'azure:azure · 1 account', 'unknown:Unknown · 1 account']);
+  // The same comparator orders routeRows' default rows and the current-account line.
+  assert.deepEqual(['codex', 'azure', 'zeta', 'anthropic', '', 'bravo'].sort(providerOrder), ['anthropic', 'codex', 'azure', 'bravo', 'zeta', '']);
+  assert.deepEqual(routeRows({ routes: [{ name: 'r', accounts: [] }], defaultTargets: s.defaultTargets }).filter(r => r.kind === 'default').map(r => r.provider), ['anthropic', 'codex', 'azure']);
+  assert.match(dom.getElementById('currentAccounts').textContent, /^Current account · Claude: .* · Codex: .* · azure: az-1$/);
+});
+
+test('T2: every bar is graded via the effective limit, marks the tick at it, and says so to a screen reader', async () => {
+  const { dom, rowFor, quotas } = await renderPage();
+  const bars = dom.querySelectorAll('#accounts .bar');
+  assert.equal(bars.length, 8);
+  for (const bar of bars) {
+    assert.ok(['ok', 'near', 'at', 'spent'].includes(bar.getAttribute('data-grade')), 'bar has a grade');
+    assert.equal(bar.querySelector('i').className, bar.getAttribute('data-grade'), 'fill class is the grade');
+    assert.equal(bar.getAttribute('role'), 'meter');
+    assert.match(bar.querySelector('b').style.left, /^(98|100)%$/, 'tick at the effective limit');
+  }
+  const alex = quotas(rowFor('alex@personal.dev'));
+  assert.deepEqual(alex.map(q => [q.label, q.grade, q.marked, q.bar.querySelector('b').style.left]), [['Weekly', 'ok', false, '98%'], ['5-hour', 'ok', false, '98%'], ['Fable weekly', 'near', true, '100%']]);
+  assert.match(alex[2].bar.getAttribute('aria-valuetext'), /^95% spent, near, switch at 100%, resets in 3\.\dd$/);
+  assert.equal(alex[2].bar.getAttribute('aria-valuenow'), '95');
+  assert.equal(alex[2].val.textContent, '95% spentnear');
+  assert.equal(alex[2].val.querySelector('.g').textContent, 'near');
+  assert.equal(quotas(rowFor('codex-secondary'))[0].grade, 'near');
+  assert.equal(quotas(rowFor('alex@work.co'))[0].grade, 'ok');
+  for (const q of dom.querySelectorAll('#accounts .quota')) assert.ok(q.querySelector('.val').textContent.endsWith(q.getAttribute('data-grade')), 'value line ends with the grade word');
+});
+
+test('T2: a cap below the threshold binds: red cap tick, fill past it, `at` short of full, per-model rows graded but never marked', async () => {
+  const s = fixtureStatus();
+  const now = Date.now();
+  s.accounts[2].maxUsage = 0.6; s.accounts[2].unavailable = 'capped'; s.accounts[2].quota.unified7d = 0.62;
+  s.accounts[2].quota.codexModelBuckets = { spark: { name: 'Spark', utilization: 0.4, resetAt: now + 86400e3 } };
+  const { rowFor, quotas } = await renderPage(s);
+  const row = rowFor('codex-primary');
+  const q = quotas(row);
+  assert.deepEqual(q.map(x => [x.label, x.grade, x.marked, x.bar.getAttribute('data-grade'), x.bar.querySelector('b').className, x.bar.querySelector('b').style.left, x.bar.querySelector('i').style.width]),
+    [['Weekly', 'at', true, 'at', 'cap', '60%', '62%'], ['Spark weekly', 'ok', false, 'ok', 'cap', '60%', '40%']]);
+  assert.match(q[0].bar.getAttribute('aria-valuetext'), /^62% spent, at, cap 60%, resets in /);
+  const binding = row.querySelector('.binding');
+  assert.equal(binding.getAttribute('data-grade'), 'at');
+  assert.match(binding.querySelector('.sub2').textContent, /^cap 60% · resets in /);
+  // The status badge is the router's own verdict, worded by UNAVAILABLE_TEXT, in the `at` red.
+  assert.deepEqual(row.querySelectorAll('.badges .badge').map(b => [b.className, b.textContent]),
+    [['badge at', UNAVAILABLE_TEXT.capped], ['badge current', 'current'], ['badge provider codex', 'Codex'], ['badge meta cap', 'cap 60%']]);
+});
+
+test('T2: each row has exactly one binding line naming the bucket, percentage, grade, limit kind and countdown; the marked label is that bucket only', async () => {
+  const { dom, rowFor } = await renderPage();
+  for (const row of dom.querySelectorAll('tr.account-row')) {
+    assert.equal(row.querySelectorAll('.binding').length, 1);
+    assert.equal(row.querySelectorAll('.lbl.binding-mark').length, 1);
+    assert.equal(row.querySelector('.binding .dot').getAttribute('aria-hidden'), 'true');
+  }
+  const alex = rowFor('alex@personal.dev').querySelector('.binding');
+  assert.equal(alex.getAttribute('data-grade'), 'near');
+  assert.equal(alex.children[1].textContent, 'Fable weekly 95% spent · near');
+  assert.equal(alex.querySelector('b').textContent, 'Fable weekly');
+  assert.equal(alex.querySelector('.g').textContent, 'near');
+  assert.match(alex.querySelector('.sub2').textContent, /^switch at 100% · resets in 3\.\dd$/);
+  assert.equal(rowFor('alex@personal.dev').querySelector('.lbl.binding-mark').textContent, 'Fable weekly');
+  assert.equal(rowFor('alex@work.co').querySelector('.lbl.binding-mark').textContent, 'Weekly');
+  assert.equal(rowFor('codex-secondary').querySelector('.binding').children[1].textContent, 'Weekly 91% spent · near');
+});
+
+test('T2: the Left toggle changes numbers and fill widths but no grade, and persists under the same key', async () => {
+  const { dom, store } = await renderPage();
+  const grades = () => dom.querySelectorAll('[data-grade]').map(e => e.getAttribute('data-grade')).join();
+  const vals = () => dom.querySelectorAll('.quota .val').map(v => v.textContent).join('|');
+  const widths = () => dom.querySelectorAll('.bar i').map(i => i.style.width).join();
+  const [g, v, w] = [grades(), vals(), widths()];
+  assert.equal(dom.getElementById('quotaSpent').getAttribute('aria-pressed'), 'true');
+  dom.getElementById('quotaLeft').click();
+  assert.equal(grades(), g);
+  assert.notEqual(vals(), v); assert.notEqual(widths(), w);
+  assert.equal(store.get('teamclaude-quota-display'), 'left');
+  assert.equal(dom.getElementById('quotaLeft').getAttribute('aria-pressed'), 'true');
+  assert.match(dom.querySelector('tr.account-row .binding').children[1].textContent, /^Fable weekly 5% left · near$/);
+  assert.match(dom.querySelector('tr.account-row .bar').getAttribute('aria-valuetext'), /^59% spent, ok/, 'aria text stays on the spent ratio');
+});
+
+test('T2: an unreported ratio renders "Not reported" and no bar; no gating bucket reads "No quota reported"', async () => {
+  const s = fixtureStatus();
+  s.accounts = [{ ...s.accounts[0], name: 'blank', quota: { unified7d: null, tokensLimit: 10, tokensRemaining: null } }];
+  const { rowFor } = await renderPage(s);
+  const row = rowFor('blank');
+  assert.equal(row.querySelectorAll('.bar').length, 0);
+  assert.deepEqual(row.querySelectorAll('.quota-unknown').map(e => e.textContent), ['Not reported', 'No window reported', 'No window reported']);
+  assert.equal(row.querySelector('.quota .lbl').textContent, 'Tokens');
+  assert.equal(row.querySelectorAll('.binding').length, 1);
+  assert.equal(row.querySelector('.binding').getAttribute('data-grade'), 'none');
+  assert.equal(row.querySelector('.binding').textContent, 'No quota reported');
+  assert.equal(row.querySelectorAll('.badges .badge').length, 0, 'no status badge for an account with nothing to report');
+});
+
+test('T2: healthy rows carry no status badge; current and threshold-override badges stay; only trouble gets a graded badge', async () => {
+  const s = fixtureStatus();
+  s.accounts[1].switchThreshold = 0.9;
+  s.accounts.push({ ...s.accounts[1], name: 'spent', quota: { unified7d: 1, unified7dReset: Date.now() + 1000 } },
+    { ...s.accounts[1], name: 'login', status: 'error', unavailable: 'error' },
+    { ...s.accounts[1], name: 'hold', status: 'throttled' },
+    { ...s.accounts[1], name: 'off', disabled: true });
+  const { rowFor } = await renderPage(s);
+  const badges = name => rowFor(name).querySelectorAll('.badges .badge').map(b => [b.className, b.textContent]);
+  assert.deepEqual(badges('alex@personal.dev'), [['badge current', 'current'], ['badge provider anthropic', 'Claude']]);
+  assert.deepEqual(badges('alex@work.co'), [['badge provider anthropic', 'Claude'], ['badge meta threshold', 'switch at 90%']]);
+  assert.deepEqual(badges('codex-secondary'), [['badge provider codex', 'Codex']]);
+  assert.deepEqual(badges('spent')[0], ['badge spent', 'Weekly exhausted']);
+  assert.deepEqual(badges('login')[0], ['badge at', UNAVAILABLE_TEXT.error]);
+  assert.deepEqual(badges('hold')[0], ['badge near', 'Rate limited']);
+  assert.deepEqual(badges('off')[0], ['badge error', 'Disabled']);
+  assert.equal(rowFor('spent').querySelector('.bar').getAttribute('data-grade'), 'spent');
+});
+
+test('T2: a single-provider fleet drops the provider badge but keeps the tint on rows and the heading', async () => {
+  const s = fixtureStatus();
+  s.accounts = s.accounts.filter(a => a.provider === 'anthropic');
+  const { dom } = await renderPage(s);
+  assert.equal(dom.querySelectorAll('.badge.provider').length, 0);
+  assert.deepEqual(dom.querySelectorAll('tr.account-row').map(r => r.getAttribute('data-provider')), ['anthropic', 'anthropic']);
+  assert.deepEqual(dom.querySelectorAll('tr.provider-heading').map(r => r.getAttribute('data-provider') + ':' + r.textContent), ['anthropic:Claude · 2 accounts']);
+});
+
+test('T2: the account dialog carries the provider, the binding line above the bars, the same grades as the row, and its stale and gone lines', async () => {
+  const page = await renderPage();
+  const { dom, rowFor, quotas } = page;
+  rowFor('alex@personal.dev').querySelector('button.act').click();
+  const dialog = dom.getElementById('accountDialog');
+  assert.equal(dialog.open, true);
+  assert.equal(dialog.getAttribute('data-provider'), 'anthropic');
+  assert.equal(dom.getElementById('accountDialogTitle').textContent, 'alex@personal.dev');
+  const details = dom.getElementById('accountDetails');
+  assert.deepEqual(details.children.map(c => c.className.split(' ')[0]).slice(0, 4), ['badges', 'binding', 'usage', 'quota']);
+  assert.equal(details.querySelector('.binding').children[1].textContent, 'Fable weekly 95% spent · near');
+  assert.deepEqual(quotas(details).map(q => [q.label, q.grade, q.marked]), quotas(rowFor('alex@personal.dev')).map(q => [q.label, q.grade, q.marked]));
+  assert.equal(details.querySelectorAll('.badge').length, 2);
+  // A failed poll while the dialog is open adds the stale line and keeps everything else.
+  await page.refresh({}, 500);
+  assert.equal(details.querySelector('p.warnt').textContent, 'Connection lost. These quota values may be stale.');
+  assert.equal(details.querySelector('p.warnt').getAttribute('role'), 'status');
+  assert.equal(dom.getElementById('accountManual').disabled, true);
+  // The account leaving the status swaps the body for the existing line and drops the tint.
+  await page.refresh({ ...fixtureStatus(), accounts: [] });
+  assert.equal(details.textContent, 'This account is no longer in the latest status.');
+  assert.equal(dialog.getAttribute('data-provider'), null);
+});
+
+test('T2: the capped account dialog says cap 60% on its binding line and its bar wears the cap tick', async () => {
+  const s = fixtureStatus();
+  s.accounts[2].maxUsage = 0.6; s.accounts[2].unavailable = 'capped'; s.accounts[2].quota.unified7d = 0.62;
+  const { dom, rowFor } = await renderPage(s);
+  rowFor('codex-primary').querySelector('button.act').click();
+  const dialog = dom.getElementById('accountDialog');
+  assert.equal(dialog.getAttribute('data-provider'), 'codex');
+  assert.match(dom.getElementById('accountDetails').querySelector('.binding').textContent, /cap 60%/);
+  assert.ok(dom.getElementById('accountDetails').querySelector('.bar b.cap'));
+  assert.equal(dom.getElementById('accountDetails').querySelector('.bar').getAttribute('data-grade'), 'at');
+});
+
+test('T2: search keeps its id and its empty copy', async () => {
+  const { dom } = await renderPage();
+  const search = dom.getElementById('accountSearch');
+  search.value = 'zzz'; search.dispatch('input');
+  assert.equal(dom.getElementById('accountCount').textContent, '0 of 4 accounts');
+  assert.equal(dom.getElementById('accounts').textContent, 'No matching accounts.');
+  search.value = 'codex'; search.dispatch('input');
+  assert.equal(dom.getElementById('accountCount').textContent, '2 of 4 accounts');
+  assert.deepEqual(dom.querySelectorAll('tr.provider-heading').map(h => h.getAttribute('data-provider')), ['codex']);
 });

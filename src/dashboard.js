@@ -90,6 +90,18 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
+// Provider order everywhere the page lists providers (FR 3): Claude, then
+// Codex, then any other key alphabetically, then an account with no provider.
+// One comparator so the account table groups and routeRows' default rows
+// cannot drift apart.
+/** @param {string|null|undefined} a @param {string|null|undefined} b */
+export function providerOrder(a, b) {
+  var rank = function (p) { return p === 'anthropic' ? 0 : p === 'codex' ? 1 : p ? 2 : 3; };
+  var x = rank(a), y = rank(b);
+  if (x !== y) return x - y;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 // Every bucket switchThreshold can be keyed by, plus the short names the
 // threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
 // and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
@@ -250,6 +262,28 @@ export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresh
     });
   }
   return parts.length ? 'switch ' + parts.join(', ') : '';
+}
+
+/**
+ * "cap 60%" / "cap 7d 60%, fable 50%" — the account's own maxUsage, the hard
+ * limit the router refuses at. It is shown on the account row and dialog (FR
+ * 25 keeps it off Diagnostics), or '' when the account has none.
+ * @param {number|Object<string, number>|null|undefined} maxUsage
+ * @returns {string}
+ */
+export function capBadgeText(maxUsage) {
+  /** @param {number} v */
+  function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  if (typeof maxUsage === 'number') return isFinite(maxUsage) ? 'cap ' + pct(maxUsage) : '';
+  if (!maxUsage || typeof maxUsage !== 'object' || Array.isArray(maxUsage)) return '';
+  var parts = [];
+  Object.keys(maxUsage).forEach(function (key) {
+    var v = maxUsage[key];
+    if (typeof v !== 'number' || !isFinite(v)) return;
+    if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
+    parts.push((key === 'default' ? '' : THRESHOLD_BUCKET_LABELS[key] + ' ') + pct(v));
+  });
+  return parts.length ? 'cap ' + parts.join(', ') : '';
 }
 
 /**
@@ -483,11 +517,7 @@ export function routeRows(status) {
     // the exact ambiguity this table exists to remove. Older servers retain
     // the original single-row fallback.
     var defaults = s.defaultTargets || null;
-    var providers = defaults ? Object.keys(defaults).sort(function (a, b) {
-      if (a === 'anthropic') return -1;
-      if (b === 'anthropic') return 1;
-      return a < b ? -1 : a > b ? 1 : 0;
-    }) : [];
+    var providers = defaults ? Object.keys(defaults).sort(providerOrder) : [];
     if (!providers.length) providers = [rows[0].provider || 'anthropic'];
     providers.forEach(function (provider) {
       var current = (s.currentAccounts && s.currentAccounts[provider]) || s.currentAccount || null;
@@ -778,10 +808,10 @@ export function sessionActivityText(sessions) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
-  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit,
+  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -817,7 +847,8 @@ const PAGE = `<!doctype html>
     --grade-near:#f2d060; --grade-near-ink:#f5db85; --grade-near-soft:#2e2814;
     --grade-at:#e8506a; --grade-at-ink:#ff9aae; --grade-at-soft:#33181e;
     --grade-spent:#e8506a; --grade-spent-ink:#ff9aae; --grade-spent-soft:#33181e;
-    --track:#262d39;
+    --track:#262d39; --tick:#f0f2f7;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   }
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
@@ -876,11 +907,21 @@ const PAGE = `<!doctype html>
   tr:last-child td { border-bottom:0; }
   th.sortable { cursor:pointer; }
   .account-table { table-layout:fixed; }
-  .account-table th:first-child { width:25%; }
+  .account-table th:first-child { width:27%; }
   .account-table th:last-child { width:94px; }
-  .account-table th:nth-child(4) { width:25%; }
-  .account-table .provider-heading th { background:#1b2029; color:#dce4f2; padding:10px 16px; font-weight:600; }
-  .account-table td { padding-top:20px; padding-bottom:20px; }
+  .account-table th:nth-child(4) { width:24%; }
+  /* Provider tint lives on identity slots only: the group band, the row rail, the provider badge, the dialog top border. */
+  .account-table .provider-heading th { padding:9px 16px 9px 13px; font-weight:600; border-left:3px solid var(--other); background:var(--other-soft); color:var(--text); }
+  .account-table .provider-heading[data-provider="anthropic"] th { border-left-color:var(--claude); background:var(--claude-soft); }
+  .account-table .provider-heading[data-provider="codex"] th { border-left-color:var(--codex); background:var(--codex-soft); }
+  .provider-heading th b { font-weight:700; }
+  .provider-heading[data-provider="anthropic"] th b { color:var(--claude); }
+  .provider-heading[data-provider="codex"] th b { color:var(--codex); }
+  .provider-heading th span { color:var(--dim); font-weight:400; }
+  .account-table td { padding-top:18px; padding-bottom:18px; }
+  .account-row td:first-child { border-left:3px solid var(--other); padding-left:13px; }
+  .account-row[data-provider="anthropic"] td:first-child { border-left-color:var(--claude); }
+  .account-row[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
   .reset-table td { padding:12px 16px; }
   .reset-table th:first-child { white-space:nowrap; }
   .reset-table td small { display:block; font-size:11px; margin-top:3px; }
@@ -889,22 +930,48 @@ const PAGE = `<!doctype html>
   .account-name { font-size:13px; font-weight:600; display:block; overflow-wrap:anywhere; margin-bottom:7px; }
   .account-meta { color:var(--dim); font-size:11px; margin-top:6px; }
   .badges { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
-  .badge { display:inline-block; font-size:11px; border-radius:5px; border:1px solid var(--line); padding:3px 7px; color:var(--dim); }
-  .badge.provider { color:var(--text); }
-  .badge.provider.codex { color:var(--accent); border-color:var(--accent); }
+  .badge { display:inline-block; font-size:11px; border-radius:5px; border:1px solid var(--line); padding:2px 7px; color:var(--dim); line-height:1.5; }
+  .badge.provider { color:var(--text); border-color:var(--other); }
+  .badge.provider.anthropic { color:var(--claude); border-color:var(--claude); background:var(--claude-soft); }
+  .badge.provider.codex { color:var(--codex); border-color:var(--codex); background:var(--codex-soft); }
   .badge.meta { color:var(--dim); }
-  .badge.current { color:var(--accent); border-color:var(--accent); }
-  .badge.active { color:var(--ok); background:#192c24; border-color:#2e4c3c; }
-  .badge.throttled,.badge.exhausted { color:var(--warn); background:#30271e; border-color:#51412b; }
-  .badge.error { color:var(--bad); border-color:#68423f; }
-  .quota+.quota { margin-top:18px; }
-  .quota-head { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:5px 12px; margin-bottom:8px; }
+  .badge.current { color:var(--text); border-color:#4a5568; font-weight:600; }
+  /* Status badges use the grade palette, so a badge and a bar of one severity read as the same thing. */
+  .badge.near { color:var(--grade-near-ink); background:var(--grade-near-soft); border-color:var(--grade-near); }
+  .badge.at,.badge.spent,.badge.error { color:var(--grade-at-ink); background:var(--grade-at-soft); border-color:var(--grade-at); }
+  /* The binding-limit line: the one line to read per account. */
+  .binding { display:grid; grid-template-columns:auto minmax(0,1fr); gap:0 8px; align-items:center; margin-top:10px; font-family:var(--mono); font-variant-numeric:tabular-nums; font-size:11.5px; line-height:1.55; color:var(--dim); }
+  .binding .dot { width:8px; height:8px; border-radius:2px; background:var(--dim); }
+  .binding .sub2 { grid-column:2; color:var(--dim); font-size:11px; }
+  .binding[data-grade="ok"] .dot { background:var(--grade-ok); }
+  .binding[data-grade="near"] .dot { background:var(--grade-near); }
+  .binding[data-grade="at"] .dot { background:var(--grade-at); }
+  .binding[data-grade="spent"] .dot { background:var(--grade-spent); }
+  .binding b { color:var(--text); font-weight:600; }
+  .binding .g { font-weight:700; text-transform:uppercase; letter-spacing:.4px; }
+  .binding[data-grade="ok"] .g { color:var(--grade-ok-ink); }
+  .binding[data-grade="near"] .g { color:var(--grade-near-ink); }
+  .binding[data-grade="at"] .g,.binding[data-grade="spent"] .g { color:var(--grade-at-ink); }
+  /* Quota rows and graded bars. Grade lands as a class and data-grade, never an inline color. */
+  .quota+.quota { margin-top:16px; }
+  .quota-head { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:5px 12px; margin-bottom:7px; }
   .quota .lbl { color:var(--dim); font-size:11px; overflow-wrap:anywhere; }
-  .quota .val { font-size:12px; font-weight:600; white-space:nowrap; }
-  .quota .val small { font-size:11px; color:var(--dim); font-weight:400; }
-  .bar { height:5px; border-radius:5px; background:#303744; overflow:hidden; }
-  .bar i { display:block; height:100%; border-radius:5px; background:#a4b9eb; }
-  .bar i.warn { background:#dbb16a; }
+  .quota .lbl.binding-mark::before { content:"▸ "; color:var(--text); }
+  .quota .val { font-size:12px; font-weight:600; white-space:nowrap; font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  .quota .val small { font-size:11px; color:var(--dim); font-weight:400; font-family:ui-sans-serif,system-ui,sans-serif; }
+  .quota .val .g { font-size:10px; font-weight:700; letter-spacing:.4px; text-transform:uppercase; margin-left:6px; font-family:ui-sans-serif,system-ui,sans-serif; }
+  .quota[data-grade="ok"] .g { color:var(--grade-ok-ink); }
+  .quota[data-grade="near"] .g { color:var(--grade-near-ink); }
+  .quota[data-grade="at"] .g,.quota[data-grade="spent"] .g { color:var(--grade-at-ink); }
+  .bar { position:relative; height:6px; border-radius:3px; background:var(--track); }
+  .bar i { display:block; height:100%; border-radius:3px; background:var(--dim); }
+  .bar[data-grade="ok"] i { background:var(--grade-ok); }
+  .bar[data-grade="near"] i { background:var(--grade-near); }
+  .bar[data-grade="at"] i { background:var(--grade-at); }
+  .bar[data-grade="spent"] i { background:var(--grade-spent); background-image:repeating-linear-gradient(135deg,transparent 0 4px,#0d101580 4px 6px); }
+  .bar b { position:absolute; top:-3px; width:2px; height:12px; background:var(--tick); border-radius:1px; transform:translateX(-1px); }
+  .bar b.cap { background:var(--grade-at-ink); width:3px; }
+  .bar b.cap::after { content:""; position:absolute; left:-3px; top:-4px; border:4px solid transparent; border-top-color:var(--grade-at-ink); border-bottom:0; }
   .quota-reset { font-size:11px; color:var(--dim); margin-top:6px; }
   .quota-reset span { display:block; }
   .quota-unknown { color:var(--dim); font-size:12px; }
@@ -944,7 +1011,7 @@ const PAGE = `<!doctype html>
   #note { padding:13px 17px; border:1px solid var(--line); border-radius:8px; }
   #note.warn,.dialog-result.warn { color:var(--warn); } #note.error,.dialog-result.error { color:var(--bad); }
   .stale .provider-routing { opacity:.6; }
-  .stale .bar i { background:#7f8799; }
+  .stale .bar i { background:#7f8799; background-image:none; }
   #keybox { display:none; max-width:440px; margin:12vh auto; padding:30px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
   #keybox input { width:100%; min-height:44px; margin:8px 0 16px; }
   #keybox label { display:block; margin-top:22px; }
@@ -953,6 +1020,8 @@ const PAGE = `<!doctype html>
   .primary { background:#c0cfff; color:#172239; border-color:#c0cfff; font-weight:600; }
   dialog { width:550px; max-width:calc(100% - 32px); max-height:calc(100dvh - 40px); color:var(--text); background:#171c24; border:1px solid #3a4556; border-radius:14px; padding:27px; }
   dialog::backdrop { background:#03060aba; backdrop-filter:blur(3px); }
+  dialog[data-provider="anthropic"] { border-top:3px solid var(--claude); }
+  dialog[data-provider="codex"] { border-top:3px solid var(--codex); }
   .dialog-head { display:flex; align-items:start; justify-content:space-between; gap:20px; margin-bottom:15px; }
   .dialog-head h2 { font-size:22px; overflow-wrap:anywhere; }
   .dialog-head button { padding:5px 12px; min-height:40px; }
@@ -978,7 +1047,7 @@ const PAGE = `<!doctype html>
   footer { color:var(--dim); font-size:11px; margin-top:28px; }
   @media(max-width:1150px) { .main-content { padding:26px; } #app { grid-template-columns:175px minmax(0,1fr); } .sidebar { padding:28px 12px; } .section-head { align-items:start; } .account-tools { justify-content:flex-end; } .account-table th:first-child { width:24%; } .account-table th:last-child { width:68px; } th,td { padding:14px 12px; } }
   @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; overflow:auto; margin-top:18px; } nav a { white-space:nowrap; flex-shrink:0; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; } }
-  @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:38px; padding:6px 13px; } .route-panel .section-head { flex-direction:row; flex-wrap:wrap; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; background:none; border:0; padding:12px 0; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:14px; } .account-table td { border:0; padding:0 0 18px; } .account-table td:last-child { padding:0; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } }
+  @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:38px; padding:6px 13px; } .route-panel .section-head { flex-direction:row; flex-wrap:wrap; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } }
   @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } }
 </style>
 </head>
@@ -1004,7 +1073,7 @@ const PAGE = `<!doctype html>
     </section>
     <section id="accountSection" data-section="overview accounts">
       <div class="section-head"><div><h2>Account capacity <span class="tag" id="accountCount"></span></h2><p class="sub" id="quotaHelp">Bars and percentages show quota spent.</p></div><div class="account-tools"><div class="quota-toggle" role="group" aria-label="Quota display"><button id="quotaSpent" aria-pressed="true">Spent</button><button id="quotaLeft" aria-pressed="false">Left</button></div><input class="search" id="accountSearch" type="search" aria-label="Find an account" placeholder="Find an account"></div></div>
-      <div id="accounts"></div><div class="account-foot"><span id="quotaTimezone"></span><span>Requests, tokens, and account controls are in Details.</span></div>
+      <div id="accounts"></div><div class="account-foot"><span id="quotaTimezone"></span><span>▸ marks the limit the router gates on. Requests, tokens and account controls are in Details.</span></div>
     </section>
     <section data-section="activity" hidden class="section-body">
       <div id="overview" class="stats"></div><div class="split"><section><h2>Request activity</h2><div class="card"><p class="usage">Requests observed while this page is open</p><div class="history" id="history" role="img" aria-label="Request activity"></div><p class="history-label" id="historyLabel">Collecting the first sample...</p></div></section><section><h2>Token accounting</h2><div class="card" id="tokens"></div></section></div>
@@ -1103,60 +1172,106 @@ ${SHARED_HELPERS}
     return (s / 86400).toFixed(1) + 'd';
   }
 
-  function quotaRow(label, ratio, resetAt) {
+  // "switch at 98%" / "cap 60%": the number a bar is graded against, worded by
+  // which of the two limits binds. Rounded like the threshold badge.
+  function limitPct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  function limitText(kind, limit) { return (kind === 'cap' ? 'cap ' : 'switch at ') + limitPct(limit); }
+  function resetIn(resetAt) {
+    var ts = parseTs(resetAt);
+    if (isNaN(ts)) return 'reset time not reported';
+    return ts > Date.now() ? 'resets in ' + fmtIn((ts - Date.now()) / 1000) : 'reset time passed';
+  }
+
+  // One bucket of one account: label, value, the graded bar with its limit
+  // tick, and the reset. binding marks the bucket bindingLimit() named for
+  // this account (FR 18). Grade is computed on the spent ratio whatever the
+  // toggle shows, so Left changes the number and the fill, never the color.
+  function quotaRow(q, a, s, binding) {
     var row = el('div', 'quota');
     var head = el('div', 'quota-head');
-    head.appendChild(el('span', 'lbl', label));
-    var value = quotaDisplay(ratio, quotaMode);
+    head.appendChild(el('span', 'lbl' + (binding ? ' binding-mark' : ''), q.label));
+    var value = quotaDisplay(q.ratio, quotaMode);
     if (value == null) {
       head.appendChild(el('span', 'quota-unknown', 'Not reported'));
       row.appendChild(head);
       return row;
     }
+    // A Codex per-model row has no bucket key and grades against the account's default limit (FR 4).
+    var lim = effectiveLimit(a, q.bucket || 'default', s.switchThreshold, s.switchThresholds);
+    var grade = quotaGrade(q.ratio, lim.limit);
+    row.setAttribute('data-grade', grade);
     var val = el('span', 'val', value + '% ');
     val.appendChild(el('small', '', quotaMode));
+    val.appendChild(el('span', 'g', grade));
     head.appendChild(val); row.appendChild(head);
+    var reset = resetIn(q.resetAt);
     var bar = el('div', 'bar');
+    bar.setAttribute('data-grade', grade);
     bar.setAttribute('role', 'meter');
-    bar.setAttribute('aria-label', label + ', quota ' + quotaMode);
+    bar.setAttribute('aria-label', q.label + ', quota ' + quotaMode);
     bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
     bar.setAttribute('aria-valuenow', String(value));
-    var fill = el('i', ratio >= 1 ? 'warn' : ''); fill.style.width = value + '%'; bar.appendChild(fill); row.appendChild(bar);
-    var reset = el('div', 'quota-reset');
-    var ts = parseTs(resetAt);
-    if (!isNaN(ts)) {
-      reset.appendChild(el('span', '', ts > Date.now() ? 'Resets in ' + fmtIn((ts - Date.now()) / 1000) : 'Reset time passed'));
-      reset.appendChild(el('span', 'quota-date', new Date(ts).toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })));
-    } else reset.textContent = 'Reset time not reported';
-    row.appendChild(reset);
+    bar.setAttribute('aria-valuetext', quotaDisplay(q.ratio, 'spent') + '% spent, ' + grade + ', ' + limitText(lim.kind, lim.limit) + ', ' + reset);
+    var fill = el('i', grade); fill.style.width = value + '%'; bar.appendChild(fill);
+    // The tick sits where the router gates; a fill may run past a cap tick, so a bar can be at well short of full (FR 6).
+    var tick = el('b', lim.kind === 'cap' ? 'cap' : ''); tick.style.left = limitPct(lim.limit); tick.title = limitText(lim.kind, lim.limit); bar.appendChild(tick);
+    row.appendChild(bar);
+    var resetLine = el('div', 'quota-reset');
+    resetLine.appendChild(el('span', '', reset.charAt(0).toUpperCase() + reset.slice(1)));
+    var ts = parseTs(q.resetAt);
+    if (!isNaN(ts)) resetLine.appendChild(el('span', 'quota-date', new Date(ts).toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })));
+    row.appendChild(resetLine);
     return row;
   }
 
-  function accountBadge(a) {
-    var text, kind = '';
-    if (a.disabled) { text = 'Disabled'; kind = 'error'; }
-    else if (a.unavailable) { text = UNAVAILABLE_TEXT[a.unavailable] || a.unavailable; kind = 'throttled'; }
-    else if (a.status === 'error') { text = 'Sign-in needed'; kind = 'error'; }
-    else if (a.status === 'throttled' || a.status === 'exhausted') { text = a.status === 'throttled' ? 'Rate limited' : 'Quota exhausted'; kind = 'throttled'; }
-    else {
-      var groups = accountQuotaGroups(a);
-      var quotas = groups.shared.concat(groups.session, groups.models);
-      var spent = quotas.filter(function (q) { return q.ratio >= 1; });
-      if (spent.length) { text = spent.map(function (q) { return q.label; }).join(', ') + ' exhausted'; kind = 'throttled'; }
-      else if (quotas.some(function (q) { return quotaDisplay(q.ratio) != null; })) { text = 'Within reported limits'; kind = 'active'; }
-      else text = 'Quota unknown';
-    }
-    return el('span', 'badge ' + kind, text);
+  // The one line to read per account (FR 9): the bucket that gates routing
+  // soonest, how far along it is, and the number it is measured against.
+  function bindingLine(b) {
+    var line = el('div', 'binding');
+    var dot = el('span', 'dot'); dot.setAttribute('aria-hidden', 'true'); line.appendChild(dot);
+    if (!b) { line.setAttribute('data-grade', 'none'); line.appendChild(el('span', '', 'No quota reported')); return line; }
+    line.setAttribute('data-grade', b.grade);
+    var main = el('span');
+    main.appendChild(el('b', '', b.label));
+    main.appendChild(el('span', '', ' ' + quotaDisplay(b.ratio, quotaMode) + '% ' + quotaMode + ' · '));
+    main.appendChild(el('span', 'g', b.grade));
+    line.appendChild(main);
+    line.appendChild(el('span', 'sub2', limitText(b.limitKind, b.limit) + ' · ' + resetIn(b.resetAt)));
+    return line;
   }
 
-  function providerName(a) {
-    return a.provider === 'anthropic' ? 'Claude' : a.provider === 'codex' ? 'Codex' : a.provider || 'Other';
+  // Only the states that want a reader (FR 11); a healthy account has no
+  // status badge. Kinds are the grade palette: a self-clearing hold is near,
+  // a refusal is at, an empty bucket is spent, a broken login error.
+  function accountBadge(a) {
+    var text = null, kind = '';
+    if (a.disabled) { text = 'Disabled'; kind = 'error'; }
+    else if (a.unavailable) { text = UNAVAILABLE_TEXT[a.unavailable] || a.unavailable; kind = a.unavailable === 'throttled' || a.unavailable === 'entitlement' ? 'near' : 'at'; }
+    else if (a.status === 'error') { text = 'Sign-in needed'; kind = 'error'; }
+    else if (a.status === 'throttled') { text = 'Rate limited'; kind = 'near'; }
+    else if (a.status === 'exhausted') { text = 'Quota exhausted'; kind = 'spent'; }
+    else {
+      var groups = accountQuotaGroups(a);
+      var spent = groups.shared.concat(groups.session, groups.models).filter(function (q) { return q.ratio >= 1; });
+      if (spent.length) { text = spent.map(function (q) { return q.label; }).join(', ') + ' exhausted'; kind = 'spent'; }
+    }
+    return text ? el('span', 'badge ' + kind, text) : null;
+  }
+
+  // Group order for the account table (FR 3), the same providerOrder routeRows
+  // uses for its default rows. An account with no provider groups last under
+  // the neutral tint.
+  function providerKeys(accounts) {
+    var keys = [];
+    accounts.forEach(function (a) { var p = a.provider || ''; if (keys.indexOf(p) === -1) keys.push(p); });
+    return keys.sort(providerOrder);
   }
 
   function accountBadgeRow(a, s) {
     var row = el('div', 'badges');
-    row.appendChild(accountBadge(a));
-    var showProvider = uniqSorted((s.accounts || []).map(providerName)).length > 1;
+    var status = accountBadge(a);
+    if (status) row.appendChild(status);
+    var showProvider = providerKeys(s.accounts || []).length > 1;
     var badges = accountBadges(a, s.currentAccount, s.currentAccounts || null, null, s.switchThreshold, s.switchThresholds);
     ['current', 'provider', 'meta threshold'].forEach(function (kind) {
       var badge = badges.filter(function (item) {
@@ -1165,6 +1280,8 @@ ${SHARED_HELPERS}
       })[0];
       if (badge) row.appendChild(el('span', 'badge ' + badge.cls, badge.text));
     });
+    var cap = capBadgeText(a.maxUsage);
+    if (cap) row.appendChild(el('span', 'badge meta cap', cap));
     return row;
   }
 
@@ -1172,25 +1289,30 @@ ${SHARED_HELPERS}
     var wrap = document.getElementById('accounts'); wrap.textContent = '';
     var query = document.getElementById('accountSearch').value.toLowerCase();
     var accounts = s.accounts || [];
-    var visible = accounts.filter(function (a) { return (a.name + ' ' + a.type + ' ' + providerName(a)).toLowerCase().indexOf(query) !== -1; });
+    var visible = accounts.filter(function (a) { return (a.name + ' ' + a.type + ' ' + providerLabel(a.provider)).toLowerCase().indexOf(query) !== -1; });
     document.getElementById('accountCount').textContent = visible.length + (query ? ' of ' + accounts.length : '') + ' accounts';
     document.getElementById('quotaSpent').setAttribute('aria-pressed', String(quotaMode === 'spent'));
     document.getElementById('quotaLeft').setAttribute('aria-pressed', String(quotaMode === 'left'));
-    document.getElementById('quotaHelp').textContent = 'Bars and percentages show quota ' + quotaMode + '. Each limit has its own reset.';
+    document.getElementById('quotaHelp').textContent = 'Bars and percentages show quota ' + quotaMode + '. Fill color grades distance to the limit the router gates on; the tick is that limit.';
     if (!visible.length) { wrap.appendChild(el('div', 'empty', query ? 'No matching accounts.' : 'No accounts configured on the proxy.')); return; }
     var scroll = el('div', 'account-table-wrap');
     var table = el('table', 'account-table'); table.setAttribute('aria-label', 'Account capacity');
     var thead = el('thead'), header = el('tr');
     ['Account', 'Weekly / total quota', '5-hour quota', 'Model-specific weekly quota', ''].forEach(function (label) { var th = el('th', '', label); th.scope = 'col'; header.appendChild(th); });
     thead.appendChild(header); table.appendChild(thead);
-    var providers = uniqSorted(visible.map(providerName));
-    providers.forEach(function (provider) {
+    providerKeys(visible).forEach(function (provider) {
       var body = el('tbody'); table.appendChild(body);
-      var members = visible.filter(function (a) { return providerName(a) === provider; });
-      var group = el('tr', 'provider-heading'); var title = el('th', '', provider + ' / ' + members.length + ' accounts'); title.colSpan = 5; title.scope = 'rowgroup'; group.appendChild(title); body.appendChild(group);
+      var members = visible.filter(function (a) { return (a.provider || '') === provider; });
+      var group = el('tr', 'provider-heading'); group.setAttribute('data-provider', provider || 'unknown');
+      var title = el('th'); title.colSpan = 5; title.scope = 'rowgroup';
+      title.appendChild(el('b', '', providerLabel(provider)));
+      title.appendChild(el('span', '', ' · ' + members.length + (members.length === 1 ? ' account' : ' accounts')));
+      group.appendChild(title); body.appendChild(group);
       members.forEach(function (a) {
-        var tr = el('tr', 'account-row');
+        var tr = el('tr', 'account-row'); tr.setAttribute('data-provider', a.provider || 'unknown');
+        var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
         var identity = el('td'); identity.appendChild(el('span', 'account-name', a.name)); identity.appendChild(accountBadgeRow(a, s));
+        identity.appendChild(bindingLine(binding));
         identity.appendChild(el('div', 'account-meta', a.type === 'oauth' ? 'Subscription' : a.type === 'api_key' ? 'API account' : a.type));
         var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0];
         identity.appendChild(el('div', 'account-meta', probe && probe.lastProbedAt ? 'Last probe ' + fmtAgo(probe.lastProbedAt) + (probe.error ? ' · Failed' : '') : 'Quota reading time not reported'));
@@ -1198,7 +1320,7 @@ ${SHARED_HELPERS}
         var groups = accountQuotaGroups(a);
         ['shared', 'session', 'models'].forEach(function (key, index) {
           var td = el('td'); td.setAttribute('data-label', ['Weekly / total quota','5-hour quota','Model-specific weekly quota'][index]);
-          groups[key].forEach(function (q) { td.appendChild(quotaRow(q.label, q.ratio, q.resetAt)); });
+          groups[key].forEach(function (q) { td.appendChild(quotaRow(q, a, s, !!binding && binding.bucket === q.bucket)); });
           if (!groups[key].length) td.appendChild(el('span', 'quota-unknown', key === 'shared' ? 'Not reported' : 'No window reported'));
           tr.appendChild(td);
         });
@@ -1211,14 +1333,19 @@ ${SHARED_HELPERS}
   function renderAccountDetails() {
     var a = ((lastStatus || {}).accounts || []).filter(function (a) { return a.name === detailAccount; })[0];
     var wrap = document.getElementById('accountDetails'); wrap.textContent = '';
+    var dialog = document.getElementById('accountDialog');
     document.getElementById('accountManual').disabled = !connected || !a;
-    if (!a) { wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
+    if (!a) { dialog.removeAttribute('data-provider'); wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
+    dialog.setAttribute('data-provider', a.provider || 'unknown');
     document.getElementById('accountDialogTitle').textContent = a.name;
-    wrap.appendChild(accountBadgeRow(a, lastStatus || {}));
+    var s = lastStatus || {};
+    wrap.appendChild(accountBadgeRow(a, s));
     if (!connected) { var warning = el('p', 'warnt', 'Connection lost. These quota values may be stale.'); warning.setAttribute('role', 'status'); wrap.appendChild(warning); }
-    wrap.appendChild(el('p', 'usage', providerName(a) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
+    var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
+    wrap.appendChild(bindingLine(binding));
+    wrap.appendChild(el('p', 'usage', providerLabel(a.provider) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
     var groups = accountQuotaGroups(a);
-    groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q.label, q.ratio, q.resetAt)); });
+    groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q, a, s, !!binding && binding.bucket === q.bucket)); });
     var q = a.quota || {}, u = a.usage || {};
     if (a.provider === 'anthropic') wrap.appendChild(el('p', 'usage', 'Recent Claude session IDs: ' + (typeof a.sessions === 'number' ? a.sessions : 'not reported') + '. Only IDs active within two minutes or with a request in flight are counted.'));
     if (q.planType) wrap.appendChild(el('p', 'usage', 'Plan: ' + q.planType));
@@ -1547,11 +1674,7 @@ ${SHARED_HELPERS}
     }
     var current = document.getElementById('currentAccounts');
     var currentAccounts = s.currentAccounts || null;
-    var providers = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
-      if (a === 'anthropic') return -1;
-      if (b === 'anthropic') return 1;
-      return a < b ? -1 : a > b ? 1 : 0;
-    }) : [];
+    var providers = currentAccounts ? Object.keys(currentAccounts).sort(providerOrder) : [];
     if (providers.length) {
       current.textContent = 'Current account · ' + providers.map(function (provider) {
         return providerLabel(provider) + ': ' + (currentAccounts[provider] || 'none');
@@ -1807,7 +1930,7 @@ ${SHARED_HELPERS}
   function showSwitch(name) {
     var select = document.getElementById('switchAccount'); select.textContent = '';
     var placeholder = el('option', '', 'Choose an account'); placeholder.value = ''; select.appendChild(placeholder);
-    ((lastStatus || {}).accounts || []).forEach(function (a) { var option = el('option', '', a.name + ' · ' + providerName(a)); option.value = a.name; select.appendChild(option); });
+    ((lastStatus || {}).accounts || []).forEach(function (a) { var option = el('option', '', a.name + ' · ' + providerLabel(a.provider)); option.value = a.name; select.appendChild(option); });
     select.value = name || ''; document.getElementById('switchResult').textContent = '';
     updateSwitchHelp(); document.getElementById('switchDialog').showModal();
   }
