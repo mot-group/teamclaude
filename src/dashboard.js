@@ -535,6 +535,49 @@ export function routeRows(status) {
   return rows;
 }
 
+// The Overview strip (FR 13): one line per routingCards() entry, in
+// providerOrder whatever order the server listed them. The headline
+// is the card's own, so the strip and the Routing cards cannot disagree; the
+// tag says a forced or pinned route sits behind it. `why` carries the default
+// row (only when it differs from the headline) and the current account, with
+// the outranks / is-blocked wording the routes table used to print on its
+// default rows, so dropping those rows loses no sentence.
+export function routeStripLines(status) {
+  var s = status || {};
+  var defaults = {};
+  routeRows(s).forEach(function (r) { if (r.kind === 'default') defaults[r.provider] = r; });
+  var forced = {};
+  (s.routes || []).forEach(function (r) { if (r.override && r.override.account) forced[r.name] = true; });
+  return routingCards(s).map(function (card, i) {
+    var models = ((s.providerRouting || [])[i] || {}).models || [];
+    var def = defaults[card.provider] || null;
+    var target = def ? def.target : null;
+    var current = (s.currentAccounts && s.currentAccounts[card.provider]) || s.currentAccount || null;
+    var why = [];
+    if (target && target !== card.headline) why.push({ text: 'Default target: ' + target, warn: false });
+    if (current && current === card.headline) why.push({ text: 'Also the current account', warn: false });
+    else if (current) {
+      // Like the old default row: any default that is not the current account
+      // explains itself, even a null one (nothing can serve); only "outranks"
+      // needs an account to name.
+      var reason = !def || target === current ? ''
+        : def.currentUnavailable ? ' · current account ' + current + ' is blocked: ' + (UNAVAILABLE_TEXT[def.currentUnavailable] || def.currentUnavailable)
+        : target ? ' · ' + target + ' outranks the current account ' + current : '';
+      why.push({ text: 'Current: ' + current + reason, warn: !!reason });
+    }
+    return {
+      provider: card.provider, label: providerLabel(card.provider),
+      accounts: (s.accounts || []).filter(function (a) { return a.provider === card.provider; }).length,
+      headline: card.headline,
+      // One group with a target: the headline names an account, not a summary.
+      resolved: card.groups.length === 1 && !!card.groups[0].target,
+      tag: models.some(function (m) { return m.route && forced[m.route]; }) ? 'forced'
+        : models.some(function (m) { return m.pinned; }) ? 'pinned' : null,
+      why: why,
+    };
+  }).sort(function (a, b) { return providerOrder(a.provider, b.provider); });
+}
+
 // The override as one chip after the target. `state` is the server's own
 // answer to whether the forced account is actually serving the route, so the
 // page never re-derives it from quota bars: `unavailable` means traffic is
@@ -709,7 +752,9 @@ export function problems(status) {
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
     var why = ATTENTION[a.unavailable];
-    if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
+    // provider and account let the banner tint the line and lead with the
+    // provider word (FR 1); the text itself stays provider-neutral.
+    if (why) out.push({ severity: 'warn', kind: 'account', provider: a.provider || null, account: a.name, text: 'Account ' + a.name + ' ' + why + '.' });
   });
 
   // Deliberately no spend line. `usedMinor` is month-to-date overage, so on a
@@ -809,7 +854,7 @@ export function sessionActivityText(sessions) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, routingCards, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
+  switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText,
 ].map(fn => fn.toString()).join('\n\n');
@@ -817,7 +862,8 @@ const SHARED_HELPERS = [
 // The constants ride along: `problems` closes over the thresholds and
 // `accountBadges` over the reset-credit cut-off, so a page without them would
 // ReferenceError on first render. The same goes for the two tables
-// `thresholdBadgeText` reads.
+// `thresholdBadgeText` reads and the UNAVAILABLE_TEXT wording
+// `routeStripLines` quotes.
 const SHARED_CONSTS = [
   `var STARVED_MIN = ${STARVED_MIN};`,
   `var STARVED_LIST_MAX = ${STARVED_LIST_MAX};`,
@@ -825,6 +871,7 @@ const SHARED_CONSTS = [
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var QUOTA_NEAR_BAND = ${QUOTA_NEAR_BAND};`,
+  `var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -886,9 +933,30 @@ const PAGE = `<!doctype html>
   .route-panel { background:var(--panel); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
   .route-panel .section-head { padding:17px 20px; margin:0; border-bottom:1px solid var(--line); }
   .provider-routing { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
-  .provider-card { padding:18px 20px; border-right:1px solid var(--line); min-width:0; }
+  /* Overview routing strip: one line per provider, the only home of the default target and current account. */
+  .route-strip { background:var(--panel); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
+  .route-strip .section-head { padding:15px 20px; margin:0; border-bottom:1px solid var(--line); }
+  .strip-line { display:grid; grid-template-columns:150px minmax(0,1fr); gap:14px; padding:14px 20px 14px 17px; border-left:3px solid var(--other); border-bottom:1px solid var(--line); align-items:baseline; }
+  .strip-line:last-child { border-bottom:0; }
+  .strip-line[data-provider="anthropic"] { border-left-color:var(--claude); }
+  .strip-line[data-provider="codex"] { border-left-color:var(--codex); }
+  .strip-provider b { font-weight:700; }
+  .strip-line[data-provider="anthropic"] .strip-provider b { color:var(--claude); }
+  .strip-line[data-provider="codex"] .strip-provider b { color:var(--codex); }
+  .strip-provider small { display:block; color:var(--dim); font-size:11px; }
+  .strip-target { font-size:15px; font-weight:600; overflow-wrap:anywhere; }
+  .strip-target .badge { vertical-align:2px; margin-left:6px; font-weight:400; }
+  .strip-why { color:var(--dim); font-size:12px; margin-top:3px; overflow-wrap:anywhere; }
+  .strip-target.warnt,.strip-why.warnt { color:var(--grade-near-ink); }
+  .route-strip>.routing-help { padding:12px 20px; margin:0; border-top:1px solid var(--line); font-size:12px; }
+  .provider-card { padding:16px 20px 18px 17px; border-right:1px solid var(--line); min-width:0; border-top:3px solid var(--other); }
+  .provider-card[data-provider="anthropic"] { border-top-color:var(--claude); }
+  .provider-card[data-provider="codex"] { border-top-color:var(--codex); }
   .provider-card:last-child { border-right:0; }
   .provider-card h3 { color:var(--dim); font-size:12px; font-weight:500; margin-bottom:8px; }
+  .provider-card h3 b { font-weight:600; }
+  .provider-card[data-provider="anthropic"] h3 b { color:var(--claude); }
+  .provider-card[data-provider="codex"] h3 b { color:var(--codex); }
   .provider-target { font-size:15px; font-weight:600; overflow-wrap:anywhere; }
   .provider-models { color:var(--dim); font-size:12px; margin-top:8px; overflow-wrap:anywhere; }
   .route-panel>.routing-help { padding:12px 20px; margin:0; border-top:1px solid var(--line); font-size:12px; }
@@ -1006,11 +1074,17 @@ const PAGE = `<!doctype html>
   .history-label { color:var(--dim); font-size:12px; }
   #err,#note,#problems { display:none; margin:0 0 20px; font-size:13px; }
   #err { border:1px solid #68503c; background:#282019; padding:14px 17px; border-radius:8px; color:var(--warn); }
-  #problems>div { border:1px solid #68503c; background:#282019; padding:12px 17px; border-radius:8px; margin-bottom:9px; color:var(--warn); }
-  #problems>.bad { border-color:#6b4142; background:#2b1e21; color:var(--bad); }
+  #problems>div { border:1px solid #5a4a1e; border-left-width:3px; background:var(--grade-near-soft); padding:12px 17px 12px 14px; border-radius:8px; margin-bottom:9px; color:var(--grade-near-ink); }
+  #problems>div[data-provider] { border-left-color:var(--other); }
+  #problems>div[data-provider="anthropic"] { border-left-color:var(--claude); }
+  #problems>div[data-provider="codex"] { border-left-color:var(--codex); }
+  #problems .pv { font-weight:700; }
+  #problems>div[data-provider="anthropic"] .pv { color:var(--claude); }
+  #problems>div[data-provider="codex"] .pv { color:var(--codex); }
+  #problems>.bad { border-color:#6b2f3c; background:var(--grade-at-soft); color:var(--grade-at-ink); }
   #note { padding:13px 17px; border:1px solid var(--line); border-radius:8px; }
   #note.warn,.dialog-result.warn { color:var(--warn); } #note.error,.dialog-result.error { color:var(--bad); }
-  .stale .provider-routing { opacity:.6; }
+  .stale .route-strip,.stale .provider-routing { opacity:.6; }
   .stale .bar i { background:#7f8799; background-image:none; }
   #keybox { display:none; max-width:440px; margin:12vh auto; padding:30px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
   #keybox input { width:100%; min-height:44px; margin:8px 0 16px; }
@@ -1027,7 +1101,9 @@ const PAGE = `<!doctype html>
   .dialog-head button { padding:5px 12px; min-height:40px; }
   .dialog-help { color:var(--dim); font-size:13px; margin:14px 0 20px; }
   dialog label { display:block; font-size:12px; margin:18px 0 8px; }
-  dialog select { width:100%; min-height:44px; }
+  dialog select { width:100%; min-height:44px; border-left:4px solid var(--line); }
+  dialog select[data-provider="anthropic"] { border-left-color:var(--claude); }
+  dialog select[data-provider="codex"] { border-left-color:var(--codex); }
   .explain { background:#202631; border:1px solid #354050; border-radius:8px; padding:14px 17px; color:#c5cedd; font-size:12px; margin:18px 0; }
   .explain ul { margin:9px 0 0; padding-left:18px; }
   .explain li+li { margin-top:8px; }
@@ -1036,18 +1112,25 @@ const PAGE = `<!doctype html>
   .force-modes label { display:flex; align-items:center; gap:9px; margin:10px 0 0; font-size:13px; }
   .force-modes input { width:16px; height:16px; padding:0; flex:0 0 auto; accent-color:#c0cfff; }
   .force-modes p { margin:5px 0 0 25px; }
-  #routes td .act+.act { margin-left:12px; }
+  /* Force controls live in the route's target cell, not a column of their own. */
+  .route-actions { display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-top:6px; }
+  .route-actions .act { min-height:32px; padding:2px 0; }
   #routes .chip { display:inline-block; }
+  #routes .chip.chip-line { display:block; margin-top:4px; }
+  #routes tr[data-provider] td:first-child { border-left:3px solid var(--other); padding-left:13px; }
+  #routes tr[data-provider="anthropic"] td:first-child { border-left-color:var(--claude); }
+  #routes tr[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
   .dialog-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:23px; }
   .dialog-result { font-size:13px; padding:13px 0; }
   #accountDetails .quota { margin:18px 0; }
   #accountDetails .quota-reset { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   #accountDetails .quota .lbl { font-size:13px; }
-  .section-body>h2 { margin:26px 0 12px; }
+  .section-body>h2,#routesWrap>h2 { margin:26px 0 12px; }
   footer { color:var(--dim); font-size:11px; margin-top:28px; }
-  @media(max-width:1150px) { .main-content { padding:26px; } #app { grid-template-columns:175px minmax(0,1fr); } .sidebar { padding:28px 12px; } .section-head { align-items:start; } .account-tools { justify-content:flex-end; } .account-table th:first-child { width:24%; } .account-table th:last-child { width:68px; } th,td { padding:14px 12px; } }
-  @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; overflow:auto; margin-top:18px; } nav a { white-space:nowrap; flex-shrink:0; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; } }
-  @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:38px; padding:6px 13px; } .route-panel .section-head { flex-direction:row; flex-wrap:wrap; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } }
+  @media(max-width:1150px) { .main-content { padding:26px; } #app { grid-template-columns:175px minmax(0,1fr); } .sidebar { padding:28px 12px; } .section-head { align-items:start; } .account-tools { justify-content:flex-end; } .account-table th:first-child { width:24%; } .account-table th:last-child { width:68px; } th,td { padding:14px 12px; } .strip-line { grid-template-columns:120px minmax(0,1fr); } }
+  @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; overflow:auto; margin-top:18px; } nav a { white-space:nowrap; flex-shrink:0; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; }
+    #routes thead { display:none; } #routes,#routes tbody,#routes tr,#routes td { display:block; width:100%; } #routes tr { padding:12px 0; border-bottom:1px solid var(--line); } #routes tr:last-child { border-bottom:0; } #routes tr[data-provider] { border-left:3px solid var(--other); } #routes tr[data-provider="anthropic"] { border-left-color:var(--claude); } #routes tr[data-provider="codex"] { border-left-color:var(--codex); } #routes tr[data-provider] td:first-child { border-left:0; padding-left:16px; } #routes td { border:0; padding:3px 16px; } #routes td[data-label]::before { content:attr(data-label) ": "; color:var(--dim); } #routes .route-actions { padding-top:4px; gap:0 8px; } #routes .route-actions .chip { flex-basis:100%; } #routes .route-actions .act { min-height:44px; } }
+  @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:38px; padding:6px 13px; } .route-panel .section-head,.route-strip .section-head { flex-direction:row; flex-wrap:wrap; } .strip-line { grid-template-columns:1fr; gap:4px; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .route-actions .act { width:auto; border-top:0; padding:2px 0; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } }
   @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } }
 </style>
 </head>
@@ -1067,9 +1150,9 @@ const PAGE = `<!doctype html>
   <main id="mainContent" class="main-content">
     <header class="topline"><div><div class="eyebrow" id="breadcrumb">Dashboard / Overview</div><h1 id="pageTitle">Routing & capacity</h1><p class="sub" id="summary">Where requests are expected to go. How much quota each account has used.</p></div><div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="reload" type="button">Reload config</button><button id="probe" type="button">Probe quotas</button><button id="logout">Sign out</button></div></header>
     <div id="err" role="alert"></div><div id="problems" role="status"></div><div id="note" role="status"></div>
-    <section aria-labelledby="modelRoutingTitle" id="modelRouting" class="route-panel" data-section="overview routing">
-      <div class="section-head"><div><h2 id="modelRoutingTitle">Expected routing</h2><p class="sub">Representative models, based on the latest router status</p></div><button id="manualSelection">Manual selection</button></div>
-      <div class="provider-routing" id="providerRouting"></div><p class="routing-help" id="currentAccounts" role="status" hidden></p><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
+    <section aria-labelledby="routeStripTitle" id="routeStrip" class="route-strip" data-section="overview">
+      <div class="section-head"><div><h2 id="routeStripTitle">Next request goes to</h2><p class="sub">Where each provider's representative models land, from the latest router status</p></div><button id="manualSelection">Manual selection</button></div>
+      <div id="routeStripLines"></div><p class="routing-help">Routing forecast, not live traffic. Sessions, request pins and retries can use another account. Per-model targets and configured routes are under Routing.</p>
     </section>
     <section id="accountSection" data-section="overview accounts">
       <div class="section-head"><div><h2>Account capacity <span class="tag" id="accountCount"></span></h2><p class="sub" id="quotaHelp">Bars and percentages show quota spent.</p></div><div class="account-tools"><div class="quota-toggle" role="group" aria-label="Quota display"><button id="quotaSpent" aria-pressed="true">Spent</button><button id="quotaLeft" aria-pressed="false">Left</button></div><input class="search" id="accountSearch" type="search" aria-label="Find an account" placeholder="Find an account"></div></div>
@@ -1080,7 +1163,12 @@ const PAGE = `<!doctype html>
       <div id="clientsWrap"><h2>Clients</h2><div class="card"><table id="clients"></table></div></div><div id="dimensionsWrap"></div>
       <section id="sessionsWrap"><h2>Claude session activity</h2><p class="sub" id="sessionActivity"></p><p class="usage" id="sessionKnown"></p><p class="usage">Counts only requests carrying a Claude session ID. A session remains recent for two minutes after a request, or while a request is running. Codex and requests without a session ID are not included. This does not count open apps or terminals.</p><div class="card"><div class="filters"><label>Project <select id="fProject"></select></label><label>Client <select id="fClient"></select></label><span class="hint" id="sessionCount"></span></div><table id="sessions"></table></div></section>
     </section>
-    <section data-section="routing" hidden class="section-body"><div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
+    <section data-section="routing" hidden class="section-body">
+      <section aria-labelledby="modelRoutingTitle" id="modelRouting" class="route-panel" data-section="routing">
+        <div class="section-head"><div><h2 id="modelRoutingTitle">Expected routing per model</h2><p class="sub">Representative models, based on the latest router status</p></div><button id="routingManualSelection">Manual selection</button></div>
+        <div class="provider-routing" id="providerRouting"></div><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
+      </section>
+      <div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
     <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table></div><p class="usage" id="resetHistoryNote"></p></section>
     <section data-section="forecast" hidden class="section-body" id="forecastSection">
       <div class="section-head"><div><h2>Subscription forecasts</h2><p class="sub">Account usage includes every machine using that subscription.</p></div><label>Work horizon <select id="forecastHorizon"><option value="2">2 hours</option><option value="8" selected>8 hours</option><option value="24">1 day</option><option value="72">3 days</option><option value="168">7 days</option></select></label></div>
@@ -1112,6 +1200,7 @@ const PAGE = `<!doctype html>
   var clearConfirmRoute = null;
   var clearConfirmFocus = false;
   var restoreClearFocus = null;
+  var routeFocus = null;
   var connected = false;
   var lastUpdated = null;
   var history = [];
@@ -1124,7 +1213,6 @@ const PAGE = `<!doctype html>
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
-  var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
 ${SHARED_CONSTS}
 
@@ -1537,7 +1625,8 @@ ${SHARED_HELPERS}
   // Provider-specific samples use the server's targets and eligibility.
   function renderRoutes(s) {
     var wrap = document.getElementById('routesWrap');
-    var rows = routeRows(s);
+    // Per-provider default rows belong to the Overview strip (FR 13-14).
+    var rows = routeRows(s).filter(function (r) { return r.kind === 'route'; });
     var blockedNote = document.getElementById('forceBlocked');
     var forceBlocked = !!(s || {}).forceBlocked;
     blockedNote.hidden = !forceBlocked;
@@ -1547,63 +1636,60 @@ ${SHARED_HELPERS}
     wrap.style.display = '';
     var table = document.getElementById('routes');
     table.textContent = '';
-    var hr = el('tr');
-    ['Route / sample', 'Target preview', 'Can serve sample', 'Force'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
-    table.appendChild(hr);
+    var head = el('thead'), hr = el('tr');
+    ['Route / sample', 'Target preview', 'Can serve sample'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    head.appendChild(hr); table.appendChild(head);
+    var body = el('tbody'); table.appendChild(body);
     // A route with two globs previews twice. The override belongs to the route,
     // not the sample, so its controls go on the route's first row only.
     var controlled = Object.create(null);
     rows.forEach(function (r) {
       var tr = el('tr');
+      tr.setAttribute('data-provider', r.provider || '');
       var fam = el('td', '', r.label + (r.match ? ' ' : ''));
+      fam.setAttribute('data-label', 'Route');
       if (r.match) fam.appendChild(el('span', 'tag', r.match));
       if (r.sampleModel) fam.title = 'Representative model: ' + r.sampleModel;
-      var configured = r.kind === 'route' && !r.autocreated;
-      var first = configured && !controlled[r.name];
+      var first = !r.autocreated && !controlled[r.name];
       if (first) controlled[r.name] = true;
       if (first && r.override && r.override.account) {
         fam.appendChild(el('div', 'hint', 'Stays forced until you clear it. Sessions pinned with TC_ACCT are not affected.'));
       }
       tr.appendChild(fam);
       var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
+      to.setAttribute('data-label', 'Target');
       if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
       if (r.pinMismatch) to.appendChild(el('span', 'warnt', ' (not eligible)'));
-      var chip = chipFor(r);
-      if (chip) {
-        var chipEl = el('span', 'chip ' + (CHIP_CLASS[chip.kind] || ''), ' · ' + chip.text);
-        chipEl.tabIndex = -1;
-        to.appendChild(chipEl);
-        // After a successful Apply the page moves the reader to the answer:
-        // what the router now says about the route it just changed.
-        if (first && forceFocusRoute === r.name) { forceFocusRoute = null; chipEl.focus(); }
-      }
-      if (r.kind === 'default' && r.target !== r.current) {
-        to.appendChild(el('span', 'warnt', r.currentUnavailable
-          ? ' · current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
-          : ' · outranks the current account ' + r.current));
-      }
       if (r.provider) to.appendChild(el('span', 'tag', ' · ' + providerLabel(r.provider)));
+      var chip = chipFor(r);
+      // The route's first row carries the chip inside its controls; a second
+      // sample of the same route keeps it inline so the state still reads.
+      if (chip && !first) to.appendChild(el('div', 'chip chip-line ' + (CHIP_CLASS[chip.kind] || ''), chip.text));
+      if (first) to.appendChild(routeActions(r, chip, forceBlocked));
       tr.appendChild(to);
-      var can = el('td', r.kind === 'default' ? 'dim' : '');
-      if (r.kind === 'default') can.textContent = 'no route of its own';
-      else if (r.blocked) can.textContent = '—';
+      var can = el('td');
+      can.setAttribute('data-label', 'Can serve');
+      if (r.blocked) can.textContent = '—';
       else if (!r.eligible.length && !r.ineligible.length) can.textContent = '—';
       else {
         can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length) + (r.ineligible.length ? ' ' : '')));
         if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.join(', ')));
       }
       tr.appendChild(can);
-      tr.appendChild(forceCell(r, first, forceBlocked));
-      table.appendChild(tr);
+      body.appendChild(tr);
     });
+    // Focus only once the rows are in the document: a detached button ignores focus().
+    if (routeFocus) { routeFocus.focus(); routeFocus = null; }
   }
 
-  function forceCell(r, first, forceBlocked) {
-    var cell = el('td');
-    if (!first) return cell;
+  // The Force controls for a configured route's first row, inline at the foot
+  // of its target cell (FR 16): the chip and Change…/Clear force when forced,
+  // Force… otherwise, or the Clear/Keep confirm in their place.
+  function routeActions(r, chip, forceBlocked) {
+    var cell = el('div', 'route-actions');
     var forced = !!(r.override && r.override.account);
     if (clearConfirmRoute === r.name) {
-      cell.appendChild(el('div', 'hint', 'Clear force on ' + r.name + '?'));
+      cell.appendChild(el('span', 'hint', 'Clear force on ' + r.name + '?'));
       var yes = el('button', 'act', 'Clear');
       yes.addEventListener('click', function () {
         clearConfirmRoute = null;
@@ -1615,8 +1701,16 @@ ${SHARED_HELPERS}
         if (lastStatus) renderRoutes(lastStatus);
       });
       cell.appendChild(yes); cell.appendChild(keep);
-      if (clearConfirmFocus) { clearConfirmFocus = false; yes.focus(); }
+      if (clearConfirmFocus) { clearConfirmFocus = false; routeFocus = yes; }
       return cell;
+    }
+    if (chip) {
+      var chipEl = el('span', 'chip ' + (CHIP_CLASS[chip.kind] || ''), chip.text);
+      chipEl.tabIndex = -1;
+      cell.appendChild(chipEl);
+      // After a successful Apply the page moves the reader to the answer:
+      // what the router now says about the route it just changed.
+      if (forceFocusRoute === r.name) { forceFocusRoute = null; routeFocus = chipEl; }
     }
     var open = el('button', 'act', forced ? 'Change…' : 'Force…');
     open.setAttribute('aria-haspopup', 'dialog');
@@ -1628,7 +1722,7 @@ ${SHARED_HELPERS}
     cell.appendChild(open);
     // A cleared route has no chip to move to, and the button the confirm
     // replaced is gone, so focus lands here instead of on the document.
-    if (forceFocusRoute === r.name) { forceFocusRoute = null; open.focus(); }
+    if (forceFocusRoute === r.name) { forceFocusRoute = null; routeFocus = open; }
     if (forced) {
       // Clearing is exempt from the ownership-claim refusal: a route that
       // cannot be un-forced would be a trap.
@@ -1640,7 +1734,7 @@ ${SHARED_HELPERS}
         if (lastStatus) renderRoutes(lastStatus);
       });
       cell.appendChild(clear);
-      if (restoreClearFocus === r.name) { restoreClearFocus = null; clear.focus(); }
+      if (restoreClearFocus === r.name) { restoreClearFocus = null; routeFocus = clear; }
     }
     return cell;
   }
@@ -1653,40 +1747,61 @@ ${SHARED_HELPERS}
     wrap.textContent = '';
     if (!list.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = 'block';
-    list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
+    list.forEach(function (p) {
+      var line = el('div', p.severity);
+      // An account line leads with its provider word and wears its tint (RT 1);
+      // session lines name no account and stay neutral.
+      if (p.kind === 'account') {
+        line.setAttribute('data-provider', p.provider || '');
+        line.appendChild(el('span', 'pv', providerLabel(p.provider)));
+        line.appendChild(el('span', '', ' · ' + p.text));
+      } else line.textContent = p.text;
+      wrap.appendChild(line);
+    });
   }
 
 
   function renderProviderRouting(s) {
     var wrap = document.getElementById('providerRouting'); wrap.textContent = '';
     var cards = routingCards(s);
-    if (!cards.length) wrap.appendChild(el('p', 'empty', 'Provider routing is unavailable on this proxy.'));
-    else {
-      cards.forEach(function (provider) {
-        provider.groups.forEach(function (group) {
-          var card = el('div', 'provider-card'); card.setAttribute('data-provider', provider.provider);
-          card.appendChild(el('h3', '', provider.label + ' · ' + group.labels.join(', ')));
-          card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), group.target || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
-          var models = el('div', 'provider-models', group.models.join(', ')); models.title = 'Representative models'; card.appendChild(models);
-          wrap.appendChild(card);
-        });
+    if (!cards.length) { wrap.appendChild(el('p', 'empty', 'Provider routing is unavailable on this proxy.')); return; }
+    cards.forEach(function (provider) {
+      provider.groups.forEach(function (group) {
+        var card = el('div', 'provider-card'); card.setAttribute('data-provider', provider.provider);
+        var h = el('h3'); h.appendChild(el('b', '', providerLabel(provider.provider))); h.appendChild(el('span', '', ' · ' + group.labels.join(', ')));
+        card.appendChild(h);
+        card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), group.target || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
+        var models = el('div', 'provider-models', group.models.join(', ')); models.title = 'Representative models'; card.appendChild(models);
+        wrap.appendChild(card);
       });
+    });
+  }
+
+  // Overview's one line per provider (FR 13). The wording is routeStripLines';
+  // this only lays it out.
+  function renderRouteStrip(s) {
+    var wrap = document.getElementById('routeStripLines'); wrap.textContent = '';
+    // An empty fleet still reports providerRouting entries (all Unavailable);
+    // the honest line is that there is nothing to route to.
+    var lines = (s.accounts || []).length ? routeStripLines(s) : [];
+    if (!lines.length) {
+      wrap.appendChild(el('p', 'empty', (s.accounts || []).length ? 'Provider routing is unavailable on this proxy.' : 'No accounts configured on the proxy.'));
+      return;
     }
-    var current = document.getElementById('currentAccounts');
-    var currentAccounts = s.currentAccounts || null;
-    var providers = currentAccounts ? Object.keys(currentAccounts).sort(providerOrder) : [];
-    if (providers.length) {
-      current.textContent = 'Current account · ' + providers.map(function (provider) {
-        return providerLabel(provider) + ': ' + (currentAccounts[provider] || 'none');
-      }).join(' · ');
-      current.hidden = false;
-    } else if (s.currentAccount) {
-      current.textContent = 'Current account · ' + s.currentAccount;
-      current.hidden = false;
-    } else {
-      current.textContent = '';
-      current.hidden = true;
-    }
+    lines.forEach(function (line) {
+      var row = el('div', 'strip-line'); row.setAttribute('data-provider', line.provider || '');
+      var who = el('div', 'strip-provider');
+      who.appendChild(el('b', '', line.label));
+      who.appendChild(el('small', '', line.accounts + (line.accounts === 1 ? ' account' : ' accounts')));
+      row.appendChild(who);
+      var what = el('div');
+      var target = el('div', 'strip-target' + (line.resolved ? '' : ' warnt'), line.headline);
+      if (line.tag) target.appendChild(el('span', 'badge meta', line.tag));
+      what.appendChild(target);
+      line.why.forEach(function (w) { what.appendChild(el('div', 'strip-why' + (w.warn ? ' warnt' : ''), w.text)); });
+      row.appendChild(what);
+      wrap.appendChild(row);
+    });
   }
 
   function renderOverview(s) {
@@ -1888,6 +2003,7 @@ ${SHARED_HELPERS}
     probeButton.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeButton.disabled = !!probe.running;
     document.getElementById('reload').disabled = false;
+    renderRouteStrip(s);
     renderProviderRouting(s);
     renderAccounts(s);
     if (document.getElementById('accountDialog').open) renderAccountDetails();
@@ -1923,14 +2039,20 @@ ${SHARED_HELPERS}
     if (a && connected) {
       var exhausted = accountQuotaGroups(a).models.filter(function (q) { return q.ratio >= 1; });
       if (exhausted.length) help += ' ' + exhausted.map(function (q) { return q.label; }).join(', ') + ' exhausted. Selecting this account does not restore those limits.';
+      var b = bindingLimit(a, lastStatus.switchThreshold, lastStatus.switchThresholds);
+      help += b ? ' Binding limit: ' + b.label + ' ' + quotaDisplay(b.ratio, 'spent') + '% spent · ' + b.grade + ', ' + limitText(b.limitKind, b.limit) + '.' : ' No quota reported.';
     }
     document.getElementById('switchHelp').textContent = help;
+    tintSelect('switchAccount', a);
   }
 
   function showSwitch(name) {
     var select = document.getElementById('switchAccount'); select.textContent = '';
     var placeholder = el('option', '', 'Choose an account'); placeholder.value = ''; select.appendChild(placeholder);
-    ((lastStatus || {}).accounts || []).forEach(function (a) { var option = el('option', '', a.name + ' · ' + providerLabel(a.provider)); option.value = a.name; select.appendChild(option); });
+    ((lastStatus || {}).accounts || []).forEach(function (a) {
+      var option = el('option', '', providerLabel(a.provider) + ' · ' + a.name + skipSuffix(a)); option.value = a.name;
+      option.setAttribute('data-provider', a.provider || ''); select.appendChild(option);
+    });
     select.value = name || ''; document.getElementById('switchResult').textContent = '';
     updateSwitchHelp(); document.getElementById('switchDialog').showModal();
   }
@@ -1972,16 +2094,35 @@ ${SHARED_HELPERS}
     var q = a.quota || {};
     var used = quotaDisplay(q.unified7d, 'spent');
     var reset = parseTs(q.unified7dReset);
-    var option = el('option', '', name + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
+    var option = el('option', '', providerLabel(a.provider) + ' · ' + name + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
       + (isNaN(reset) ? 'reset time not reported'
-        : reset > Date.now() ? 'resets in ' + fmtIn((reset - Date.now()) / 1000) : 'reset time passed'));
+        : reset > Date.now() ? 'resets in ' + fmtIn((reset - Date.now()) / 1000) : 'reset time passed') + skipSuffix(a));
     option.value = name;
+    option.setAttribute('data-provider', a.provider || '');
     return option;
+  }
+
+  // Why the router may skip an account, appended to its dialog option so the
+  // choice is visible before it is made. Same wording as #switchHelp.
+  function skipSuffix(a) {
+    if (!a) return '';
+    if (a.disabled) return ' · disabled';
+    if (a.unavailable) return ' · ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable);
+    return a.status === 'error' ? ' · sign-in needed' : '';
+  }
+
+  // The select's left border takes the chosen account's provider tint (FR 28);
+  // an option cannot be colored reliably, its container can.
+  function tintSelect(id, a) {
+    var select = document.getElementById(id);
+    if (a && a.provider) select.setAttribute('data-provider', a.provider);
+    else select.removeAttribute('data-provider');
   }
 
   function updateForceHelp() {
     var row = forceRoute ? forceRowFor(forceRoute) : null;
     var account = document.getElementById('forceAccount').value;
+    tintSelect('forceAccount', ((lastStatus || {}).accounts || []).filter(function (a) { return a.name === account; })[0]);
     document.getElementById('applyForce').disabled = !row || !account || !connected || forcePending;
     document.getElementById('forceHelp').textContent = !connected
       ? 'The proxy is disconnected. Wait for a fresh status before applying.'
@@ -2131,6 +2272,7 @@ ${SHARED_HELPERS}
       document.getElementById('err').style.display = 'none';
       connected = true; lastUpdated = Date.now(); document.body.classList.remove('stale');
       document.getElementById('manualSelection').disabled = false;
+      document.getElementById('routingManualSelection').disabled = false;
       document.getElementById('reload').disabled = false;
       document.getElementById('connection').textContent = 'Connected · 5s refresh';
       recordActivity(s); render(s);
@@ -2139,6 +2281,7 @@ ${SHARED_HELPERS}
       if (generation !== authGeneration) return;
       connected = false; document.body.classList.add('stale');
       document.getElementById('manualSelection').disabled = true;
+      document.getElementById('routingManualSelection').disabled = true;
       document.getElementById('reload').disabled = true;
       document.getElementById('probe').disabled = true;
       document.getElementById('accountManual').disabled = true; updateSwitchHelp(); updateForceHelp();
@@ -2196,6 +2339,7 @@ ${SHARED_HELPERS}
   });
   document.querySelectorAll('[data-close]').forEach(function (button) { button.addEventListener('click', function () { document.getElementById(button.getAttribute('data-close')).close(); }); });
   document.getElementById('manualSelection').addEventListener('click', function () { showSwitch(); });
+  document.getElementById('routingManualSelection').addEventListener('click', function () { showSwitch(); });
   document.getElementById('accountManual').addEventListener('click', function () { document.getElementById('accountDialog').close(); showSwitch(detailAccount); });
   document.getElementById('switchAccount').addEventListener('change', updateSwitchHelp);
   document.getElementById('applySwitch').addEventListener('click', doSwitch);

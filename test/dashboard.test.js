@@ -9,7 +9,7 @@ import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
   accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
+  switchRequest, switchOutcome, routeRows, routeStripLines, problems, STARVED_MIN, STARVED_LIST_MAX,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder,
 } from '../src/dashboard.js';
@@ -775,7 +775,7 @@ test('the page ships the same helper implementations it is tested against', () =
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems,
     chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
-    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, providerOrder]) {
+    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, providerOrder, routeStripLines]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
@@ -1168,6 +1168,7 @@ test('reset history rows date scheduled rolls by the window and early resets by 
 // document.querySelector hands back a throwaway node so the renderers this
 // task does not touch keep going.
 function fakeDom() {
+  let focused = null;
   class Node {
     constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attrs = {}; this.style = {}; this.listeners = {}; this.parentNode = null; this.value = ''; this.open = false; this.disabled = false; this.hidden = false; }
     get className() { return this.attrs.class || ''; }
@@ -1183,7 +1184,7 @@ function fakeDom() {
     addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
     dispatch(type) { (this.listeners[type] || []).forEach(fn => fn.call(this, { type, key: '' })); }
     click() { this.dispatch('click'); }
-    focus() {}
+    focus() { focused = this; }
     showModal() { this.open = true; }
     close() { this.open = false; }
     *walk() { for (const c of this.children) if (typeof c !== 'string') { yield c; yield* c.walk(); } }
@@ -1220,6 +1221,7 @@ function fakeDom() {
     querySelectorAll: sel => root.querySelectorAll(sel),
     querySelector: sel => root.querySelector(sel) || new Node('div'),
     contains: () => true,
+    get focused() { return focused; },
   };
 }
 
@@ -1288,7 +1290,10 @@ test('T2: Codex stays second behind Claude ahead of an alphabetically earlier pr
   // The same comparator orders routeRows' default rows and the current-account line.
   assert.deepEqual(['codex', 'azure', 'zeta', 'anthropic', '', 'bravo'].sort(providerOrder), ['anthropic', 'codex', 'azure', 'bravo', 'zeta', '']);
   assert.deepEqual(routeRows({ routes: [{ name: 'r', accounts: [] }], defaultTargets: s.defaultTargets }).filter(r => r.kind === 'default').map(r => r.provider), ['anthropic', 'codex', 'azure']);
-  assert.match(dom.getElementById('currentAccounts').textContent, /^Current account · Claude: .* · Codex: .* · azure: az-1$/);
+  // The current-account line is gone (T3); the Overview strip carries the order now,
+  // whatever order the server lists providers in.
+  const listed = { accounts: s.accounts, currentAccounts: s.currentAccounts, providerRouting: ['azure', 'codex', 'anthropic'].map(provider => ({ provider, models: [{ label: 'm', model: 'm', target: s.currentAccounts[provider] }] })) };
+  assert.deepEqual(routeStripLines(listed).map(l => l.provider), ['anthropic', 'codex', 'azure']);
 });
 
 test('T2: every bar is graded via the effective limit, marks the tick at it, and says so to a screen reader', async () => {
@@ -1452,4 +1457,205 @@ test('T2: search keeps its id and its empty copy', async () => {
   search.value = 'codex'; search.dispatch('input');
   assert.equal(dom.getElementById('accountCount').textContent, '2 of 4 accounts');
   assert.deepEqual(dom.querySelectorAll('tr.provider-heading').map(h => h.getAttribute('data-provider')), ['codex']);
+});
+
+// ---- T3: Overview routing strip, Routing split, inline Force, problems tint, dialogs ----
+
+// fixtureStatus plus the fixture's providerRouting and routes: Claude models all
+// land on alex@personal.dev with no route; Codex's configured codex-default is
+// forced to codex-secondary (two samples) and Fable has an autocreated route.
+function routedStatus() {
+  const s = fixtureStatus();
+  const both = names => names.map(name => ({ name, eligible: true }));
+  const claude = both(['alex@personal.dev', 'alex@work.co']), codex = both(['codex-primary', 'codex-secondary']);
+  const model = (provider, label, m, accounts, extra = {}) => ({ provider, label, model: m, blocked: false, route: null, pinned: null, target: accounts[0].name, accounts, ...extra });
+  const codexRoute = { route: 'codex-default', pinned: 'codex-secondary', target: 'codex-secondary' };
+  s.providerRouting = [
+    { provider: 'anthropic', label: 'Claude', models: ['Opus', 'Sonnet', 'Haiku', 'Fable'].map(l => model('anthropic', l, 'claude-' + l.toLowerCase(), claude)) },
+    { provider: 'codex', label: 'Codex', models: [model('codex', 'General', 'gpt-6-astra', codex, codexRoute), model('codex', 'gpt-*', 'gpt-', codex, codexRoute), model('codex', '*codex*', 'codex', codex, codexRoute)] },
+  ];
+  s.routes = [
+    { name: 'codex-default', match: ['gpt-*', '*codex*'], autocreated: false, id: 'configured:codex-default', provider: 'codex', pinned: 'codex-secondary',
+      previews: [model('codex', 'gpt-*', 'gpt-', codex, codexRoute), model('codex', '*codex*', 'codex', codex, codexRoute)],
+      members: ['codex-primary', 'codex-secondary'], accounts: codex, target: 'codex-secondary',
+      override: { account: 'codex-secondary', whenSpent: 'fallback', source: 'config', since: 1, state: 'effective', reason: null },
+      persisted: { account: 'codex-secondary', whenSpent: 'fallback' } },
+    { name: 'fable', match: ['*fable*'], autocreated: true, id: 'auto:fable', provider: 'anthropic', pinned: null,
+      previews: [model('anthropic', '*fable*', 'claude-fable-5', claude)], members: ['alex@personal.dev', 'alex@work.co'], accounts: claude, target: 'alex@personal.dev' },
+  ];
+  s.forceBlocked = false;
+  return s;
+}
+
+const stripText = lines => lines.map(l => ({ provider: l.provider, headline: l.headline, tag: l.tag, why: l.why.map(w => w.text) }));
+
+test('T3: the strip has one line per provider with the fixture headlines, tag and why lines', async () => {
+  assert.deepEqual(stripText(routeStripLines(routedStatus())), [
+    { provider: 'anthropic', headline: 'alex@personal.dev', tag: null, why: ['Also the current account'] },
+    { provider: 'codex', headline: 'codex-secondary', tag: 'forced', why: ['Default target: codex-primary', 'Current: codex-primary'] },
+  ]);
+  const { dom } = await renderPage(routedStatus());
+  const lines = dom.getElementById('routeStripLines').querySelectorAll('.strip-line');
+  assert.deepEqual(lines.map(l => l.getAttribute('data-provider')), ['anthropic', 'codex']);
+  assert.deepEqual(lines.map(l => l.querySelector('.strip-provider').textContent), ['Claude2 accounts', 'Codex2 accounts']);
+  assert.equal(lines[0].querySelector('.strip-target').textContent, 'alex@personal.dev');
+  assert.equal(lines[1].querySelector('.strip-target').textContent, 'codex-secondaryforced');
+  assert.equal(lines[1].querySelector('.strip-target .badge').textContent, 'forced');
+  assert.deepEqual(lines[0].querySelectorAll('.strip-why').map(w => w.textContent), ['Also the current account']);
+  assert.deepEqual(lines[1].querySelectorAll('.strip-why').map(w => w.textContent), ['Default target: codex-primary', 'Current: codex-primary']);
+  assert.ok(lines.every(l => !l.querySelector('.strip-target').matches('.warnt')), 'a resolved headline is not in near ink');
+});
+
+test('T3: the strip carries the is-blocked and outranks sentences the default rows used to', () => {
+  const capped = routedStatus();
+  capped.defaultTargets.codex = 'codex-secondary';
+  capped.accounts[2].unavailable = 'capped';
+  const codex = routeStripLines(capped)[1];
+  assert.deepEqual(codex.why.map(w => w.text), ['Current: codex-primary · current account codex-primary is blocked: ' + UNAVAILABLE_TEXT.capped]);
+  assert.equal(codex.why[0].warn, true);
+  const outranked = routedStatus();
+  outranked.defaultTargets.codex = 'codex-secondary';
+  assert.deepEqual(routeStripLines(outranked)[1].why.map(w => w.text), ['Current: codex-primary · codex-secondary outranks the current account codex-primary']);
+  // A null default (nothing can serve) still explains a blocked current account; outranks needs a name.
+  const nothing = { currentAccounts: { anthropic: 'a' }, defaultTargets: { anthropic: null },
+    accounts: [{ name: 'a', provider: 'anthropic', unavailable: 'capped' }],
+    providerRouting: [{ provider: 'anthropic', models: [{ label: 'm', model: 'm', target: null }] }],
+    routes: [{ name: 'r', match: ['m*'], members: ['a'], previews: [{ provider: 'anthropic', label: 'm*', model: 'm', target: null, accounts: [] }] }] };
+  assert.equal(routeRows(nothing).find(r => r.kind === 'default').target, null, 'the default row exists with no target');
+  assert.deepEqual(routeStripLines(nothing)[0].why, [{ text: 'Current: a · current account a is blocked: ' + UNAVAILABLE_TEXT.capped, warn: true }]);
+  nothing.accounts[0].unavailable = null;
+  assert.deepEqual(routeStripLines(nothing)[0].why, [{ text: 'Current: a', warn: false }]);
+});
+
+test('T3: a split, partial or pinned-only provider and an empty fleet', async () => {
+  const split = routedStatus();
+  split.providerRouting[0].models[3].target = 'alex@work.co';
+  split.providerRouting[1].models[0].target = null;
+  split.providerRouting[1].models[0].route = null;
+  split.routes[0].override = null;
+  const [claude, codex] = routeStripLines(split);
+  assert.deepEqual([claude.headline, claude.resolved, codex.headline, codex.resolved, codex.tag], ['Multiple targets', false, 'Partially available', false, 'pinned']);
+  const { dom } = await renderPage(split);
+  assert.ok(dom.getElementById('routeStripLines').querySelectorAll('.strip-target').every(t => t.matches('.warnt')), 'summary headlines render in near ink');
+  const empty = await renderPage({ accounts: [] });
+  assert.equal(empty.dom.getElementById('routeStripLines').textContent, 'No accounts configured on the proxy.');
+  // A real empty fleet still sends providerRouting entries; the strip must not turn them into lines.
+  const real = new AccountManager([], 0.98).getStatus();
+  assert.ok(real.providerRouting.length > 0, 'the server reports provider entries for an empty fleet');
+  const served = await renderPage(real);
+  assert.equal(served.dom.getElementById('routeStripLines').textContent, 'No accounts configured on the proxy.');
+  assert.equal(served.dom.getElementById('routeStripLines').querySelectorAll('.strip-line').length, 0);
+});
+
+test('T3: Overview owns the strip, Routing owns the cards and the table, and #currentAccounts is gone', async () => {
+  const html = renderDashboardHtml();
+  const overview = html.slice(html.indexOf('<section aria-labelledby="routeStripTitle"'), html.indexOf('<section id="accountSection"'));
+  assert.match(overview, /class="route-strip" data-section="overview"/);
+  assert.match(overview, /id="manualSelection"/);
+  assert.doesNotMatch(overview, /providerRouting|id="routes"|provider-card/);
+  const routing = html.slice(html.indexOf('<section data-section="routing"'), html.indexOf('<section data-section="resets"'));
+  assert.match(routing, /<section aria-labelledby="modelRoutingTitle" id="modelRouting" class="route-panel" data-section="routing">/);
+  assert.match(routing, /id="modelRouting"[\s\S]*id="routingManualSelection"[\s\S]*id="providerRouting"[\s\S]*id="routes"[\s\S]*id="forceBlocked"/);
+  assert.doesNotMatch(html, /data-section="overview routing"|id="currentAccounts"|getElementById\('currentAccounts'\)/);
+  const { dom } = await renderPage(routedStatus());
+  const cards = dom.getElementById('providerRouting').querySelectorAll('.provider-card');
+  assert.deepEqual(cards.map(c => c.getAttribute('data-provider') + ':' + c.querySelector('h3 b').textContent), ['anthropic:Claude', 'codex:Codex']);
+  assert.match(cards[0].querySelector('h3').textContent, /^Claude · Opus, Sonnet, Haiku, Fable$/);
+});
+
+test('T3: the routes table has three columns, only configured and autocreated route rows, and inline Force controls on each route\'s first row', async () => {
+  const { dom } = await renderPage(routedStatus());
+  const table = dom.getElementById('routes');
+  assert.deepEqual(table.querySelectorAll('th').map(th => th.textContent), ['Route / sample', 'Target preview', 'Can serve sample']);
+  const rows = table.querySelectorAll('tbody tr');
+  assert.equal(rows.length, 3, 'two codex-default samples and fable; no default rows');
+  assert.doesNotMatch(table.textContent, /no route of its own|outranks|Claude default|Codex default/);
+  assert.deepEqual(rows.map(r => r.getAttribute('data-provider')), ['codex', 'codex', 'anthropic']);
+  rows.forEach(r => assert.match(r.querySelectorAll('td')[1].textContent, r.getAttribute('data-provider') === 'codex' ? /Codex/ : /Claude/));
+  assert.deepEqual(rows.map(r => r.querySelectorAll('td').map(td => td.getAttribute('data-label'))), Array(3).fill(['Route', 'Target', 'Can serve']));
+  const actions = rows[0].querySelectorAll('td')[1].querySelector('.route-actions');
+  assert.ok(actions, 'the forced route\'s first row carries the controls in its target cell');
+  assert.match(actions.querySelector('.chip').textContent, /forced/);
+  assert.deepEqual(actions.querySelectorAll('button').map(b => [b.textContent, b.getAttribute('aria-label')]),
+    [['Change…', 'Change the forced account for route codex-default'], ['Clear force', 'Clear force on route codex-default']]);
+  assert.equal(rows[1].querySelector('.route-actions'), null, 'second sample of the same route');
+  assert.equal(rows[1].querySelector('.chip-line').textContent, 'forced · falls back when spent', 'but it still says the route is forced, on its own line with no leading separator');
+  assert.equal(rows[2].querySelector('.route-actions'), null, 'autocreated route');
+  const unforced = routedStatus(); unforced.routes[0].override = null; unforced.routes[0].persisted = null;
+  const plain = (await renderPage(unforced)).dom.getElementById('routes').querySelector('.route-actions');
+  assert.deepEqual(plain.querySelectorAll('button').map(b => [b.textContent, b.getAttribute('aria-label')]), [['Force…', 'Force route codex-default']]);
+});
+
+test('T3: Clear force confirms in the same cell with focus on Clear; Keep puts the buttons and focus back; forceBlocked disables Force', async () => {
+  const { dom } = await renderPage(routedStatus());
+  const cell = () => dom.getElementById('routes').querySelector('tbody tr').querySelectorAll('td')[1];
+  cell().querySelectorAll('.route-actions button')[1].click();
+  const confirm = cell().querySelector('.route-actions');
+  assert.equal(confirm.textContent, 'Clear force on codex-default?ClearKeep');
+  assert.equal(dom.focused, confirm.querySelectorAll('button')[0]);
+  confirm.querySelectorAll('button')[1].click();
+  const restored = cell().querySelectorAll('.route-actions button');
+  assert.deepEqual(restored.map(b => b.textContent), ['Change…', 'Clear force']);
+  assert.equal(dom.focused, restored[1]);
+  const blocked = routedStatus(); blocked.forceBlocked = true; blocked.routes[0].override = null;
+  const b = await renderPage(blocked);
+  assert.equal(b.dom.getElementById('routes').querySelector('.route-actions button').disabled, true);
+  assert.equal(b.dom.getElementById('forceBlocked').hidden, false);
+  assert.match(b.dom.getElementById('forceBlocked').textContent, /Forcing is off/);
+});
+
+test('T3: switch and force dialog options lead with the provider, the select takes the chosen tint, and #switchHelp names the binding limit', async () => {
+  const { dom } = await renderPage(routedStatus());
+  dom.getElementById('manualSelection').click();
+  const select = dom.getElementById('switchAccount');
+  assert.deepEqual(select.querySelectorAll('option').slice(1).map(o => o.textContent),
+    ['Claude · alex@personal.dev', 'Claude · alex@work.co', 'Codex · codex-primary', 'Codex · codex-secondary']);
+  assert.equal(select.getAttribute('data-provider'), null, 'neutral until an account is chosen');
+  select.value = 'codex-secondary'; select.dispatch('change');
+  assert.equal(select.getAttribute('data-provider'), 'codex');
+  assert.match(dom.getElementById('switchHelp').textContent, /Binding limit: Weekly 91% spent · near, switch at 98%\./);
+  select.value = 'alex@personal.dev'; select.dispatch('change');
+  assert.equal(select.getAttribute('data-provider'), 'anthropic');
+  assert.match(dom.getElementById('switchHelp').textContent, /Binding limit: Fable weekly 95% spent · near/);
+  dom.getElementById('routingManualSelection').click();
+  assert.equal(dom.getElementById('switchDialog').open, true, 'Manual selection is reachable from Routing too');
+  dom.getElementById('routes').querySelector('.route-actions button').click();
+  const force = dom.getElementById('forceAccount');
+  assert.equal(dom.getElementById('forceDialog').open, true);
+  assert.ok(force.querySelectorAll('option').every(o => /^Codex · codex-(primary|secondary) · weekly /.test(o.textContent)));
+  assert.equal(force.value, 'codex-secondary');
+  assert.equal(force.getAttribute('data-provider'), 'codex');
+  for (const id of ['forceAccount', 'forceFallback', 'forceHold', 'forceHelp', 'forceResult', 'forceUseCurrent', 'applyForce', 'switchAccount', 'switchHelp', 'switchResult', 'applySwitch']) {
+    assert.match(renderDashboardHtml(), new RegExp(`id="${id}"`));
+  }
+});
+
+test('T3: an account problem leads with its provider and wears its tint; a session problem stays neutral', async () => {
+  const s = routedStatus();
+  s.accounts[1].unavailable = 'error';
+  s.sessions = { starvedMax: STARVED_MIN };
+  const { dom } = await renderPage(s);
+  const lines = dom.getElementById('problems').children;
+  assert.equal(lines.length, 2);
+  const session = lines.find(l => l.getAttribute('data-provider') == null);
+  const account = lines.find(l => l.getAttribute('data-provider') != null);
+  assert.match(session.textContent, /^A conversation has had/);
+  assert.equal(account.getAttribute('data-provider'), 'anthropic');
+  assert.equal(account.querySelector('.pv').textContent, 'Claude');
+  assert.equal(account.textContent, 'Claude · Account alex@work.co needs a re-login.');
+  assert.deepEqual(problems(s).filter(p => p.kind === 'account').map(p => [p.provider, p.account]), [['anthropic', 'alex@work.co']]);
+});
+
+test('T3: switch and force dialog options keep the reason the router may skip an account', async () => {
+  const s = routedStatus();
+  s.accounts[2].unavailable = 'capped';
+  s.accounts[1].disabled = true;
+  const { dom } = await renderPage(s);
+  dom.getElementById('manualSelection').click();
+  assert.deepEqual(dom.getElementById('switchAccount').querySelectorAll('option').slice(1).map(o => o.textContent),
+    ['Claude · alex@personal.dev', 'Claude · alex@work.co · disabled', 'Codex · codex-primary · ' + UNAVAILABLE_TEXT.capped, 'Codex · codex-secondary']);
+  dom.getElementById('routes').querySelector('.route-actions button').click();
+  const force = dom.getElementById('forceAccount').querySelectorAll('option').map(o => o.textContent);
+  assert.match(force[0], new RegExp('^Codex · codex-primary · weekly .* · ' + UNAVAILABLE_TEXT.capped.replace(/[()]/g, '\\$&') + '$'));
+  assert.doesNotMatch(force[1], /usage cap/);
 });
