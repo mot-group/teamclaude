@@ -96,10 +96,13 @@ export function providerLabel(provider) {
 // cannot drift apart.
 /** @param {string|null|undefined} a @param {string|null|undefined} b */
 export function providerOrder(a, b) {
+  /** @param {string|null|undefined} p */
   var rank = function (p) { return p === 'anthropic' ? 0 : p === 'codex' ? 1 : p ? 2 : 3; };
   var x = rank(a), y = rank(b);
   if (x !== y) return x - y;
-  return a < b ? -1 : a > b ? 1 : 0;
+  // Equal ranks mean both are strings or both are empty, so '' stands in for null.
+  var s = a || '', t = b || '';
+  return s < t ? -1 : s > t ? 1 : 0;
 }
 
 // Every bucket switchThreshold can be keyed by, plus the short names the
@@ -190,7 +193,7 @@ export function effectiveLimit(account, bucket, fleetThreshold, fleetThresholds)
   var threshold = resolveSwitchThreshold(a.switchThreshold, bucket, fleetFor(bucket, fleetThreshold, fleetThresholds));
   var cap = resolveMaxUsage(a.maxUsage, bucket);
   var capped = cap != null && cap < threshold;
-  return { limit: capped ? cap : threshold, kind: capped ? 'cap' : 'threshold', threshold: threshold, cap: cap };
+  return { limit: capped ? /** @type {number} */ (cap) : threshold, kind: capped ? 'cap' : 'threshold', threshold: threshold, cap: cap };
 }
 
 /**
@@ -292,6 +295,7 @@ export function capBadgeText(maxUsage) {
   function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
   if (typeof maxUsage === 'number') return isFinite(maxUsage) ? 'cap ' + pct(maxUsage) : '';
   if (!maxUsage || typeof maxUsage !== 'object' || Array.isArray(maxUsage)) return '';
+  /** @type {string[]} */
   var parts = [];
   Object.keys(maxUsage).forEach(function (key) {
     var v = maxUsage[key];
@@ -558,13 +562,16 @@ export function routeRows(status) {
 // row (only when it differs from the headline) and the current account, with
 // the outranks / is-blocked wording the routes table used to print on its
 // default rows, so dropping those rows loses no sentence.
+/** @param {Record<string, any>|null|undefined} status */
 export function routeStripLines(status) {
   var s = status || {};
+  /** @type {Record<string, any>} */
   var defaults = {};
-  routeRows(s).forEach(function (r) { if (r.kind === 'default') defaults[r.provider] = r; });
+  routeRows(s).forEach(/** @param {Record<string, any>} r */ function (r) { if (r.kind === 'default') defaults[r.provider] = r; });
+  /** @type {Record<string, boolean>} */
   var forced = {};
-  (s.routes || []).forEach(function (r) { if (r.override && r.override.account) forced[r.name] = true; });
-  return routingCards(s).map(function (card, i) {
+  (s.routes || []).forEach(/** @param {Record<string, any>} r */ function (r) { if (r.override && r.override.account) forced[r.name] = true; });
+  return routingCards(s).map(/** @param {Record<string, any>} card @param {number} i */ function (card, i) {
     var models = ((s.providerRouting || [])[i] || {}).models || [];
     var def = defaults[card.provider] || null;
     var target = def ? def.target : null;
@@ -577,10 +584,11 @@ export function routeStripLines(status) {
       // explains itself, even a null one (nothing can serve); only "outranks"
       // needs an account to name.
       var reason = !def || target === current ? ''
-        : def.currentUnavailable ? ' · current account ' + current + ' is blocked: ' + (UNAVAILABLE_TEXT[def.currentUnavailable] || def.currentUnavailable)
+        : def.currentUnavailable ? ' · current account ' + current + ' is blocked: ' + (/** @type {Record<string, string>} */ (UNAVAILABLE_TEXT)[def.currentUnavailable] || def.currentUnavailable)
         : target ? ' · ' + target + ' outranks the current account ' + current : '';
       why.push({ text: 'Current: ' + current + reason, warn: !!reason });
     }
+    /** @param {Array<Record<string, any>>} ms */
     var tagOf = function (ms) {
       return ms.some(function (m) { return m.route && forced[m.route]; }) ? 'forced'
         : ms.some(function (m) { return m.pinned; }) ? 'pinned' : null;
@@ -589,20 +597,20 @@ export function routeStripLines(status) {
     var resolved = card.groups.length === 1 && !!card.groups[0].target;
     return {
       provider: card.provider, label: providerLabel(card.provider),
-      accounts: (s.accounts || []).filter(function (a) { return a.provider === card.provider; }).length,
+      accounts: (s.accounts || []).filter(/** @param {Record<string, any>} a */ function (a) { return a.provider === card.provider; }).length,
       headline: card.headline,
       resolved: resolved,
       tag: resolved ? tagOf(models) : null,
       // A summary headline hides which families went where, so each of
       // routingCards' groups gets a sub-line; the tag moves to its group.
-      groups: resolved ? [] : card.groups.map(function (g) {
+      groups: resolved ? [] : card.groups.map(/** @param {Record<string, any>} g */ function (g) {
         return { labels: g.labels.join(', '),
           target: g.target || (g.blocked ? 'blocked by policy' : 'no eligible account'), missing: !g.target,
-          tag: tagOf(models.filter(function (m) { return (m.target || null) === g.target && !!m.blocked === g.blocked; })) };
+          tag: tagOf(models.filter(/** @param {Record<string, any>} m */ function (m) { return (m.target || null) === g.target && !!m.blocked === g.blocked; })) };
       }),
       why: why,
     };
-  }).sort(function (a, b) { return providerOrder(a.provider, b.provider); });
+  }).sort(/** @param {Record<string, any>} a @param {Record<string, any>} b */ function (a, b) { return providerOrder(a.provider, b.provider); });
 }
 
 // The override as one chip after the target. `state` is the server's own
@@ -808,12 +816,19 @@ export function quotaDisplay(ratio, mode = 'spent') {
  * @returns {string}
  */
 export function bucketLabel(key) {
+  /** @type {Record<string, string>} */
   var names = { unified5h: '5-hour', unified7d: 'Weekly', unified7dFable: 'Fable weekly', unified7dSonnet: 'Sonnet weekly', tokens: 'Tokens', requests: 'Requests' };
   return Object.prototype.hasOwnProperty.call(names, key) ? names[key] : key;
 }
 
+/**
+ * @typedef {{ label: string, ratio: any, resetAt: any, bucket: string|null }} QuotaRow
+ * @param {Record<string, any>} [account]
+ * @returns {{ shared: QuotaRow[], session: QuotaRow[], models: QuotaRow[] }}
+ */
 export function accountQuotaGroups(account = {}) {
   var q = account.quota || {};
+  /** @type {QuotaRow[]} */
   var shared = [];
   if (q.unified7d != null) shared.push({ label: bucketLabel('unified7d'), ratio: q.unified7d, resetAt: q.unified7dReset, bucket: 'unified7d' });
   if (q.tokensLimit != null) shared.push({ label: bucketLabel('tokens'), ratio: q.tokensLimit > 0 && q.tokensRemaining != null ? 1 - q.tokensRemaining / q.tokensLimit : null, resetAt: q.resetsAt, bucket: 'tokens' });
@@ -847,15 +862,17 @@ export function accountQuotaGroups(account = {}) {
  */
 export function bindingLimit(account, fleetThreshold, fleetThresholds) {
   var groups = accountQuotaGroups(account || {});
+  /** @type {ReturnType<typeof bindingLimit>} */
   var best = null;
   groups.shared.concat(groups.session, groups.models).forEach(function (row) {
-    var order = row.bucket ? THRESHOLD_BUCKET_KEYS.indexOf(row.bucket) : -1;
-    if (order === -1 || typeof row.ratio !== 'number' || !isFinite(row.ratio)) return;
-    var lim = effectiveLimit(account, row.bucket, fleetThreshold, fleetThresholds);
+    var bucket = row.bucket;
+    var order = bucket ? THRESHOLD_BUCKET_KEYS.indexOf(bucket) : -1;
+    if (!bucket || order === -1 || typeof row.ratio !== 'number' || !isFinite(row.ratio)) return;
+    var lim = effectiveLimit(account, bucket, fleetThreshold, fleetThresholds);
     var headroom = lim.limit - row.ratio;
     if (best && (headroom > best.headroom || (headroom === best.headroom && order > THRESHOLD_BUCKET_KEYS.indexOf(best.bucket)))) return;
     best = {
-      bucket: row.bucket, label: row.label, ratio: row.ratio, limit: lim.limit, limitKind: lim.kind,
+      bucket: bucket, label: row.label, ratio: row.ratio, limit: lim.limit, limitKind: lim.kind,
       headroom: headroom, grade: quotaGrade(row.ratio, lim.limit, QUOTA_NEAR_BAND), resetAt: row.resetAt,
     };
   });
