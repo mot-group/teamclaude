@@ -48,7 +48,8 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
     try {
       let origin;
       try { origin = new URL(`${secure ? 'https' : 'http'}://${req.headers.host}`); } catch { reply(400, { error: 'Invalid host' }); return; }
-      if (!allowedHosts.has(origin.hostname.replace(/^\[|\]$/g, '').toLowerCase()) || origin.host !== req.headers.host) { reply(403, { error: 'Unknown dashboard host' }); return; }
+      // Hostnames are case-insensitive and URL lowercases them, so compare the raw header lowercased too.
+      if (!allowedHosts.has(origin.hostname.replace(/^\[|\]$/g, '').toLowerCase()) || origin.host !== String(req.headers.host).toLowerCase()) { reply(403, { error: 'Unknown dashboard host' }); return; }
       if (req.method === 'GET' && ['/', '/teamclaude/dashboard'].includes(req.url)) {
         reply(200, page, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': dashboardCsp(page) }); return;
       }
