@@ -11,7 +11,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routeStripLines, problems, STARVED_MIN, STARVED_LIST_MAX,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows, RESET_WINDOW_BUCKETS,
-  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder,
+  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder, forecastWindowLabel, bucketLabel,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -775,7 +775,7 @@ test('the page ships the same helper implementations it is tested against', () =
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems,
     chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
-    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, providerOrder, routeStripLines]) {
+    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, providerOrder, routeStripLines, forecastWindowLabel, bucketLabel]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
@@ -1823,4 +1823,175 @@ test('T4: a Claude and a Codex account with the same name grade their cards agai
   const bars = dom.getElementById('resetAccounts').querySelectorAll('.card').map(c => c.querySelector('.mini .bar'));
   assert.deepEqual(bars.map(b => [b.getAttribute('data-grade'), b.querySelector('b').style.left, b.querySelector('b').className]),
     [['near', '80%', ''], ['at', '60%', 'cap']]);
+});
+
+// ---- T5: Forecast, Activity and Diagnostics ----
+
+// The fixture's forecast windows: two thin Claude accounts, one Codex row with a
+// projection and one without.
+function forecastStatus() {
+  const s = fixtureStatus();
+  const now = Date.now(), week = 604800000;
+  const win = (bucket, durationMs, extra = {}) => ({ bucket, durationMs, status: 'Insufficient history', ratePerHour: null, limitAt: null, resetAt: now + 3.6 * 86400e3, utilization: 0.6, ...extra });
+  const claude = name => ({ name, provider: 'anthropic', disabled: false, models: [], windows: [
+    win('shared:fiveHour', 18000000, { status: 'No active window', resetAt: null, utilization: 0 }),
+    win('shared:sevenDay', week), win('family:breakdown', null, { resetAt: null, utilization: null }), win('family:fable', week, { utilization: 0.95 }),
+  ] });
+  s.forecast = {
+    status: 'Experimental account forecasts', observedThrough: now - 60e3,
+    coverage: { subscriptionCount: 4, exclusions: [], remoteConsumption: 'Included in provider quota changes; attribution unknown', adviceReason: 'No acceptable alternatives configured' },
+    accounts: [claude('alex@personal.dev'), claude('alex@work.co'),
+      { name: 'codex-primary', provider: 'codex', disabled: false, models: [], windows: [win('shared:primary_window', week, { status: 'Recent-rate scenario', ratePerHour: 0.0167, limitAt: now + 16 * 3600e3, utilization: 0.72 })] },
+      { name: 'codex-secondary', provider: 'codex', disabled: false, models: [], windows: [win('shared:primary_window', week, { status: 'Usage change below measurement resolution', utilization: 0.91 })] }],
+    recommendations: [],
+  };
+  return s;
+}
+
+test('T5: forecast window labels are sentence case with the family capitalized', () => {
+  assert.equal(forecastWindowLabel('shared:fiveHour', 18000000), 'Shared five-hour window');
+  assert.equal(forecastWindowLabel('shared:sevenDay', 604800000), 'Shared weekly window');
+  assert.equal(forecastWindowLabel('shared:primary_window', 604800000), 'Shared weekly window');
+  assert.equal(forecastWindowLabel('shared:other'), 'Shared quota window');
+  assert.equal(forecastWindowLabel('family:fable', 604800000), 'Fable weekly window');
+  assert.equal(forecastWindowLabel('family:breakdown', null), 'Breakdown weekly window');
+  assert.equal(forecastWindowLabel('family:sonnet'), 'Sonnet weekly window');
+  assert.equal(forecastWindowLabel('model:gpt-5'), 'Model gpt-5');
+  const html = renderDashboardHtml();
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  assert.equal(new Function(`${bundle}; return forecastWindowLabel;`)()('family:fable', 604800000), 'Fable weekly window');
+});
+
+test('T5: forecast cards carry the provider rail and badge; thin evidence is dim, numbers mono; ids and copy stay', async () => {
+  const { dom } = await renderPage(forecastStatus());
+  const cards = dom.getElementById('forecastAccounts').querySelectorAll('section.card');
+  assert.deepEqual(cards.map(c => c.getAttribute('data-provider')), ['anthropic', 'anthropic', 'codex', 'codex']);
+  assert.deepEqual(cards.map(c => c.querySelector('.card-head h3').textContent), ['alex@personal.dev', 'alex@work.co', 'codex-primary', 'codex-secondary']);
+  assert.deepEqual(cards.map(c => c.querySelector('.card-head .badge.provider').textContent), ['Claude', 'Claude', 'Codex', 'Codex']);
+  const rows = cards.flatMap(c => c.querySelectorAll('tr').slice(1));
+  const labels = rows.map(r => r.querySelector('td').textContent);
+  assert.deepEqual(labels.slice(0, 4), ['Shared five-hour window', 'Shared weekly window', 'Breakdown weekly window', 'Fable weekly window']);
+  for (const label of labels) assert.match(label, /^(Shared|Fable|Sonnet|Breakdown) /);
+  const cells = rows.flatMap(r => r.querySelectorAll('td'));
+  const thin = cells.filter(td => td.textContent === 'Not enough evidence');
+  assert.equal(thin.length, 9);
+  assert.ok(thin.every(td => td.className === 'dim'));
+  assert.ok(cells.filter(td => td.textContent === 'Unknown').every(td => td.className === 'dim'));
+  const horizon = dom.getElementById('forecastHorizon');
+  horizon.value = '24';
+  horizon.dispatch('change');
+  const codex = dom.getElementById('forecastAccounts').querySelectorAll('section.card')[2].querySelectorAll('tr')[1].querySelectorAll('td');
+  assert.deepEqual(codex.slice(1, 3).map(td => [td.textContent, td.className]), [['72.0%', 'mono'], ['1.67 percentage points', 'mono']]);
+  assert.match(codex[3].textContent, /, in 16\.0 hours$/);
+  assert.equal(codex[3].className, '', 'a real projection is not dimmed');
+  assert.match(dom.getElementById('forecastSummary').textContent, /^Experimental account forecasts · Target /);
+  assert.equal(dom.getElementById('forecastAdvice').textContent, 'No acceptable alternatives configured');
+  const html = renderDashboardHtml();
+  for (const id of ['forecastHorizon', 'forecastSummary', 'forecastCoverage', 'forecastAssumptions', 'forecastAdvice']) assert.match(html, new RegExp(`id="${id}"`));
+  assert.match(html, /#forecastAccounts td\.dim \{ color:var\(--dim\); \}/);
+  assert.match(html, /\.card \{ [^}]*overflow-x:auto; \}/, 'forecast tables scroll inside their card');
+});
+
+test('T5: with forecast null no cards render and the summary keeps the disabled copy', async () => {
+  const s = forecastStatus();
+  s.forecast = null;
+  const { dom } = await renderPage(s);
+  assert.equal(dom.getElementById('forecastAccounts').querySelectorAll('.card').length, 0);
+  assert.match(dom.getElementById('forecastSummary').textContent, /^Forecast history is disabled · Target /);
+  assert.equal(dom.getElementById('forecastAdvice').textContent, 'No supported model alternatives yet.');
+});
+
+test('T5: the empty chart says it fills while the page is open; bars and metrics use the dim and mono roles', async () => {
+  const { dom } = await renderPage();
+  const chart = dom.getElementById('history');
+  assert.equal(chart.className, 'history empty-chart');
+  assert.equal(chart.textContent, 'No samples yet');
+  assert.equal(dom.getElementById('historyLabel').textContent, 'This chart fills while the page is open and resets on reload.');
+  const html = renderDashboardHtml();
+  assert.match(html, /<p class="history-label" id="historyLabel">This chart fills while the page is open and resets on reload\.<\/p>/);
+  assert.match(html, /\.history i \{ flex:1; background:var\(--dim\);/);
+  assert.match(html, /\.metric strong \{ [^}]*font-family:var\(--mono\); font-variant-numeric:tabular-nums;/);
+  // The chart card and the token card are the two halves of one .split, same height.
+  assert.match(html, /<div class="split"><section><h2>Request activity<\/h2><div class="card">.*?<\/section><section><h2>Token accounting<\/h2><div class="card" id="tokens"><\/div><\/section><\/div>/);
+  assert.match(html, /\.split>section>\.card \{ flex:1; \}/);
+});
+
+test('T5: a second poll fills the chart with dim bars and drops the empty state', async () => {
+  const s = fixtureStatus();
+  s.server = { startedAt: 1 };
+  s.accounts[0].usage = { totalRequests: 10 };
+  const { dom, refresh } = await renderPage(s);
+  const next = fixtureStatus();
+  next.server = { startedAt: 1 };
+  next.accounts[0].usage = { totalRequests: 16 };
+  await refresh(next);
+  const chart = dom.getElementById('history');
+  assert.equal(chart.className, 'history');
+  assert.equal(chart.querySelectorAll('i').length, 1);
+  assert.match(dom.getElementById('historyLabel').textContent, /^6 requests over \d+s · /);
+});
+
+test('T5: sessions keep sort headers and filters; the clients empty copy is unchanged', async () => {
+  const s = fixtureStatus();
+  s.sessions = { active: 1, known: 1, items: [{ id: 'deadbeef1234', client: 'alice', active: true, requests: 3, pins: {}, tokens: {} }] };
+  s.clients = {};
+  const { dom } = await renderPage(s);
+  const heads = dom.getElementById('sessions').querySelectorAll('th');
+  assert.ok(heads.length > 0);
+  assert.ok(heads.every(th => th.getAttribute('aria-sort') != null));
+  assert.equal(dom.getElementById('clients').textContent, 'No client-attributed usage yet. Requests using the shared proxy key are unattributed.');
+  const html = renderDashboardHtml();
+  assert.match(html, /<select id="fProject"><\/select>/);
+  assert.match(html, /<select id="fClient"><\/select>/);
+});
+
+test('T5: the switch threshold line lists per-bucket fleet overrides only when there are any', async () => {
+  let { dom } = await renderPage();
+  const threshold = d => d.getElementById('routingInfo').querySelectorAll('dd')[0].textContent;
+  assert.equal(threshold(dom), '98% · per bucket: Fable weekly 100%');
+  assert.doesNotMatch(dom.getElementById('routingInfo').textContent, /unified7dFable/, 'no raw bucket keys');
+  const s = fixtureStatus();
+  s.switchThresholds = {};
+  ({ dom } = await renderPage(s));
+  assert.equal(threshold(dom), '98%');
+  s.switchThresholds = { default: 0.98, unified5h: 0.9, unified7d: 0.95, tokens: 0.8, mystery: 0.5 };
+  ({ dom } = await renderPage(s));
+  assert.equal(threshold(dom), '98% · per bucket: 5-hour 90%, Weekly 95%, Tokens 80%, mystery 50%');
+  s.switchThresholds = { default: 0.9 };
+  ({ dom } = await renderPage(s));
+  assert.equal(threshold(dom), '98%', 'the default key is not a per-bucket override');
+});
+
+test('T5: job rows carry the provider and its label; a probe error is at-ink; same-name accounts get their own row', async () => {
+  const s = fixtureStatus();
+  s.probe.accounts = s.accounts.map(a => ({ name: a.name, status: 'ok', lastProbedAt: new Date().toISOString(), durationMs: 300, error: null }));
+  s.probe.accounts[3] = { ...s.probe.accounts[3], status: 'error', durationMs: null, error: 'HTTP 401' };
+  let { dom } = await renderPage(s);
+  const rows = () => dom.getElementById('jobs').querySelectorAll('tr').slice(1);
+  assert.deepEqual(rows().map(r => r.getAttribute('data-provider')), ['anthropic', 'anthropic', 'codex', 'codex']);
+  assert.deepEqual(rows().map(r => r.querySelector('td').textContent), ['alex@personal.dev · Claude', 'alex@work.co · Claude', 'codex-primary · Codex', 'codex-secondary · Codex']);
+  assert.deepEqual(rows().map(r => r.querySelector('.pv').textContent), ['Claude', 'Claude', 'Codex', 'Codex']);
+  const err = rows()[3].querySelectorAll('td');
+  assert.deepEqual([err[1].textContent, err[1].className, err[4].textContent, err[4].className], ['error', 'badt', 'HTTP 401', 'badt']);
+  assert.deepEqual([rows()[0].querySelectorAll('td')[4].textContent, rows()[0].querySelectorAll('td')[4].className], ['300 ms', 'mono']);
+  assert.match(renderDashboardHtml(), /#jobs \.badt \{ color:var\(--grade-at-ink\); \}/);
+  // A Claude and a Codex account named alike: each row reads its own probe entry.
+  s.accounts[2] = { ...s.accounts[2], name: 'shared' };
+  s.accounts[0] = { ...s.accounts[0], name: 'shared' };
+  s.probe.accounts[0] = { ...s.probe.accounts[0], name: 'shared', durationMs: 111 };
+  s.probe.accounts[2] = { ...s.probe.accounts[2], name: 'shared', durationMs: 222 };
+  ({ dom } = await renderPage(s));
+  assert.deepEqual([rows()[0].querySelectorAll('td')[4].textContent, rows()[2].querySelectorAll('td')[4].textContent], ['111 ms', '222 ms']);
+});
+
+test('T5: bucketLabel names each bucket the way its quota row does; unknown keys pass through', () => {
+  assert.deepEqual(THRESHOLD_BUCKET_KEYS.map(bucketLabel), ['5-hour', 'Weekly', 'Sonnet weekly', 'Fable weekly', 'Tokens', 'Requests']);
+  assert.equal(bucketLabel('mystery'), 'mystery');
+  assert.equal(bucketLabel('toString'), 'toString');
+  // Same words as the bars: every graded row's label is bucketLabel(its bucket).
+  const groups = accountQuotaGroups({ quota: { unified7d: 0.1, unified5h: 0.1, unified7dFable: 0.1, unified7dSonnet: 0.1, tokensLimit: 10, tokensRemaining: 5, requestsLimit: 10, requestsRemaining: 5 } });
+  const rows = groups.shared.concat(groups.session, groups.models).filter(r => r.bucket);
+  assert.equal(rows.length, 6);
+  for (const r of rows) assert.equal(r.label, bucketLabel(r.bucket));
 });

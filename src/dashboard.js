@@ -212,6 +212,22 @@ export function quotaGrade(ratio, limit, band) {
 }
 
 /**
+ * A forecast window key as the operator reads it (FR 24): sentence case with
+ * the family capitalized, so `family:fable` is "Fable weekly window" and a
+ * seven-day `shared:*` key is "Shared weekly window". Any other key keeps its
+ * words, first letter raised.
+ * @param {string} bucket
+ * @param {number|null|undefined} [durationMs]
+ * @returns {string}
+ */
+export function forecastWindowLabel(bucket, durationMs) {
+  var b = String(bucket || '');
+  if (b.indexOf('shared:') === 0) return durationMs === 18000000 ? 'Shared five-hour window' : durationMs === 604800000 ? 'Shared weekly window' : 'Shared quota window';
+  b = b.indexOf('family:') === 0 ? b.slice(7) + ' weekly window' : b.replace(/:/g, ' ');
+  return b.charAt(0).toUpperCase() + b.slice(1);
+}
+
+/**
  * "switch at 100%" / "switch 7d 90%, fable 80%" — an account's OWN
  * switchThreshold (issue #409), or '' when it has none or every override it
  * carries merely repeats what the fleet already resolves to. `fleetThreshold`
@@ -773,16 +789,28 @@ export function quotaDisplay(ratio, mode = 'spent') {
   return mode === 'left' ? 100 - percentage : percentage;
 }
 
+/**
+ * The quota-row name for a switchThreshold/maxUsage bucket key, so a line that
+ * lists buckets reads like the bars do ("Fable weekly", not "unified7dFable").
+ * accountQuotaGroups uses it for its fixed rows; an unknown key comes back as is.
+ * @param {string} key
+ * @returns {string}
+ */
+export function bucketLabel(key) {
+  var names = { unified5h: '5-hour', unified7d: 'Weekly', unified7dFable: 'Fable weekly', unified7dSonnet: 'Sonnet weekly', tokens: 'Tokens', requests: 'Requests' };
+  return Object.prototype.hasOwnProperty.call(names, key) ? names[key] : key;
+}
+
 export function accountQuotaGroups(account = {}) {
   var q = account.quota || {};
   var shared = [];
-  if (q.unified7d != null) shared.push({ label: 'Weekly', ratio: q.unified7d, resetAt: q.unified7dReset, bucket: 'unified7d' });
-  if (q.tokensLimit != null) shared.push({ label: 'Tokens', ratio: q.tokensLimit > 0 && q.tokensRemaining != null ? 1 - q.tokensRemaining / q.tokensLimit : null, resetAt: q.resetsAt, bucket: 'tokens' });
+  if (q.unified7d != null) shared.push({ label: bucketLabel('unified7d'), ratio: q.unified7d, resetAt: q.unified7dReset, bucket: 'unified7d' });
+  if (q.tokensLimit != null) shared.push({ label: bucketLabel('tokens'), ratio: q.tokensLimit > 0 && q.tokensRemaining != null ? 1 - q.tokensRemaining / q.tokensLimit : null, resetAt: q.resetsAt, bucket: 'tokens' });
   // The router gates on `requests` too (capExceeded / maxUtilization in
   // account-manager.js, same 1 - remaining / limit ratio), so it is a row and a
   // binding-limit candidate. Appended after Tokens so existing rows keep their order.
-  if (q.requestsLimit != null) shared.push({ label: 'Requests', ratio: q.requestsLimit > 0 && q.requestsRemaining != null ? 1 - q.requestsRemaining / q.requestsLimit : null, resetAt: q.resetsAt, bucket: 'requests' });
-  var session = q.unified5h == null ? [] : [{ label: '5-hour', ratio: q.unified5h, resetAt: q.unified5hReset, bucket: 'unified5h' }];
+  if (q.requestsLimit != null) shared.push({ label: bucketLabel('requests'), ratio: q.requestsLimit > 0 && q.requestsRemaining != null ? 1 - q.requestsRemaining / q.requestsLimit : null, resetAt: q.resetsAt, bucket: 'requests' });
+  var session = q.unified5h == null ? [] : [{ label: bucketLabel('unified5h'), ratio: q.unified5h, resetAt: q.unified5hReset, bucket: 'unified5h' }];
   // `bucket` is the switchThreshold/maxUsage key the row grades against; a
   // family the router has no key for (Codex per-model) carries null.
   var models = scopedWeeklyRows(q).map(function (row) {
@@ -866,7 +894,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
-  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText,
+  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1030,6 +1058,14 @@ const PAGE = `<!doctype html>
   .reset-table tr[data-provider="anthropic"] .pv { color:var(--claude); }
   .reset-table tr[data-provider="codex"] .pv { color:var(--codex); }
   .reveal { margin:12px 0 0; }
+  /* Forecast: the card rail and badge are identity; thin evidence recedes so a real projection stands out. */
+  #forecastAccounts td.dim { color:var(--dim); }
+  #jobs tr[data-provider] td:first-child { border-left:3px solid var(--other); padding-left:13px; }
+  #jobs tr[data-provider="anthropic"] td:first-child { border-left-color:var(--claude); }
+  #jobs tr[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
+  #jobs tr[data-provider="anthropic"] .pv { color:var(--claude); }
+  #jobs tr[data-provider="codex"] .pv { color:var(--codex); }
+  #jobs .badt { color:var(--grade-at-ink); }
   .account-name { font-size:13px; font-weight:600; display:block; overflow-wrap:anywhere; margin-bottom:7px; }
   .account-meta { color:var(--dim); font-size:11px; margin-top:6px; }
   .badges { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
@@ -1089,7 +1125,11 @@ const PAGE = `<!doctype html>
   .split { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
   .stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin:22px 0; }
   .metric { border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:20px; }
-  .metric strong { display:block; font-size:30px; font-weight:600; margin:6px 0; }
+  .metric strong { display:block; font-size:30px; font-weight:600; margin:6px 0; font-family:var(--mono); font-variant-numeric:tabular-nums; letter-spacing:-.5px; }
+  #tokens dd,.mono { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  /* Activity: the chart card and the token card share the row and its height. */
+  .split>section { display:flex; flex-direction:column; min-width:0; }
+  .split>section>.card { flex:1; }
   .metric-label,.metric small { font-size:12px; color:var(--dim); }
   .details { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:0; }
   .details dt { color:var(--dim); font-size:12px; }
@@ -1105,7 +1145,9 @@ const PAGE = `<!doctype html>
   .badt { color:var(--bad); }
   .empty { color:var(--dim); padding:28px; text-align:center; }
   .history { height:90px; display:flex; align-items:end; gap:3px; margin:20px 0 12px; }
-  .history i { flex:1; background:var(--accent); border-radius:3px 3px 0 0; min-height:2px; }
+  /* A request count carries neither provider nor grade, so the bars stay dim. */
+  .history i { flex:1; background:var(--dim); border-radius:3px 3px 0 0; min-height:2px; }
+  .history.empty-chart { border:1px dashed var(--line); border-radius:8px; align-items:center; justify-content:center; color:var(--dim); font-size:12px; }
   .history-label { color:var(--dim); font-size:12px; }
   #err,#note,#problems { display:none; margin:0 0 20px; font-size:13px; }
   #err { border:1px solid #68503c; background:#282019; padding:14px 17px; border-radius:8px; color:var(--warn); }
@@ -1194,7 +1236,7 @@ const PAGE = `<!doctype html>
       <div id="accounts"></div><div class="account-foot"><span id="quotaTimezone"></span><span>▸ marks the limit the router gates on. Requests, tokens and account controls are in Details.</span></div>
     </section>
     <section data-section="activity" hidden class="section-body">
-      <div id="overview" class="stats"></div><div class="split"><section><h2>Request activity</h2><div class="card"><p class="usage">Requests observed while this page is open</p><div class="history" id="history" role="img" aria-label="Request activity"></div><p class="history-label" id="historyLabel">Collecting the first sample...</p></div></section><section><h2>Token accounting</h2><div class="card" id="tokens"></div></section></div>
+      <div id="overview" class="stats"></div><div class="split"><section><h2>Request activity</h2><div class="card"><p class="usage">Requests observed while this page is open</p><div class="history empty-chart" id="history" role="img" aria-label="This chart fills while the page is open and resets on reload.">No samples yet</div><p class="history-label" id="historyLabel">This chart fills while the page is open and resets on reload.</p></div></section><section><h2>Token accounting</h2><div class="card" id="tokens"></div></section></div>
       <div id="clientsWrap"><h2>Clients</h2><div class="card"><table id="clients"></table></div></div><div id="dimensionsWrap"></div>
       <section id="sessionsWrap"><h2>Claude session activity</h2><p class="sub" id="sessionActivity"></p><p class="usage" id="sessionKnown"></p><p class="usage">Counts only requests carrying a Claude session ID. A session remains recent for two minutes after a request, or while a request is running. Codex and requests without a session ID are not included. This does not count open apps or terminals.</p><div class="card"><div class="filters"><label>Project <select id="fProject"></select></label><label>Client <select id="fClient"></select></label><span class="hint" id="sessionCount"></span></div><table id="sessions"></table></div></section>
     </section>
@@ -2028,15 +2070,31 @@ ${SHARED_HELPERS}
   function renderDiagnostics(s) {
     var server = s.server || {}, loop = server.eventLoop || {}, pool = s.upstreamPool || {};
     details('serverInfo', [['Proxy uptime', server.uptimeSeconds == null ? null : fmtIn(server.uptimeSeconds)], ['Proxy port', server.port], ['Event loop lag', loop.lastLagMs == null ? null : loop.lastLagMs + ' ms'], ['Worst lag', loop.maxLagMs == null ? null : loop.maxLagMs + ' ms'], ['Active upstream requests', pool.active], ['Queued upstream requests', pool.queued]]);
-    details('routingInfo', [['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%'], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
+    // Fleet per-bucket overrides ride on the threshold line (FR 25); per-account caps live on the account row.
+    var fleetTable = s.switchThresholds || {};
+    var perBucket = Object.keys(fleetTable).filter(function (k) { return k !== 'default' && typeof fleetTable[k] === 'number' && isFinite(fleetTable[k]); })
+      .map(function (k) { return bucketLabel(k) + ' ' + Math.round(fleetTable[k] * 100) + '%'; });
+    details('routingInfo', [['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%' + (perBucket.length ? ' · per bucket: ' + perBucket.join(', ') : '')], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
     var overrides = ((s.fableDepletionRouting || {}).models || []);
     if (overrides.length) { var box = document.getElementById('routingInfo'); box.appendChild(el('p', 'usage', 'Fable depletion overrides')); overrides.forEach(function (r) { box.appendChild(el('p', 'usage', r.model + ' → ' + (r.target || 'None') + ' · ' + r.reason)); }); }
     var table = document.getElementById('jobs'); table.textContent = '';
     var hr = el('tr'); ['Account', 'Quota probe', 'Last checked', 'Warmup', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); }); table.appendChild(hr);
-    (s.accounts || []).forEach(function (a) {
-      var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0] || {};
-      var warm = ((s.warm || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0] || {};
-      var row = el('tr'); [a.name, probe.status || 'Unknown', probe.lastProbedAt ? fmtAgo(probe.lastProbedAt) : 'Never', warm.status || 'Unknown', probe.error || warm.error || (probe.durationMs == null ? 'No measurement' : probe.durationMs + ' ms')].forEach(function (v) { row.appendChild(el('td', '', v)); }); table.appendChild(row);
+    // Job rows come from the same account list in the same order, but names are
+    // unique only within a provider: take the row at this index when it is the
+    // same account, else the first with this name and (when stated) provider.
+    var jobFor = function (list, a, i) {
+      var same = function (p) { return p && p.name === a.name && (p.provider == null || p.provider === a.provider); };
+      return same(list[i]) ? list[i] : list.filter(same)[0] || {};
+    };
+    (s.accounts || []).forEach(function (a, i) {
+      var probe = jobFor((s.probe || {}).accounts || [], a, i);
+      var warm = jobFor((s.warm || {}).accounts || [], a, i);
+      var row = el('tr'); row.setAttribute('data-provider', a.provider || 'unknown');
+      var name = el('td', '', a.name); var tag = el('span', 'tag', ' · '); tag.appendChild(el('span', 'pv', providerLabel(a.provider))); name.appendChild(tag); row.appendChild(name);
+      var error = probe.error || warm.error;
+      [[probe.status || 'Unknown', probe.error ? 'badt' : ''], [probe.lastProbedAt ? fmtAgo(probe.lastProbedAt) : 'Never', ''], [warm.status || 'Unknown', warm.error ? 'badt' : ''],
+        [error || (probe.durationMs == null ? 'No measurement' : probe.durationMs + ' ms'), error ? 'badt' : probe.durationMs == null ? '' : 'mono']].forEach(function (c) { row.appendChild(el('td', c[1], c[0])); });
+      table.appendChild(row);
     });
   }
 
@@ -2048,22 +2106,18 @@ ${SHARED_HELPERS}
       if (history.length > 60) history.shift();
     } else history = [];
     previousSample = { total: total, time: now, started: started };
-    var chart = document.getElementById('history'); chart.textContent = '';
+    var chart = document.getElementById('history'); chart.textContent = history.length ? '' : 'No samples yet';
+    chart.className = history.length ? 'history' : 'history empty-chart';
     var max = Math.max.apply(null, [1].concat(history.map(function (h) { return h.count / h.seconds; })));
     history.forEach(function (h) { var bar = el('i'); bar.style.height = Math.max(2, h.count / h.seconds / max * 100) + '%'; bar.title = h.count + ' requests in ' + Math.round(h.seconds) + 's'; chart.appendChild(bar); });
     var count = history.reduce(function (n, h) { return n + h.count; }, 0), seconds = history.reduce(function (n, h) { return n + h.seconds; }, 0);
-    var label = history.length ? count + ' requests over ' + Math.round(seconds) + 's · ' + (count / seconds * 60).toFixed(1) + ' req/min' : 'Collecting the first sample...';
+    var label = history.length ? count + ' requests over ' + Math.round(seconds) + 's · ' + (count / seconds * 60).toFixed(1) + ' req/min' : 'This chart fills while the page is open and resets on reload.';
     document.getElementById('historyLabel').textContent = label; chart.setAttribute('aria-label', label);
   }
 
   function renderForecast(f) {
     f = f || { status: 'Forecast history is disabled', coverage: {}, accounts: [], recommendations: [] };
     var hours = Number(document.getElementById('forecastHorizon').value);
-    var windowLabel = function (bucket, durationMs) {
-      if (bucket.indexOf('shared:') === 0) return durationMs === 18000000 ? 'Shared five-hour window' : durationMs === 604800000 ? 'Shared weekly window' : 'Shared quota window';
-      if (bucket.indexOf('family:') === 0) return bucket.slice(7) + ' weekly window';
-      return bucket.replace(/:/g, ' ');
-    };
     var end = Date.now() + hours * 3600000;
     var date = function (t) { return t == null ? 'Unknown' : new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }); };
     var timing = function (t) { return date(t) + (t > Date.now() ? ', in ' + ((t - Date.now()) / 3600000).toFixed(1) + ' hours' : ''); };
@@ -2073,7 +2127,9 @@ ${SHARED_HELPERS}
     document.getElementById('forecastAssumptions').textContent = 'Experimental current-pace scenario. Each subscription keeps its observed total workload. Future resets are conditional. Account percentages and times are not added into a pooled balance.';
     var root = document.getElementById('forecastAccounts'); root.replaceChildren();
     (f.accounts || []).forEach(function (a) {
-      var card = el('section', 'card'); card.appendChild(el('h3', '', a.name + ' · ' + (a.provider === 'codex' ? 'Codex' : 'Claude')));
+      var card = el('section', 'card'); card.setAttribute('data-provider', a.provider || 'unknown');
+      var head = el('div', 'card-head'); head.appendChild(el('h3', '', a.name));
+      head.appendChild(el('span', 'badge provider ' + (a.provider || 'unknown'), providerLabel(a.provider))); card.appendChild(head);
       if (a.disabled) card.appendChild(el('p', 'usage', 'Disabled. Excluded from usable capacity.'));
       if (!a.windows.length) card.appendChild(el('p', 'usage', 'No fresh provider windows recorded yet.'));
       var table = el('table'); var head = el('tr'); ['Quota window', 'Spent', 'Pace per hour', 'Provider limit', 'Reported reset'].forEach(function (h) { head.appendChild(el('th', '', h)); }); table.appendChild(head);
@@ -2083,7 +2139,13 @@ ${SHARED_HELPERS}
         if (w.limitAt != null && w.resetAt > Date.now()) {
           projection = w.limitAt >= w.resetAt ? 'Reset occurs first; continuation conditional' : w.limitAt > end ? 'No limit projected through target' : timing(w.limitAt);
         }
-        [windowLabel(w.bucket, w.durationMs), w.utilization == null ? 'Unknown' : (w.utilization * 100).toFixed(1) + '%', w.ratePerHour == null ? 'Not enough evidence' : (w.ratePerHour * 100).toFixed(2) + ' percentage points', projection, date(w.resetAt)].forEach(function (value) { row.appendChild(el('td', '', value)); });
+        // [text, class]: numbers take the mono role; thin evidence and unknowns take --dim.
+        var thin = w.ratePerHour == null;
+        [[forecastWindowLabel(w.bucket, w.durationMs), ''],
+          w.utilization == null ? ['Unknown', 'dim'] : [(w.utilization * 100).toFixed(1) + '%', 'mono'],
+          thin ? ['Not enough evidence', 'dim'] : [(w.ratePerHour * 100).toFixed(2) + ' percentage points', 'mono'],
+          [projection, thin && w.limitAt == null ? 'dim' : ''],
+          [date(w.resetAt), w.resetAt == null ? 'dim' : '']].forEach(function (c) { row.appendChild(el('td', c[1], c[0])); });
         table.appendChild(row);
         if (w.hardCapAt != null || w.softThresholdAt != null || w.lastEstimate) {
           var notes = el('tr'); var cell = el('td', 'usage'); cell.colSpan = 5;
@@ -2099,7 +2161,7 @@ ${SHARED_HELPERS}
     var advice = document.getElementById('forecastAdvice'); advice.replaceChildren();
     if (!(f.recommendations || []).length) advice.appendChild(el('p', '', coverage.adviceReason || 'No supported model alternatives yet.'));
     (f.recommendations || []).forEach(function (r) {
-      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + r.account + ' avoids ' + r.avoidedConstraints.map(windowLabel).join(', ') + '.'));
+      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + r.account + ' avoids ' + r.avoidedConstraints.map(function (b) { return forecastWindowLabel(b); }).join(', ') + '.'));
       advice.appendChild(el('p', 'usage', r.evidence + '. ' + r.gainReason + '. ' + r.tradeoff));
     });
   }
