@@ -215,6 +215,63 @@ export function quotaGrade(ratio, limit, band) {
 }
 
 /**
+ * Ported from model.js for the same reason as resolveSwitchThreshold: the
+ * weekly reading the router gates a bucket on. Family spend meters into the
+ * family bucket AND the shared weekly (#175), so a family bucket gates on the
+ * higher of the two. Null is unreported, never zero.
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {string} bucketKey
+ * @returns {number|null}
+ */
+export function gatingUtilization(quota, bucketKey) {
+  var q = quota || {};
+  var own = q[bucketKey] == null ? null : q[bucketKey];
+  if (bucketKey === 'unified7d') return own;
+  var shared = q.unified7d == null ? null : q.unified7d;
+  if (own == null) return shared;
+  if (shared == null) return own;
+  return Math.max(own, shared);
+}
+
+/**
+ * How the router gates one accountQuotaGroups row, so grade, headroom and tick
+ * match rotation. A family's switch threshold is compared against
+ * gatingUtilization (_isNearQuota), but its maxUsage cap against the family
+ * reading alone (capExceeded; the shared cap sits on the Weekly row). Whichever
+ * leaves less headroom names the limit. A family with no dedicated key
+ * (`gate: 'unified7d'`) is gated like _governingWeekly gates it, against the
+ * shared weekly's threshold. `ratio` is the reading the limit is measured on;
+ * `via` repeats it when the shared weekly pushed it past the row's own reading,
+ * else null. The bar keeps showing the row's own ratio.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {{ ratio?: any, bucket?: string|null, gate?: string }|null|undefined} row
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {{ limit: number, kind: 'threshold'|'cap', ratio: number|null, headroom: number|null, grade: 'ok'|'near'|'at'|'spent'|null, via: number|null }}
+ */
+export function quotaGate(account, row, fleetThreshold, fleetThresholds) {
+  var q = (account || {}).quota || {};
+  var r = row || {};
+  var key = r.bucket || r.gate || 'default';
+  var lim = effectiveLimit(account, key, fleetThreshold, fleetThresholds);
+  var own = typeof r.ratio === 'number' && isFinite(r.ratio) ? r.ratio : null;
+  var family = r.bucket ? r.bucket !== 'unified7d' && r.bucket.indexOf('unified7d') === 0 : r.gate === 'unified7d';
+  // The row's own reading stands in for the family bucket: a scoped family has
+  // no dedicated field, and a Resets window carries its own utilization.
+  var gating = family ? gatingUtilization({ unified7d: q.unified7d, family: own }, 'family') : own;
+  var capOn = !r.bucket && r.gate ? (q.unified7d == null ? null : q.unified7d) : own;
+  var capRoom = lim.cap != null && capOn != null ? lim.cap - capOn : Infinity;
+  var capBinds = gating != null && capRoom < lim.threshold - gating;
+  var ratio = capBinds ? capOn : gating;
+  var limit = capBinds ? /** @type {number} */ (lim.cap) : lim.threshold;
+  return {
+    limit: limit, kind: capBinds ? 'cap' : 'threshold', ratio: ratio,
+    headroom: ratio == null ? null : limit - ratio, grade: quotaGrade(ratio, limit, QUOTA_NEAR_BAND),
+    via: ratio != null && own != null && ratio > own ? ratio : null,
+  };
+}
+
+/**
  * A forecast window key as the operator reads it (FR 24): sentence case with
  * the family capitalized, so `family:fable` is "Fable weekly window" and a
  * seven-day `shared:*` key is "Shared weekly window". Any other key keeps its
@@ -304,6 +361,21 @@ export function capBadgeText(maxUsage) {
     parts.push((key === 'default' ? '' : THRESHOLD_BUCKET_LABELS[key] + ' ') + pct(v));
   });
   return parts.length ? 'cap ' + parts.join(', ') : '';
+}
+
+/**
+ * The account one provider's cursor sits on. `currentAccounts` is authoritative
+ * whenever the server sends it: a provider missing from the map has no current
+ * account, so a Claude-only fleet never shows its Claude account as Codex's.
+ * The global `currentAccount` answers only for an older server with no map.
+ * @param {Record<string, any>|null|undefined} status
+ * @param {string|null|undefined} provider
+ * @returns {string|null}
+ */
+export function currentFor(status, provider) {
+  var s = status || {};
+  if (s.currentAccounts && typeof s.currentAccounts === 'object') return s.currentAccounts[provider || ''] || null;
+  return s.currentAccount || null;
 }
 
 /**
@@ -540,7 +612,7 @@ export function routeRows(status) {
     var providers = defaults ? Object.keys(defaults).sort(providerOrder) : [];
     if (!providers.length) providers = [rows[0].provider || 'anthropic'];
     providers.forEach(function (provider) {
-      var current = (s.currentAccounts && s.currentAccounts[provider]) || s.currentAccount || null;
+      var current = currentFor(s, provider);
       var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
       rows.push({
         kind: 'default', name: '',
@@ -575,7 +647,7 @@ export function routeStripLines(status) {
     var models = ((s.providerRouting || [])[i] || {}).models || [];
     var def = defaults[card.provider] || null;
     var target = def ? def.target : null;
-    var current = (s.currentAccounts && s.currentAccounts[card.provider]) || s.currentAccount || null;
+    var current = currentFor(s, card.provider);
     var why = [];
     if (target && target !== card.headline) why.push({ text: 'Default target: ' + target, warn: false });
     if (current && current === card.headline) why.push({ text: 'Also the current account', warn: false });
@@ -822,7 +894,7 @@ export function bucketLabel(key) {
 }
 
 /**
- * @typedef {{ label: string, ratio: any, resetAt: any, bucket: string|null }} QuotaRow
+ * @typedef {{ label: string, ratio: any, resetAt: any, bucket: string|null, gate?: string }} QuotaRow
  * @param {Record<string, any>} [account]
  * @returns {{ shared: QuotaRow[], session: QuotaRow[], models: QuotaRow[] }}
  */
@@ -839,9 +911,12 @@ export function accountQuotaGroups(account = {}) {
   var session = q.unified5h == null ? [] : [{ label: bucketLabel('unified5h'), ratio: q.unified5h, resetAt: q.unified5hReset, bucket: 'unified5h' }];
   // `bucket` is the switchThreshold/maxUsage key the row grades against; a
   // family the router has no key for (Codex per-model) carries null.
-  var models = scopedWeeklyRows(q).map(function (row) {
+  var models = scopedWeeklyRows(q).map(/** @returns {QuotaRow} */ function (row) {
     var key = 'unified7d' + row.family.charAt(0).toUpperCase() + row.family.slice(1);
-    return { label: row.label + ' weekly', ratio: row.utilization, resetAt: row.resetAt, bucket: THRESHOLD_BUCKET_KEYS.indexOf(key) === -1 ? null : key };
+    if (THRESHOLD_BUCKET_KEYS.indexOf(key) !== -1) return { label: row.label + ' weekly', ratio: row.utilization, resetAt: row.resetAt, bucket: key };
+    // No switchThreshold key, but the router still gates this family on it
+    // against the shared weekly's threshold (_governingWeekly); quotaGate reads `gate`.
+    return { label: row.label + ' weekly', ratio: row.utilization, resetAt: row.resetAt, bucket: null, gate: 'unified7d' };
   });
   Object.keys(q.codexModelBuckets || {}).forEach(function (slug) {
     var bucket = q.codexModelBuckets[slug];
@@ -853,27 +928,30 @@ export function accountQuotaGroups(account = {}) {
 /**
  * The one bucket that gates this account's routing soonest (FR 9, 10): of the
  * THRESHOLD_BUCKET_KEYS buckets the account reports a finite ratio for, the
- * least headroom (effective limit minus spent ratio); ties go to the earlier
- * key. Per-model rows (`bucket: null`) never bind. Null when nothing gates.
+ * least headroom (quotaGate's limit minus the reading it gates on, so a
+ * family is measured the way the router gates it); ties go to the earlier key.
+ * A scoped family binds under its `gate` key; Codex per-model rows never bind.
+ * Null when nothing gates.
  * @param {Record<string, any>|null|undefined} account
  * @param {number|null|undefined} fleetThreshold
  * @param {Object<string, number>|null|undefined} fleetThresholds
- * @returns {{ bucket: string, label: string, ratio: number, limit: number, limitKind: 'threshold'|'cap', headroom: number, grade: 'ok'|'near'|'at'|'spent'|null, resetAt: any }|null}
+ * @returns {{ bucket: string, label: string, ratio: number, limit: number, limitKind: 'threshold'|'cap', headroom: number, grade: 'ok'|'near'|'at'|'spent'|null, via: number|null, resetAt: any }|null}
  */
 export function bindingLimit(account, fleetThreshold, fleetThresholds) {
   var groups = accountQuotaGroups(account || {});
   /** @type {ReturnType<typeof bindingLimit>} */
   var best = null;
   groups.shared.concat(groups.session, groups.models).forEach(function (row) {
-    var bucket = row.bucket;
+    var bucket = row.bucket || row.gate || null;
     var order = bucket ? THRESHOLD_BUCKET_KEYS.indexOf(bucket) : -1;
     if (!bucket || order === -1 || typeof row.ratio !== 'number' || !isFinite(row.ratio)) return;
-    var lim = effectiveLimit(account, bucket, fleetThreshold, fleetThresholds);
-    var headroom = lim.limit - row.ratio;
-    if (best && (headroom > best.headroom || (headroom === best.headroom && order > THRESHOLD_BUCKET_KEYS.indexOf(best.bucket)))) return;
+    var g = quotaGate(account, row, fleetThreshold, fleetThresholds);
+    var headroom = /** @type {number} */ (g.headroom);
+    // `>=` on order keeps a scoped family that ties the Weekly row it gates under from displacing it.
+    if (best && (headroom > best.headroom || (headroom === best.headroom && order >= THRESHOLD_BUCKET_KEYS.indexOf(best.bucket)))) return;
     best = {
-      bucket: bucket, label: row.label, ratio: row.ratio, limit: lim.limit, limitKind: lim.kind,
-      headroom: headroom, grade: quotaGrade(row.ratio, lim.limit, QUOTA_NEAR_BAND), resetAt: row.resetAt,
+      bucket: bucket, label: row.label, ratio: row.ratio, limit: g.limit, limitKind: g.kind,
+      headroom: headroom, grade: g.grade, via: g.via, resetAt: row.resetAt,
     };
   });
   return best;
@@ -923,6 +1001,7 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
+  currentFor, gatingUtilization, quotaGate,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1384,6 +1463,8 @@ ${SHARED_HELPERS}
   // which of the two limits binds. Rounded like the threshold badge.
   function limitPct(v) { return (Math.round(v * 1000) / 10) + '%'; }
   function limitText(kind, limit) { return (kind === 'cap' ? 'cap ' : 'switch at ') + limitPct(limit); }
+  // Why a short bar can carry a red grade: the router gated the family on the shared weekly (quotaGate).
+  function viaText(via, mode) { return via == null ? '' : ' · via shared weekly ' + quotaDisplay(via, mode) + '% ' + mode; }
   function resetIn(resetAt) {
     var ts = parseTs(resetAt);
     if (isNaN(ts)) return 'reset time not reported';
@@ -1401,7 +1482,7 @@ ${SHARED_HELPERS}
     bar.setAttribute('aria-label', label + ', quota ' + quotaMode);
     bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
     bar.setAttribute('aria-valuenow', String(value));
-    bar.setAttribute('aria-valuetext', quotaDisplay(ratio, 'spent') + '% spent, ' + grade + ', ' + limitText(lim.kind, lim.limit) + ', ' + reset);
+    bar.setAttribute('aria-valuetext', quotaDisplay(ratio, 'spent') + '% spent, ' + grade + viaText(lim.via, 'spent').replace(' ·', ',') + ', ' + limitText(lim.kind, lim.limit) + ', ' + reset);
     var fill = el('i', grade); fill.style.width = value + '%'; bar.appendChild(fill);
     // The tick sits where the router gates; a fill may run past a cap tick, so a bar can be at well short of full (FR 6).
     var tick = el('b', lim.kind === 'cap' ? 'cap' : ''); tick.style.left = limitPct(lim.limit); tick.title = limitText(lim.kind, lim.limit); bar.appendChild(tick);
@@ -1423,12 +1504,13 @@ ${SHARED_HELPERS}
       return row;
     }
     // A Codex per-model row has no bucket key and grades against the account's default limit (FR 4).
-    var lim = effectiveLimit(a, q.bucket || 'default', s.switchThreshold, s.switchThresholds);
-    var grade = quotaGrade(q.ratio, lim.limit);
+    var lim = quotaGate(a, q, s.switchThreshold, s.switchThresholds);
+    var grade = lim.grade;
     row.setAttribute('data-grade', grade);
     var val = el('span', 'val', value + '% ');
     val.appendChild(el('small', '', quotaMode));
     val.appendChild(el('span', 'g', grade));
+    if (lim.via != null) val.appendChild(el('small', 'via', viaText(lim.via, quotaMode)));
     head.appendChild(val); row.appendChild(head);
     var reset = resetIn(q.resetAt);
     row.appendChild(gradedBar(q.label, q.ratio, lim, grade, reset));
@@ -1451,6 +1533,7 @@ ${SHARED_HELPERS}
     main.appendChild(el('b', '', b.label));
     main.appendChild(el('span', '', ' ' + quotaDisplay(b.ratio, quotaMode) + '% ' + quotaMode + ' · '));
     main.appendChild(el('span', 'g', b.grade));
+    if (b.via != null) main.appendChild(el('span', '', viaText(b.via, quotaMode)));
     line.appendChild(main);
     line.appendChild(el('span', 'sub2', limitText(b.limitKind, b.limit) + ' · ' + resetIn(b.resetAt)));
     return line;
@@ -1536,7 +1619,7 @@ ${SHARED_HELPERS}
         var groups = accountQuotaGroups(a);
         ['shared', 'session', 'models'].forEach(function (key, index) {
           var td = el('td'); td.setAttribute('data-label', ['Weekly / total quota','5-hour quota','Model-specific weekly quota'][index]);
-          groups[key].forEach(function (q) { td.appendChild(quotaRow(q, a, s, !!binding && binding.bucket === q.bucket)); });
+          groups[key].forEach(function (q) { td.appendChild(quotaRow(q, a, s, !!binding && binding.label === q.label)); });
           if (!groups[key].length) td.appendChild(el('span', 'quota-unknown', key === 'shared' ? 'Not reported' : 'No window reported'));
           tr.appendChild(td);
         });
@@ -1561,7 +1644,7 @@ ${SHARED_HELPERS}
     wrap.appendChild(bindingLine(binding));
     wrap.appendChild(el('p', 'usage', providerLabel(a.provider) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
     var groups = accountQuotaGroups(a);
-    groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q, a, s, !!binding && binding.bucket === q.bucket)); });
+    groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q, a, s, !!binding && binding.label === q.label)); });
     var q = a.quota || {}, u = a.usage || {};
     if (a.provider === 'anthropic') wrap.appendChild(el('p', 'usage', 'Recent Claude session IDs: ' + (typeof a.sessions === 'number' ? a.sessions : 'not reported') + '. Only IDs active within two minutes or with a request in flight are counted.'));
     if (q.planType) wrap.appendChild(el('p', 'usage', 'Plan: ' + q.planType));
@@ -1989,8 +2072,8 @@ ${SHARED_HELPERS}
       row.appendChild(el('span', 'num', 'unknown · ' + when));
       return row;
     }
-    var lim = effectiveLimit(a, RESET_WINDOW_BUCKETS[key] || 'default', s.switchThreshold, s.switchThresholds);
-    var grade = quotaGrade(w.utilization, lim.limit);
+    var lim = quotaGate(a, { bucket: RESET_WINDOW_BUCKETS[key] || null, ratio: w.utilization }, s.switchThreshold, s.switchThresholds);
+    var grade = lim.grade;
     row.appendChild(gradedBar(w.label, w.utilization, lim, grade, ended ? 'ended ' + shortDate(due) + ', no new window yet' : resetIn(w.resetAt)));
     var num = el('span', 'num');
     num.appendChild(el('b', '', shown + '%'));
@@ -2252,12 +2335,12 @@ ${SHARED_HELPERS}
     var help = !connected ? 'The proxy is disconnected. Wait for a fresh status before selecting an account.'
       : !a ? 'Choose an account to review it before applying.'
       : a.disabled || a.unavailable || a.status === 'error' ? 'The router may skip this account: ' + (a.disabled ? 'disabled' : UNAVAILABLE_TEXT[a.unavailable] || a.unavailable || 'sign-in needed')
-      : 'Recorded starting account: ' + ((lastStatus || {}).currentAccount || 'not reported') + '. Model routes and availability can override this choice.';
+      : 'Recorded starting account: ' + (currentFor(lastStatus, a.provider) || 'not reported') + '. Model routes and availability can override this choice.';
     if (a && connected) {
       var exhausted = accountQuotaGroups(a).models.filter(function (q) { return q.ratio >= 1; });
       if (exhausted.length) help += ' ' + exhausted.map(function (q) { return q.label; }).join(', ') + ' exhausted. Selecting this account does not restore those limits.';
       var b = bindingLimit(a, lastStatus.switchThreshold, lastStatus.switchThresholds);
-      help += b ? ' Binding limit: ' + b.label + ' ' + quotaDisplay(b.ratio, 'spent') + '% spent · ' + b.grade + ', ' + limitText(b.limitKind, b.limit) + '.' : ' No quota reported.';
+      help += b ? ' Binding limit: ' + b.label + ' ' + quotaDisplay(b.ratio, 'spent') + '% spent · ' + b.grade + viaText(b.via, 'spent') + ', ' + limitText(b.limitKind, b.limit) + '.' : ' No quota reported.';
     }
     document.getElementById('switchHelp').textContent = help;
     tintSelect('switchAccount', a);

@@ -11,6 +11,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routeStripLines, problems, STARVED_MIN, STARVED_LIST_MAX,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows, RESET_WINDOW_BUCKETS,
+  currentFor, gatingUtilization, quotaGate,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder, forecastWindowLabel, bucketLabel,
 } from '../src/dashboard.js';
 
@@ -1034,7 +1035,7 @@ test('switch-threshold precedence: account entry > account default > fleet bucke
 test('bindingLimit picks the least headroom among gating buckets, never a per-model row', () => {
   assert.deepEqual(bindingLimit(fixtureAlex, FLEET.threshold, FLEET.table), {
     bucket: 'unified7dFable', label: 'Fable weekly', ratio: 0.95, limit: 1, limitKind: 'threshold',
-    headroom: 1 - 0.95, grade: 'near', resetAt: 30,
+    headroom: 1 - 0.95, grade: 'near', via: null, resetAt: 30,
   });
   // A Codex account with only per-model buckets reported binds on the shared weekly bucket.
   const codex = { name: 'codex-secondary', provider: 'codex', quota: {
@@ -1075,11 +1076,75 @@ test('an account the server reports as capped or out of quota binds at grade at 
   // account-manager.js), so the page must find a binding limit there too.
   const reqCapped = { name: 'r', unavailable: 'capped', maxUsage: { requests: 0.5 }, quota: { requestsLimit: 100, requestsRemaining: 45, resetsAt: 9 } };
   assert.deepEqual(bindingLimit(reqCapped, 0.98, null), {
-    bucket: 'requests', label: 'Requests', ratio: 0.55, limit: 0.5, limitKind: 'cap', headroom: 0.5 - 0.55, grade: 'at', resetAt: 9,
+    bucket: 'requests', label: 'Requests', ratio: 0.55, limit: 0.5, limitKind: 'cap', headroom: 0.5 - 0.55, grade: 'at', via: null, resetAt: 9,
   });
   const reqSpent = { name: 's', unavailable: 'quota', quota: { requestsLimit: 100, requestsRemaining: 0 } };
   assert.equal(bindingLimit(reqSpent, 0.98, null).grade, 'spent');
   assert.equal(bindingLimit({ quota: { requestsLimit: 0, requestsRemaining: 0 } }, 0.98, null), null);
+});
+
+test('a family gates on the higher of its own weekly and the shared one, as the router does (#175)', () => {
+  assert.equal(gatingUtilization({ unified7d: 0.9, unified7dFable: 0.2 }, 'unified7dFable'), 0.9);
+  assert.equal(gatingUtilization({ unified7d: 0.3, unified7dFable: 0.5 }, 'unified7dFable'), 0.5);
+  assert.equal(gatingUtilization({ unified7d: 0.4, unified7dFable: 0.9 }, 'unified7d'), 0.4);
+  assert.equal(gatingUtilization({ unified7d: null, unified7dFable: 0.2 }, 'unified7dFable'), 0.2);
+  assert.equal(gatingUtilization({ unified7d: 0.7 }, 'unified7dSonnet'), 0.7);
+  assert.equal(gatingUtilization({}, 'unified7dFable'), null);
+  assert.equal(gatingUtilization(null, 'unified7d'), null);
+
+  // Family threshold 0.8, shared 1.0: the shared weekly at 0.9 bars Fable at 0.2.
+  const account = { switchThreshold: { unified7dFable: 0.8, unified7d: 1 }, quota: { unified7d: 0.9, unified7dFable: 0.2, unified7dFableReset: 4 } };
+  const fable = accountQuotaGroups(account).models[0];
+  assert.deepEqual(quotaGate(account, fable, 0.98, null), { limit: 0.8, kind: 'threshold', ratio: 0.9, headroom: 0.8 - 0.9, grade: 'at', via: 0.9 });
+  const b = bindingLimit(account, 0.98, null);
+  assert.deepEqual([b.bucket, b.label, b.ratio, b.grade, b.via, b.limit], ['unified7dFable', 'Fable weekly', 0.2, 'at', 0.9, 0.8]);
+  // The shared row itself grades on its own reading, with nothing to explain.
+  assert.deepEqual([quotaGate(account, accountQuotaGroups(account).shared[0], 0.98, null).grade, quotaGate(account, accountQuotaGroups(account).shared[0], 0.98, null).via], ['near', null]);
+
+  // A family cap compares the family reading alone (capExceeded), so it can still bind.
+  const capped = { maxUsage: { unified7dFable: 0.3 }, quota: { unified7d: 0.5, unified7dFable: 0.25 } };
+  assert.deepEqual(quotaGate(capped, accountQuotaGroups(capped).models[0], 0.98, null), { limit: 0.3, kind: 'cap', ratio: 0.25, headroom: 0.3 - 0.25, grade: 'near', via: null });
+
+  // A scoped family with no key gates on max(shared, scoped) against the shared threshold, and binds when it is tighter.
+  const opus = { quota: { unified7d: 0.5, scopedWeekly: { opus: { utilization: 0.97 } } } };
+  const ob = bindingLimit(opus, 0.98, null);
+  assert.deepEqual([ob.bucket, ob.label, ob.grade, ob.via], ['unified7d', 'Opus weekly', 'near', null]);
+  // Tied with the Weekly row it gates under, the Weekly row keeps the binding.
+  const tied = { quota: { unified7d: 0.6, scopedWeekly: { opus: { utilization: 0.1 } } } };
+  assert.equal(bindingLimit(tied, 0.98, null).label, 'Weekly');
+  assert.equal(quotaGate(tied, accountQuotaGroups(tied).models[0], 0.98, null).via, 0.6);
+});
+
+test('fixture grades are unchanged by the governing-weekly gate', () => {
+  // Quotas copied from the fixture (FLEET above); none has the shared weekly above its family.
+  const work = { quota: { unified5h: 0, unified7d: 0.23, unified7dFable: 0.25, scopedWeekly: { fable: { utilization: 0.25 } } } };
+  const secondary = { provider: 'codex', quota: { unified7d: 0.91, codexModelBuckets: {} } };
+  /** @param {any} a */
+  const grades = a => { const g = accountQuotaGroups(a); return g.shared.concat(g.session, g.models).map(r => [r.label, quotaGate(a, r, FLEET.threshold, FLEET.table).grade, quotaGate(a, r, FLEET.threshold, FLEET.table).via]); };
+  assert.deepEqual(grades(fixtureAlex), [['Weekly', 'ok', null], ['5-hour', 'ok', null], ['Fable weekly', 'near', null]]);
+  assert.deepEqual(grades(work), [['Weekly', 'ok', null], ['5-hour', 'ok', null], ['Fable weekly', 'ok', null]]);
+  assert.deepEqual(grades(secondary), [['Weekly', 'near', null]]);
+});
+
+test('currentAccounts is authoritative; the global currentAccount only answers without it', () => {
+  assert.equal(currentFor({ currentAccounts: { anthropic: 'a' }, currentAccount: 'a' }, 'codex'), null);
+  assert.equal(currentFor({ currentAccounts: { anthropic: 'a' }, currentAccount: 'a' }, 'anthropic'), 'a');
+  assert.equal(currentFor({ currentAccount: 'a' }, 'codex'), 'a');
+  assert.equal(currentFor(null, 'codex'), null);
+  const status = {
+    currentAccount: 'a', currentAccounts: { anthropic: 'a' },
+    accounts: [{ name: 'a', provider: 'anthropic' }],
+    defaultTargets: { anthropic: 'a', codex: null },
+    providerRouting: [{ provider: 'anthropic', models: [] }, { provider: 'codex', models: [] }],
+  };
+  const lines = routeStripLines(status);
+  const codex = lines.find(l => l.provider === 'codex');
+  assert.ok(codex, 'codex line rendered');
+  assert.ok(!codex.why.some(w => /^Current:/.test(w.text)), JSON.stringify(codex.why));
+  // Legacy server: one global cursor, no map.
+  const legacy = { currentAccount: 'a', accounts: [{ name: 'a', provider: 'anthropic' }, { name: 'b', provider: 'anthropic' }],
+    defaultTargets: { anthropic: 'b' }, providerRouting: [{ provider: 'anthropic', models: [] }] };
+  assert.ok(routeStripLines(legacy)[0].why.some(w => /^Current: a/.test(w.text)));
 });
 
 test('requests takes part in least-headroom selection and is last in the tie-break', () => {
