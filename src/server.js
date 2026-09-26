@@ -708,8 +708,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, label: label || null }));
         } catch (err) {
-          const missing = err.code === 'no-such-account';
-          if (!missing) console.error('[TeamClaude] Rename failed:', err.message);
+          const failure = /** @type {Error & { code?: string }} */ (err);
+          const missing = failure.code === 'no-such-account';
+          if (!missing) console.error('[TeamClaude] Rename failed:', failure.message);
           res.writeHead(missing ? 404 : 500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: missing ? 'no such account' : 'could not save the name; see the proxy log' }));
         }
