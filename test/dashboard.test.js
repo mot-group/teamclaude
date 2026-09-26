@@ -1131,6 +1131,25 @@ test('a family limit reports the reset of the reading that binds it', () => {
   // The family's own reading binds alone: its own reset, as before.
   assert.equal(reset({ unified7d: 0.3, unified7dReset: 6 * DAY, unified7dFable: 0.85, unified7dFableReset: DAY }), DAY);
   assert.equal(bindingLimit(fixtureAlex, FLEET.threshold, FLEET.table).resetAt, 30);
+
+  // A family cap that wins the headroom comparison does not hide a shared weekly also over the threshold.
+  const capped = { maxUsage: { unified7dFable: 0.5 }, switchThreshold: { unified7dFable: 0.8, unified7d: 1 } };
+  /** @param {Record<string, any>} quota */
+  const capReset = quota => {
+    const a = { ...capped, quota };
+    return quotaGate(a, accountQuotaGroups(a).models[0], 0.98, null);
+  };
+  const both = capReset({ unified7d: 0.85, unified7dReset: 6 * DAY, unified7dFable: 0.6, unified7dFableReset: DAY });
+  assert.deepEqual([both.kind, both.resetAt], ['cap', 6 * DAY]);
+  // The cap alone blocks: the family's reset.
+  assert.equal(capReset({ unified7d: 0.3, unified7dReset: 6 * DAY, unified7dFable: 0.6, unified7dFableReset: DAY }).resetAt, DAY);
+  // The shared weekly alone blocks: its reset.
+  assert.equal(capReset({ unified7d: 0.85, unified7dReset: 6 * DAY, unified7dFable: 0.2, unified7dFableReset: DAY }).resetAt, 6 * DAY);
+  // A blocking reading's reset is unknown: null.
+  assert.equal(capReset({ unified7d: 0.85, unified7dFable: 0.6, unified7dFableReset: DAY }).resetAt, null);
+  // A scoped family capped through the shared weekly takes the shared reset.
+  const opus = { maxUsage: { unified7d: 0.5 }, quota: { unified7d: 0.6, unified7dReset: 6 * DAY, scopedWeekly: { opus: { utilization: 0.1, resetAt: DAY } } } };
+  assert.equal(quotaGate(opus, accountQuotaGroups(opus).models[0], 0.98, null).resetAt, 6 * DAY);
 });
 
 test('fixture grades are unchanged by the governing-weekly gate', () => {

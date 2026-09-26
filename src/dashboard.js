@@ -243,9 +243,10 @@ export function gatingUtilization(quota, bucketKey) {
  * shared weekly's threshold. `ratio` is the reading the limit is measured on;
  * `via` repeats it when the shared weekly pushed it past the row's own reading,
  * else null. The bar keeps showing the row's own ratio. `resetAt` is when the
- * limit lifts: the shared weekly's reset when that reading binds, the later of
- * the two when both are at the limit, null when a reset it needs is unknown
- * (never an earlier recovery than the router's), else the row's own.
+ * limit lifts: the latest reset of every reading at its limit (cap or
+ * threshold, family or shared), null when one of those resets is unknown
+ * (never an earlier recovery than the router's); with nothing at a limit, the
+ * shared weekly's reset when it drives the grade, else the row's own.
  * @param {Record<string, any>|null|undefined} account
  * @param {{ ratio?: any, bucket?: string|null, gate?: string, resetAt?: any }|null|undefined} row
  * @param {number|null|undefined} fleetThreshold
@@ -271,12 +272,20 @@ export function quotaGate(account, row, fleetThreshold, fleetThresholds) {
   var shared = q.unified7d == null ? null : q.unified7d;
   /** @param {any} v */
   var ts = function (v) { var t = typeof v === 'number' ? v : Date.parse(v); return isFinite(t) ? t : NaN; };
-  var resetAt = r.resetAt;
-  if (family && !capBinds && own != null && own >= limit && shared != null && shared >= limit) {
-    // Both readings bar the family: it stays barred until the later window rolls.
-    var a = ts(r.resetAt), b = ts(q.unified7dReset);
-    resetAt = isNaN(a) || isNaN(b) ? null : a >= b ? r.resetAt : q.unified7dReset;
-  } else if (via != null) resetAt = q.unified7dReset == null ? null : q.unified7dReset;
+  // Every reading that bars the row right now, whichever won the headroom
+  // comparison: it recovers only once the last of their windows rolls.
+  var capReset = !r.bucket && r.gate ? q.unified7dReset : r.resetAt;
+  var blocking = [];
+  if (lim.cap != null && capOn != null && capOn >= lim.cap) blocking.push(capReset);
+  if (own != null && own >= lim.threshold) blocking.push(r.resetAt);
+  if (family && shared != null && shared >= lim.threshold) blocking.push(q.unified7dReset);
+  var resetAt = via != null ? (q.unified7dReset == null ? null : q.unified7dReset) : r.resetAt;
+  if (blocking.length) {
+    resetAt = blocking.reduce(function (latest, v) {
+      if (latest === null || isNaN(ts(v))) return null;
+      return latest === undefined || ts(v) > ts(latest) ? v : latest;
+    }, undefined);
+  }
   return {
     limit: limit, kind: capBinds ? 'cap' : 'threshold', ratio: ratio,
     headroom: ratio == null ? null : limit - ratio, grade: quotaGrade(ratio, limit, QUOTA_NEAR_BAND),
