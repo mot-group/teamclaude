@@ -66,17 +66,30 @@ Logs are available with `journalctl --user -u teamclaude-dashboard.service`. Aft
 
 Unknown quota means the proxy has not reported that quota. It does not mean an account has unlimited capacity. Token totals include only tokens reported by upstream responses. Named clients need `proxy.clientKeys`, and project attribution needs `proxy.usageDimensions`. Session rows need `proxy.sessionDetail: true` in the proxy config. See [configuration](configuration.md) for those options. The dashboard explains these empty states instead of inventing values.
 
+Each quota bar has one of four grades. The grade compares the spent share with the bucket's limit, which is the lower of the switch threshold and the account's usage cap:
+
+- OK: more than 15 points below the limit.
+- Near: within 15 points of it.
+- At: at or past the limit.
+- Spent: 100% used.
+
+The grade word prints next to every percentage, and a tick on the bar marks the limit. When the usage cap is the lower of the two, the tick turns red. The Spent / Left control changes the numbers and bar lengths but never the grade. Under each account name, the binding-limit line names the limit the router gates on, for example "Fable weekly 95% spent · near", then "switch at 100%" or "cap 60%" and the reset countdown. An account the router is skipping also gets a status badge in the CLI status wording, for example "account usage cap reached (maxUsage)".
+
 The Usage resets section records detected resets and banked Codex reset credits across server restarts. See [reset tracking](reset-tracking.md) for detection rules and Google Chat configuration.
 
 ## Dashboard views
 
-Overview combines the model routing forecast with an account comparison table. Accounts shows the same limits on their own. Activity contains request counters, token accounting, clients, dimensions, and Claude session activity. Routing keeps the configured-route details. Resets and Diagnostics retain reset inventory, history, probes, warmup, and server measurements. The navigation stays available on phones.
+Overview has three parts: the problems banner, the routing strip, and the account capacity table. The banner appears only when something needs attention. The routing strip gives one line per provider. It names where that provider's representative models land, tagged forced or pinned when a route is behind it, then the default target when it differs and the current account. The account capacity table groups accounts by provider. Accounts shows the same table on its own. Routing holds the per-model cards and the configured routes, and each route row carries its own Force and Clear force controls. Activity contains request counters, token accounting, clients, dimensions, and Claude session activity. Resets shows a card per watched account and the newest 20 history rows, with a button to show the rest. Forecast and Diagnostics keep their projections, probes, warmup, and server measurements. Diagnostics names threshold buckets in words, such as "Fable weekly 100%".
+
+The problems banner is not limited to Overview. It sits above every view, so a re-login or starved-route warning shows wherever you are. Claude items carry a clay rail and Codex items a teal one, and the provider name is always written beside the color. On phones the navigation wraps onto extra rows, so all seven views stay visible without sideways scrolling.
+
+When a poll fails the page keeps the last reading, grays the bars, adds a note, and turns the connection dot red. Reload config, Probe quotas, Manual selection, and the Force and Clear controls stay disabled until a poll succeeds. Refresh stays enabled as a manual retry, and the page also keeps polling in the background, so it recovers on its own.
 
 The Spent / Left control changes both percentages and bar lengths for current account quota, including account details. The browser remembers the choice. For example, 81% spent becomes 19% left. An unknown reading stays unknown in either mode. Rounded percentages always add to 100, and only a fully spent limit displays 100% spent or 0% left. Historical reset events always show quota spent, and routing configuration is unaffected.
 
 ## Model routing summary
 
-The header groups representative Claude and Codex models by their server-reported target. Blocked models and models with no eligible account have explicit labels. This forecast does not identify a native desktop login or promise which account every running request uses. Request pins, existing session assignments, distribution, advisor constraints, and retries can produce a different destination. Model IDs appear below each target.
+The Routing view's per-model cards group representative Claude and Codex models by their server-reported target. Blocked models and models with no eligible account have explicit labels. This forecast does not identify a native desktop login or promise which account every running request uses. Request pins, existing session assignments, distribution, advisor constraints, and retries can produce a different destination. Model IDs appear below each target.
 
 Manual selection records a starting account for rotation. It does not set a persistent preference, change priority, or pin a model. The dialog reports whether the server recorded the choice and whether rotation will skip it. The dashboard refreshes the server forecast after selection. A disconnected dashboard disables manual selection until status is available again.
 

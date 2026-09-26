@@ -156,6 +156,19 @@ test('IPv6 host literals match unbracketed configured addresses', async t => {
   assert.equal(status, 200);
 });
 
+test('a configured hostname matches whatever case the Host header uses', async t => {
+  const server = createDashboardServer({ credential, hosts: ['Zis-Mac-mini.local'] });
+  const url = await listen(server);
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const get = host => new Promise(resolve => {
+    http.get(url, { headers: { host } }, res => { res.resume(); resolve(res.statusCode); });
+  });
+  assert.equal(await get('Zis-Mac-mini.local:3457'), 200);
+  assert.equal(await get('zis-mac-mini.local:3457'), 200);
+  assert.equal(await get('ZIS-MAC-MINI.LOCAL:3457'), 200);
+  assert.equal(await get('attacker.test:3457'), 403);
+});
+
 // The Force dialog reaches the proxy through here on a LAN deployment. The
 // forwarded body is rebuilt field by field, like the switch above: this is the
 // server exposed to the LAN, and it relays nothing it has not named itself.

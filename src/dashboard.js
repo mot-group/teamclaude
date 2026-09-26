@@ -90,6 +90,21 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
+// Provider order everywhere the page lists providers (FR 3): Claude, then
+// Codex, then any other key alphabetically, then an account with no provider.
+// One comparator so the account table groups and routeRows' default rows
+// cannot drift apart.
+/** @param {string|null|undefined} a @param {string|null|undefined} b */
+export function providerOrder(a, b) {
+  /** @param {string|null|undefined} p */
+  var rank = function (p) { return p === 'anthropic' ? 0 : p === 'codex' ? 1 : p ? 2 : 3; };
+  var x = rank(a), y = rank(b);
+  if (x !== y) return x - y;
+  // Equal ranks mean both are strings or both are empty, so '' stands in for null.
+  var s = a || '', t = b || '';
+  return s < t ? -1 : s > t ? 1 : 0;
+}
+
 // Every bucket switchThreshold can be keyed by, plus the short names the
 // threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
 // and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
@@ -105,6 +120,203 @@ export var THRESHOLD_BUCKET_LABELS = {
   tokens: 'tokens', requests: 'requests',
 };
 
+// How far below the effective limit a bucket counts as `near` (FR 5): 15
+// points, so with the 0.98 default `near` starts at 83%. Written into the
+// page by SHARED_CONSTS, like the two tables above.
+export var QUOTA_NEAR_BAND = 0.15;
+
+/**
+ * The fleet-wide switch threshold for one bucket off the status payload's own
+ * two fields — the wire-shape twin of resolveFleetThreshold in model.js
+ * (`switchThresholds` entry, else its `default`, else `switchThreshold`, else
+ * 0.98). Shared by thresholdBadgeText and effectiveLimit so the badge and the
+ * bar grade agree on the number.
+ * @param {string} bucket
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {number}
+ */
+export function fleetFor(bucket, fleetThreshold, fleetThresholds) {
+  if (fleetThresholds && typeof fleetThresholds === 'object') {
+    var v = fleetThresholds[bucket];
+    if (v == null) v = fleetThresholds.default;
+    if (typeof v === 'number' && isFinite(v)) return v;
+  }
+  return typeof fleetThreshold === 'number' && isFinite(fleetThreshold) ? fleetThreshold : 0.98;
+}
+
+// Ported from model.js (resolveSwitchThreshold / resolveMaxUsage) for the same
+// reason THRESHOLD_BUCKET_KEYS is: the browser never runs an import, and the
+// page must grade an account exactly the way the router rotates it.
+/**
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {string} bucket
+ * @param {number} fleetValue
+ * @returns {number}
+ */
+export function resolveSwitchThreshold(accountThreshold, bucket, fleetValue) {
+  if (typeof accountThreshold === 'number' && isFinite(accountThreshold)) return accountThreshold;
+  if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    var v = accountThreshold[bucket];
+    if (v == null) v = accountThreshold.default;
+    if (typeof v === 'number' && isFinite(v)) return v;
+  }
+  return fleetValue;
+}
+
+/**
+ * @param {number|Object<string, number>|null|undefined} maxUsage
+ * @param {string} bucket
+ * @returns {number|null}  null means uncapped
+ */
+export function resolveMaxUsage(maxUsage, bucket) {
+  if (typeof maxUsage === 'number' && isFinite(maxUsage)) return maxUsage;
+  if (maxUsage && typeof maxUsage === 'object') {
+    var v = maxUsage[bucket];
+    if (v == null) v = maxUsage.default;
+    if (typeof v === 'number' && isFinite(v)) return v;
+  }
+  return null;
+}
+
+/**
+ * The ratio a bucket's bar is graded against (FR 4): the lower of the switch
+ * threshold the router would rotate at and the account's hard maxUsage cap.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {string} bucket
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {{ limit: number, kind: 'threshold'|'cap', threshold: number, cap: number|null }}
+ */
+export function effectiveLimit(account, bucket, fleetThreshold, fleetThresholds) {
+  var a = account || {};
+  var threshold = resolveSwitchThreshold(a.switchThreshold, bucket, fleetFor(bucket, fleetThreshold, fleetThresholds));
+  var cap = resolveMaxUsage(a.maxUsage, bucket);
+  var capped = cap != null && cap < threshold;
+  return { limit: capped ? /** @type {number} */ (cap) : threshold, kind: capped ? 'cap' : 'threshold', threshold: threshold, cap: cap };
+}
+
+/**
+ * The four-grade scale (FR 5): `spent` at ratio >= 1, `at` from the limit up,
+ * `near` within `band` below the limit, `ok` under that; null for a ratio the
+ * account did not report.
+ * @param {number|null|undefined} ratio
+ * @param {number} limit
+ * @param {number} [band]
+ * @returns {'ok'|'near'|'at'|'spent'|null}
+ */
+export function quotaGrade(ratio, limit, band) {
+  if (typeof ratio !== 'number' || !isFinite(ratio)) return null;
+  if (band == null) band = QUOTA_NEAR_BAND;
+  if (ratio >= 1) return 'spent';
+  if (ratio >= limit) return 'at';
+  if (ratio >= limit - band) return 'near';
+  return 'ok';
+}
+
+/**
+ * Ported from model.js for the same reason as resolveSwitchThreshold: the
+ * weekly reading the router gates a bucket on. Family spend meters into the
+ * family bucket AND the shared weekly (#175), so a family bucket gates on the
+ * higher of the two. Null is unreported, never zero.
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {string} bucketKey
+ * @returns {number|null}
+ */
+export function gatingUtilization(quota, bucketKey) {
+  var q = quota || {};
+  var own = q[bucketKey] == null ? null : q[bucketKey];
+  if (bucketKey === 'unified7d') return own;
+  var shared = q.unified7d == null ? null : q.unified7d;
+  if (own == null) return shared;
+  if (shared == null) return own;
+  return Math.max(own, shared);
+}
+
+/**
+ * The latest of several reset times (ms or date string), as given; null when
+ * any is unknown, so a limit never claims an earlier recovery than the router's.
+ * @param {any[]} resets
+ * @returns {any}
+ */
+export function latestReset(resets) {
+  /** @param {any} v */
+  var ts = function (v) { var t = typeof v === 'number' ? v : Date.parse(v); return isFinite(t) ? t : NaN; };
+  return resets.reduce(function (latest, v) {
+    if (latest === null || isNaN(ts(v))) return null;
+    return latest === undefined || ts(v) > ts(latest) ? v : latest;
+  }, undefined);
+}
+
+/**
+ * How the router gates one accountQuotaGroups row, so grade, headroom and tick
+ * match rotation. A family's switch threshold is compared against
+ * gatingUtilization (_isNearQuota), but its maxUsage cap against the family
+ * reading alone (capExceeded; the shared cap sits on the Weekly row). Whichever
+ * leaves less headroom names the limit. A family with no dedicated key
+ * (`gate: 'unified7d'`) is gated like _governingWeekly gates it, against the
+ * shared weekly's threshold. `ratio` is the reading the limit is measured on;
+ * `via` repeats it when the shared weekly pushed it past the row's own reading,
+ * else null. The bar keeps showing the row's own ratio. `resetAt` is when the
+ * limit lifts: the latest reset of every reading at its limit (cap or
+ * threshold, family or shared), null when one of those resets is unknown
+ * (never an earlier recovery than the router's); with nothing at a limit, the
+ * shared weekly's reset when it drives the grade, else the row's own.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {{ ratio?: any, bucket?: string|null, gate?: string, resetAt?: any }|null|undefined} row
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {{ limit: number, kind: 'threshold'|'cap', ratio: number|null, headroom: number|null, grade: 'ok'|'near'|'at'|'spent'|null, via: number|null, resetAt: any }}
+ */
+export function quotaGate(account, row, fleetThreshold, fleetThresholds) {
+  var q = (account || {}).quota || {};
+  var r = row || {};
+  var key = r.bucket || r.gate || 'default';
+  var lim = effectiveLimit(account, key, fleetThreshold, fleetThresholds);
+  var own = typeof r.ratio === 'number' && isFinite(r.ratio) ? r.ratio : null;
+  var family = r.bucket ? r.bucket !== 'unified7d' && r.bucket.indexOf('unified7d') === 0 : r.gate === 'unified7d';
+  // The row's own reading stands in for the family bucket: a scoped family has
+  // no dedicated field, and a Resets window carries its own utilization.
+  var gating = family ? gatingUtilization({ unified7d: q.unified7d, family: own }, 'family') : own;
+  var capOn = !r.bucket && r.gate ? (q.unified7d == null ? null : q.unified7d) : own;
+  var capRoom = lim.cap != null && capOn != null ? lim.cap - capOn : Infinity;
+  var capBinds = gating != null && capRoom < lim.threshold - gating;
+  var ratio = capBinds ? capOn : gating;
+  var limit = capBinds ? /** @type {number} */ (lim.cap) : lim.threshold;
+  var via = ratio != null && own != null && ratio > own ? ratio : null;
+  var shared = q.unified7d == null ? null : q.unified7d;
+  // Every reading that bars the row right now, whichever won the headroom
+  // comparison: it recovers only once the last of their windows rolls.
+  var capReset = !r.bucket && r.gate ? q.unified7dReset : r.resetAt;
+  var blocking = [];
+  if (lim.cap != null && capOn != null && capOn >= lim.cap) blocking.push(capReset);
+  if (own != null && own >= lim.threshold) blocking.push(r.resetAt);
+  if (family && shared != null && shared >= lim.threshold) blocking.push(q.unified7dReset);
+  var resetAt = via != null ? (q.unified7dReset == null ? null : q.unified7dReset) : r.resetAt;
+  if (blocking.length) resetAt = latestReset(blocking);
+  return {
+    limit: limit, kind: capBinds ? 'cap' : 'threshold', ratio: ratio,
+    headroom: ratio == null ? null : limit - ratio, grade: quotaGrade(ratio, limit, QUOTA_NEAR_BAND),
+    via: via, resetAt: resetAt,
+  };
+}
+
+/**
+ * A forecast window key as the operator reads it (FR 24): sentence case with
+ * the family capitalized, so `family:fable` is "Fable weekly window" and a
+ * seven-day `shared:*` key is "Shared weekly window". Any other key keeps its
+ * words, first letter raised.
+ * @param {string} bucket
+ * @param {number|null|undefined} [durationMs]
+ * @returns {string}
+ */
+export function forecastWindowLabel(bucket, durationMs) {
+  var b = String(bucket || '');
+  if (b.indexOf('shared:') === 0) return durationMs === 18000000 ? 'Shared five-hour window' : durationMs === 604800000 ? 'Shared weekly window' : 'Shared quota window';
+  b = b.indexOf('family:') === 0 ? b.slice(7) + ' weekly window' : b.replace(/:/g, ' ');
+  return b.charAt(0).toUpperCase() + b.slice(1);
+}
+
 /**
  * "switch at 100%" / "switch 7d 90%, fable 80%" — an account's OWN
  * switchThreshold (issue #409), or '' when it has none or every override it
@@ -119,14 +331,7 @@ export var THRESHOLD_BUCKET_LABELS = {
  */
 export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresholds) {
   /** @param {string} bucket */
-  function fleetFor(bucket) {
-    if (fleetThresholds && typeof fleetThresholds === 'object') {
-      var v = fleetThresholds[bucket];
-      if (v == null) v = fleetThresholds.default;
-      if (typeof v === 'number' && isFinite(v)) return v;
-    }
-    return typeof fleetThreshold === 'number' && isFinite(fleetThreshold) ? fleetThreshold : 0.98;
-  }
+  function fleet(bucket) { return fleetFor(bucket, fleetThreshold, fleetThresholds); }
   /** @param {number} v */
   function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
   /** @param {unknown} v */
@@ -140,7 +345,7 @@ export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresh
   if (typeof accountThreshold === 'number') {
     if (!valid(accountThreshold)) return '';
     ownDefault = accountThreshold;
-    if (accountThreshold !== fleetFor('default')) parts.push('at ' + pct(accountThreshold));
+    if (accountThreshold !== fleet('default')) parts.push('at ' + pct(accountThreshold));
   } else if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
     table = accountThreshold;
     ownDefault = table.default;
@@ -148,7 +353,7 @@ export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresh
       var v = table[key];
       if (!valid(v)) return;
       if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
-      if (v !== fleetFor(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
+      if (v !== fleet(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
     });
   }
   // As switchThresholdDiffs in model.js: the account's own default outranks a
@@ -156,13 +361,51 @@ export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresh
   // still move a bucket the fleet names (fleet 7d at 85%, account 0.98 puts
   // that account's 7d at 98%). When the defaults differ, "at N%" already
   // covers every bucket the account does not list.
-  if (valid(ownDefault) && ownDefault === fleetFor('default')) {
+  if (valid(ownDefault) && ownDefault === fleet('default')) {
     THRESHOLD_BUCKET_KEYS.forEach(function (key) {
       if (valid(table[key])) return;
-      if (ownDefault !== fleetFor(key)) parts.push(THRESHOLD_BUCKET_LABELS[key] + ' ' + pct(ownDefault));
+      if (ownDefault !== fleet(key)) parts.push(THRESHOLD_BUCKET_LABELS[key] + ' ' + pct(ownDefault));
     });
   }
   return parts.length ? 'switch ' + parts.join(', ') : '';
+}
+
+/**
+ * "cap 60%" / "cap 7d 60%, fable 50%" — the account's own maxUsage, the hard
+ * limit the router refuses at. It is shown on the account row and dialog (FR
+ * 25 keeps it off Diagnostics), or '' when the account has none.
+ * @param {number|Object<string, number>|null|undefined} maxUsage
+ * @returns {string}
+ */
+export function capBadgeText(maxUsage) {
+  /** @param {number} v */
+  function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  if (typeof maxUsage === 'number') return isFinite(maxUsage) ? 'cap ' + pct(maxUsage) : '';
+  if (!maxUsage || typeof maxUsage !== 'object' || Array.isArray(maxUsage)) return '';
+  /** @type {string[]} */
+  var parts = [];
+  Object.keys(maxUsage).forEach(function (key) {
+    var v = maxUsage[key];
+    if (typeof v !== 'number' || !isFinite(v)) return;
+    if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
+    parts.push((key === 'default' ? '' : THRESHOLD_BUCKET_LABELS[key] + ' ') + pct(v));
+  });
+  return parts.length ? 'cap ' + parts.join(', ') : '';
+}
+
+/**
+ * The account one provider's cursor sits on. `currentAccounts` is authoritative
+ * whenever the server sends it: a provider missing from the map has no current
+ * account, so a Claude-only fleet never shows its Claude account as Codex's.
+ * The global `currentAccount` answers only for an older server with no map.
+ * @param {Record<string, any>|null|undefined} status
+ * @param {string|null|undefined} provider
+ * @returns {string|null}
+ */
+export function currentFor(status, provider) {
+  var s = status || {};
+  if (s.currentAccounts && typeof s.currentAccounts === 'object') return s.currentAccounts[provider || ''] || null;
+  return s.currentAccount || null;
 }
 
 /**
@@ -396,14 +639,10 @@ export function routeRows(status) {
     // the exact ambiguity this table exists to remove. Older servers retain
     // the original single-row fallback.
     var defaults = s.defaultTargets || null;
-    var providers = defaults ? Object.keys(defaults).sort(function (a, b) {
-      if (a === 'anthropic') return -1;
-      if (b === 'anthropic') return 1;
-      return a < b ? -1 : a > b ? 1 : 0;
-    }) : [];
+    var providers = defaults ? Object.keys(defaults).sort(providerOrder) : [];
     if (!providers.length) providers = [rows[0].provider || 'anthropic'];
     providers.forEach(function (provider) {
-      var current = (s.currentAccounts && s.currentAccounts[provider]) || s.currentAccount || null;
+      var current = currentFor(s, provider);
       var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
       rows.push({
         kind: 'default', name: '',
@@ -416,6 +655,64 @@ export function routeRows(status) {
     });
   }
   return rows;
+}
+
+// The Overview strip (FR 13): one line per routingCards() entry, in
+// providerOrder whatever order the server listed them. The headline
+// is the card's own, so the strip and the Routing cards cannot disagree; the
+// tag says a forced or pinned route sits behind it. `why` carries the default
+// row (only when it differs from the headline) and the current account, with
+// the outranks / is-blocked wording the routes table used to print on its
+// default rows, so dropping those rows loses no sentence.
+/** @param {Record<string, any>|null|undefined} status */
+export function routeStripLines(status) {
+  var s = status || {};
+  /** @type {Record<string, any>} */
+  var defaults = {};
+  routeRows(s).forEach(/** @param {Record<string, any>} r */ function (r) { if (r.kind === 'default') defaults[r.provider] = r; });
+  /** @type {Record<string, boolean>} */
+  var forced = {};
+  (s.routes || []).forEach(/** @param {Record<string, any>} r */ function (r) { if (r.override && r.override.account) forced[r.name] = true; });
+  return routingCards(s).map(/** @param {Record<string, any>} card @param {number} i */ function (card, i) {
+    var models = ((s.providerRouting || [])[i] || {}).models || [];
+    var def = defaults[card.provider] || null;
+    var target = def ? def.target : null;
+    var current = currentFor(s, card.provider);
+    var why = [];
+    if (target && target !== card.headline) why.push({ text: 'Default target: ' + target, warn: false });
+    if (current && current === card.headline) why.push({ text: 'Also the current account', warn: false });
+    else if (current) {
+      // Like the old default row: any default that is not the current account
+      // explains itself, even a null one (nothing can serve); only "outranks"
+      // needs an account to name.
+      var reason = !def || target === current ? ''
+        : def.currentUnavailable ? ' · current account ' + current + ' is blocked: ' + (/** @type {Record<string, string>} */ (UNAVAILABLE_TEXT)[def.currentUnavailable] || def.currentUnavailable)
+        : target ? ' · ' + target + ' outranks the current account ' + current : '';
+      why.push({ text: 'Current: ' + current + reason, warn: !!reason });
+    }
+    /** @param {Array<Record<string, any>>} ms */
+    var tagOf = function (ms) {
+      return ms.some(function (m) { return m.route && forced[m.route]; }) ? 'forced'
+        : ms.some(function (m) { return m.pinned; }) ? 'pinned' : null;
+    };
+    // One group with a target: the headline names an account, not a summary.
+    var resolved = card.groups.length === 1 && !!card.groups[0].target;
+    return {
+      provider: card.provider, label: providerLabel(card.provider),
+      accounts: (s.accounts || []).filter(/** @param {Record<string, any>} a */ function (a) { return a.provider === card.provider; }).length,
+      headline: card.headline,
+      resolved: resolved,
+      tag: resolved ? tagOf(models) : null,
+      // A summary headline hides which families went where, so each of
+      // routingCards' groups gets a sub-line; the tag moves to its group.
+      groups: resolved ? [] : card.groups.map(/** @param {Record<string, any>} g */ function (g) {
+        return { labels: g.labels.join(', '),
+          target: g.target || (g.blocked ? 'blocked by policy' : 'no eligible account'), missing: !g.target,
+          tag: tagOf(models.filter(/** @param {Record<string, any>} m */ function (m) { return (m.target || null) === g.target && !!m.blocked === g.blocked; })) };
+      }),
+      why: why,
+    };
+  }).sort(/** @param {Record<string, any>} a @param {Record<string, any>} b */ function (a, b) { return providerOrder(a.provider, b.provider); });
 }
 
 // The override as one chip after the target. `state` is the server's own
@@ -592,7 +889,9 @@ export function problems(status) {
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
     var why = ATTENTION[a.unavailable];
-    if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
+    // provider and account let the banner tint the line and lead with the
+    // provider word (FR 1); the text itself stays provider-neutral.
+    if (why) out.push({ severity: 'warn', kind: 'account', provider: a.provider || null, account: a.name, text: 'Account ' + a.name + ' ' + why + '.' });
   });
 
   // Deliberately no spend line. `usedMinor` is month-to-date overage, so on a
@@ -611,26 +910,126 @@ export function quotaDisplay(ratio, mode = 'spent') {
   return mode === 'left' ? 100 - percentage : percentage;
 }
 
+/**
+ * The quota-row name for a switchThreshold/maxUsage bucket key, so a line that
+ * lists buckets reads like the bars do ("Fable weekly", not "unified7dFable").
+ * accountQuotaGroups uses it for its fixed rows; an unknown key comes back as is.
+ * @param {string} key
+ * @returns {string}
+ */
+export function bucketLabel(key) {
+  /** @type {Record<string, string>} */
+  var names = { unified5h: '5-hour', unified7d: 'Weekly', unified7dFable: 'Fable weekly', unified7dSonnet: 'Sonnet weekly', tokens: 'Tokens', requests: 'Requests' };
+  return Object.prototype.hasOwnProperty.call(names, key) ? names[key] : key;
+}
+
+/**
+ * @typedef {{ label: string, ratio: any, resetAt: any, bucket: string|null, gate?: string }} QuotaRow
+ * @param {Record<string, any>} [account]
+ * @returns {{ shared: QuotaRow[], session: QuotaRow[], models: QuotaRow[] }}
+ */
 export function accountQuotaGroups(account = {}) {
   var q = account.quota || {};
+  /** @type {QuotaRow[]} */
   var shared = [];
-  if (q.unified7d != null) shared.push({ label: 'Weekly', ratio: q.unified7d, resetAt: q.unified7dReset });
-  if (q.tokensLimit != null) shared.push({ label: 'Tokens', ratio: q.tokensLimit > 0 && q.tokensRemaining != null ? 1 - q.tokensRemaining / q.tokensLimit : null, resetAt: q.resetsAt });
-  var session = q.unified5h == null ? [] : [{ label: '5-hour', ratio: q.unified5h, resetAt: q.unified5hReset }];
-  var models = scopedWeeklyRows(q).map(function (row) {
-    return { label: row.label + ' weekly', ratio: row.utilization, resetAt: row.resetAt };
+  if (q.unified7d != null) shared.push({ label: bucketLabel('unified7d'), ratio: q.unified7d, resetAt: q.unified7dReset, bucket: 'unified7d' });
+  if (q.tokensLimit != null) shared.push({ label: bucketLabel('tokens'), ratio: q.tokensLimit > 0 && q.tokensRemaining != null ? 1 - q.tokensRemaining / q.tokensLimit : null, resetAt: q.resetsAt, bucket: 'tokens' });
+  // The router gates on `requests` too (capExceeded / maxUtilization in
+  // account-manager.js, same 1 - remaining / limit ratio), so it is a row and a
+  // binding-limit candidate. Appended after Tokens so existing rows keep their order.
+  if (q.requestsLimit != null) shared.push({ label: bucketLabel('requests'), ratio: q.requestsLimit > 0 && q.requestsRemaining != null ? 1 - q.requestsRemaining / q.requestsLimit : null, resetAt: q.resetsAt, bucket: 'requests' });
+  var session = q.unified5h == null ? [] : [{ label: bucketLabel('unified5h'), ratio: q.unified5h, resetAt: q.unified5hReset, bucket: 'unified5h' }];
+  // `bucket` is the switchThreshold/maxUsage key the row grades against; a
+  // family the router has no key for (Codex per-model) carries null.
+  var models = scopedWeeklyRows(q).map(/** @returns {QuotaRow} */ function (row) {
+    var key = 'unified7d' + row.family.charAt(0).toUpperCase() + row.family.slice(1);
+    if (THRESHOLD_BUCKET_KEYS.indexOf(key) !== -1) return { label: row.label + ' weekly', ratio: row.utilization, resetAt: row.resetAt, bucket: key };
+    // No switchThreshold key, but the router still gates this family on it
+    // against the shared weekly's threshold (_governingWeekly); quotaGate reads `gate`.
+    return { label: row.label + ' weekly', ratio: row.utilization, resetAt: row.resetAt, bucket: null, gate: 'unified7d' };
   });
   Object.keys(q.codexModelBuckets || {}).forEach(function (slug) {
     var bucket = q.codexModelBuckets[slug];
-    models.push({ label: (bucket.name || slug) + ' weekly', ratio: bucket.utilization, resetAt: bucket.resetAt });
+    models.push({ label: (bucket.name || slug) + ' weekly', ratio: bucket.utilization, resetAt: bucket.resetAt, bucket: null });
   });
   return { shared: shared, session: session, models: models };
 }
 
-// One table row per reset-event window for the Resets view. `when` is the
+/**
+ * The one bucket that gates this account's routing soonest (FR 9, 10): of the
+ * THRESHOLD_BUCKET_KEYS buckets the account reports a finite ratio for, the
+ * least headroom (quotaGate's limit minus the reading it gates on, so a
+ * family is measured the way the router gates it); ties go to the earlier key.
+ * A scoped family binds under its `gate` key; Codex per-model rows never bind.
+ * A blocked binding row reports when its models recover: the latest reset of
+ * every blocked row that gates those models, mirroring the router. The 5-hour,
+ * tokens and requests rows gate every model, as does the Weekly row, except
+ * that a family with its own bucket meets the shared weekly through its own
+ * threshold (already in its gate) and is barred directly only by the shared
+ * cap (capExceeded). Another family's row never gates it. Null when nothing gates.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {{ bucket: string, label: string, ratio: number, limit: number, limitKind: 'threshold'|'cap', headroom: number, grade: 'ok'|'near'|'at'|'spent'|null, via: number|null, resetAt: any }|null}
+ */
+export function bindingLimit(account, fleetThreshold, fleetThresholds) {
+  var groups = accountQuotaGroups(account || {});
+  /** @type {ReturnType<typeof bindingLimit>} */
+  var best = null;
+  /** @type {QuotaRow|null} */
+  var bestRow = null;
+  /** @type {Array<{ row: QuotaRow, g: ReturnType<typeof quotaGate> }>} */
+  var gated = [];
+  groups.shared.concat(groups.session, groups.models).forEach(function (row) {
+    var bucket = row.bucket || row.gate || null;
+    var order = bucket ? THRESHOLD_BUCKET_KEYS.indexOf(bucket) : -1;
+    if (!bucket || order === -1 || typeof row.ratio !== 'number' || !isFinite(row.ratio)) return;
+    var g = quotaGate(account, row, fleetThreshold, fleetThresholds);
+    gated.push({ row: row, g: g });
+    var headroom = /** @type {number} */ (g.headroom);
+    // `>=` on order keeps a scoped family that ties the Weekly row it gates under from displacing it.
+    if (best && (headroom > best.headroom || (headroom === best.headroom && order >= THRESHOLD_BUCKET_KEYS.indexOf(best.bucket)))) return;
+    best = {
+      bucket: bucket, label: row.label, ratio: row.ratio, limit: g.limit, limitKind: g.kind,
+      headroom: headroom, grade: g.grade, via: g.via, resetAt: g.resetAt,
+    };
+    bestRow = row;
+  });
+  // The forEach assigned these; TS narrows both to their null initializers without the casts.
+  var found = /** @type {ReturnType<typeof bindingLimit>} */ (best);
+  var binding = /** @type {QuotaRow|null} */ (bestRow);
+  if (found && binding && (found.grade === 'at' || found.grade === 'spent')) {
+    var q = (account || {}).quota || {};
+    var dedicated = groups.models.indexOf(binding) !== -1 && !!binding.bucket;
+    var cap7d = effectiveLimit(account, 'unified7d', fleetThreshold, fleetThresholds).cap;
+    /** @type {any[]} */
+    var resets = [];
+    gated.forEach(function (e) {
+      if (e.row === binding) { resets.push(e.g.resetAt); return; }
+      if (groups.models.indexOf(e.row) !== -1) return;
+      if (e.row.bucket === 'unified7d' && dedicated) {
+        if (cap7d != null && q.unified7d != null && q.unified7d >= cap7d) resets.push(e.row.resetAt);
+        return;
+      }
+      if (e.g.grade === 'at' || e.g.grade === 'spent') resets.push(e.g.resetAt);
+    });
+    found.resetAt = latestReset(resets);
+  }
+  return found;
+}
+
+// The reset tracker names its watched windows by limit; the grading helpers
+// name them by status bucket. This maps one onto the other so a Resets-view
+// mini bar grades exactly like the account bar for the same limit (FR 21).
+// A window missing here grades against the account's default limit.
+export var RESET_WINDOW_BUCKETS = { sevenDay: 'unified7d', fiveHour: 'unified5h', sevenDayFable: 'unified7dFable', sevenDaySonnet: 'unified7dSonnet' };
+
+// One table row per reset-event window for the Resets view, newest first
+// (RT 2), so the page can cap the table at its head. `when` is the
 // moment the reader cares about: a scheduled roll is the window's own reset
 // time, while an early or unclear reset is only known to lie between two
-// probes, so the probe that confirmed it dates it.
+// probes, so the probe that confirmed it dates it. A row with no readable
+// time sorts last.
 export function resetHistoryRows(events) {
   var rows = [];
   (events || []).forEach(function (event) {
@@ -641,13 +1040,15 @@ export function resetHistoryRows(events) {
       else { what = 'Reset, timing unclear'; kind = 'dim'; }
       rows.push({
         when: event.timing === 'scheduled' ? w.before.resetAt : w.after.at,
-        account: event.account, window: w.after.label, what: what, kind: kind,
+        account: event.account, provider: event.provider || null, window: w.after.label, what: what, kind: kind,
         before: Math.round(w.before.utilization * 100), after: Math.round(w.after.utilization * 100),
         observed: [w.before.at, w.after.at], resetAt: [w.before.resetAt, w.after.resetAt],
       });
     });
   });
-  return rows;
+  /** @param {any} v */
+  function time(v) { var t = typeof v === 'number' ? v : Date.parse(v); return isFinite(t) ? t : -Infinity; }
+  return rows.sort(function (a, b) { var ta = time(a.when), tb = time(b.when); return ta === tb ? 0 : tb > ta ? 1 : -1; });
 }
 
 export function sessionActivityText(sessions) {
@@ -657,21 +1058,27 @@ export function sessionActivityText(sessions) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, routingCards, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
+  scopedWeeklyRows, accountTokens, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
+  fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
+  currentFor, gatingUtilization, quotaGate, latestReset,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
 // `accountBadges` over the reset-credit cut-off, so a page without them would
 // ReferenceError on first render. The same goes for the two tables
-// `thresholdBadgeText` reads.
+// `thresholdBadgeText` reads and the UNAVAILABLE_TEXT wording
+// `routeStripLines` quotes.
 const SHARED_CONSTS = [
   `var STARVED_MIN = ${STARVED_MIN};`,
   `var STARVED_LIST_MAX = ${STARVED_LIST_MAX};`,
   `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
+  `var QUOTA_NEAR_BAND = ${QUOTA_NEAR_BAND};`,
+  `var RESET_WINDOW_BUCKETS = ${JSON.stringify(RESET_WINDOW_BUCKETS)};`,
+  `var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -681,7 +1088,21 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TeamClaude</title>
 <style>
-  :root { color-scheme:dark; --bg:#0d1015; --panel:#151920; --line:#2a313d; --text:#f0f2f7; --dim:#a0abba; --accent:#b5c7ff; --ok:#8cd7b0; --warn:#efc17b; --bad:#ffaaa6; }
+  :root {
+    color-scheme:dark;
+    --bg:#0d1015; --panel:#151920; --panel-2:#1b2029; --line:#2a313d; --text:#f0f2f7; --dim:#a0abba; --accent:#b5c7ff;
+    /* provider tints: identity only (rails, group headers, provider badges). Never a bar fill. */
+    --claude:#e8956a; --claude-soft:#2a1d16;
+    --codex:#3fbfd0; --codex-soft:#12242a;
+    --other:#a0abba; --other-soft:#1b2029;
+    /* quota grades: measurement only (bar fill, grade word, status badge). Never on identity elements. */
+    --grade-ok:#9ad46e; --grade-ok-ink:#b9e394; --grade-ok-soft:#1c2a19;
+    --grade-near:#f2d060; --grade-near-ink:#f5db85; --grade-near-soft:#2e2814;
+    --grade-at:#e8506a; --grade-at-ink:#ff9aae; --grade-at-soft:#33181e;
+    --grade-spent:#e8506a; --grade-spent-ink:#ff9aae; --grade-spent-soft:#33181e;
+    --track:#262d39; --tick:#f0f2f7;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 ui-sans-serif,system-ui,sans-serif; }
@@ -700,11 +1121,13 @@ const PAGE = `<!doctype html>
   #app { display:grid; grid-template-columns:204px minmax(0,1fr); min-height:100vh; }
   .sidebar { min-width:0; background:#10141a; border-right:1px solid var(--line); padding:30px 18px; }
   .brand { color:var(--text); font-size:20px; letter-spacing:-.5px; font-weight:650; display:flex; align-items:center; gap:10px; padding:0 10px; text-decoration:none; }
-  .brand-mark { width:22px; height:22px; display:inline-block; border:2px solid var(--accent); border-radius:5px; box-shadow:6px 6px 0 -2px var(--bg),6px 6px 0 0 var(--accent); margin-right:5px; }
+  /* Two-tint mark: Claude clay top-left, Codex teal bottom-right. */
+  .brand-mark { width:22px; height:22px; display:inline-block; flex:0 0 auto; border-radius:5px; background:linear-gradient(135deg,var(--claude) 0 50%,var(--codex) 50% 100%); }
   .nav-label { margin:42px 12px 12px; color:var(--dim); font-size:11px; letter-spacing:1.2px; text-transform:uppercase; }
   nav { display:flex; flex-direction:column; gap:5px; }
-  nav a { text-decoration:none; color:var(--dim); padding:11px 13px; min-height:44px; border-radius:7px; font-size:13px; }
-  nav a[aria-current] { color:#e0e8ff; background:#242d40; }
+  nav a { text-decoration:none; color:var(--dim); padding:11px 13px; min-height:44px; border-radius:7px; font-size:13px; border-left:3px solid transparent; }
+  /* The current item is neutral: the accent is kept for links and focus rings. */
+  nav a[aria-current] { color:var(--text); background:var(--panel-2); border-left-color:var(--text); font-weight:600; }
   nav a:hover { background:#1b2330; }
   .main-content { padding:32px 38px; max-width:1560px; width:100%; margin:0 auto; min-width:0; }
   .topline,.section-head { display:flex; align-items:center; justify-content:space-between; gap:18px; }
@@ -714,13 +1137,39 @@ const PAGE = `<!doctype html>
   .sub,.routing-help { color:var(--dim); font-size:13px; margin-top:8px; }
   .toolbar,.account-tools { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .toolbar { flex:0 0 auto; }
-  .live { color:var(--dim); font-size:12px; }
+  .live { color:var(--dim); font-size:12px; display:inline-flex; align-items:center; gap:7px; }
+  .live::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--dim); flex:0 0 auto; }
+  .live.on::before { background:var(--grade-ok); }
+  .stale .live::before { background:var(--grade-at); }
   .route-panel { background:var(--panel); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
   .route-panel .section-head { padding:17px 20px; margin:0; border-bottom:1px solid var(--line); }
   .provider-routing { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
-  .provider-card { padding:18px 20px; border-right:1px solid var(--line); min-width:0; }
+  /* Overview routing strip: one line per provider, the only home of the default target and current account. */
+  .route-strip { background:var(--panel); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
+  .route-strip .section-head { padding:15px 20px; margin:0; border-bottom:1px solid var(--line); }
+  .strip-line { display:grid; grid-template-columns:150px minmax(0,1fr); gap:14px; padding:14px 20px 14px 17px; border-left:3px solid var(--other); border-bottom:1px solid var(--line); align-items:baseline; }
+  .strip-line:last-child { border-bottom:0; }
+  .strip-line[data-provider="anthropic"] { border-left-color:var(--claude); }
+  .strip-line[data-provider="codex"] { border-left-color:var(--codex); }
+  .strip-provider b { font-weight:700; }
+  .strip-line[data-provider="anthropic"] .strip-provider b { color:var(--claude); }
+  .strip-line[data-provider="codex"] .strip-provider b { color:var(--codex); }
+  .strip-provider small { display:block; color:var(--dim); font-size:11px; }
+  .strip-target { font-size:15px; font-weight:600; overflow-wrap:anywhere; }
+  .strip-target .badge { vertical-align:2px; margin-left:6px; font-weight:400; }
+  .strip-why { color:var(--dim); font-size:12px; margin-top:3px; overflow-wrap:anywhere; }
+  .strip-group { font-size:13px; margin-top:3px; overflow-wrap:anywhere; }
+  .strip-group .badge { vertical-align:1px; margin-left:6px; }
+  .strip-target.warnt,.strip-why.warnt { color:var(--grade-near-ink); }
+  .route-strip>.routing-help { padding:12px 20px; margin:0; border-top:1px solid var(--line); font-size:12px; }
+  .provider-card { padding:16px 20px 18px 17px; border-right:1px solid var(--line); min-width:0; border-top:3px solid var(--other); }
+  .provider-card[data-provider="anthropic"] { border-top-color:var(--claude); }
+  .provider-card[data-provider="codex"] { border-top-color:var(--codex); }
   .provider-card:last-child { border-right:0; }
   .provider-card h3 { color:var(--dim); font-size:12px; font-weight:500; margin-bottom:8px; }
+  .provider-card h3 b { font-weight:600; }
+  .provider-card[data-provider="anthropic"] h3 b { color:var(--claude); }
+  .provider-card[data-provider="codex"] h3 b { color:var(--codex); }
   .provider-target { font-size:15px; font-weight:600; overflow-wrap:anywhere; }
   .provider-models { color:var(--dim); font-size:12px; margin-top:8px; overflow-wrap:anywhere; }
   .route-panel>.routing-help { padding:12px 20px; margin:0; border-top:1px solid var(--line); font-size:12px; }
@@ -729,9 +1178,9 @@ const PAGE = `<!doctype html>
   .search,input,select { background:#11161e; border:1px solid var(--line); color:var(--text); border-radius:7px; padding:9px 12px; }
   .search { width:200px; min-height:40px; font-size:12px; }
   .search::placeholder { color:var(--dim); }
-  .quota-toggle { display:inline-flex; align-items:center; border:1px solid #424d62; border-radius:7px; padding:3px; background:#11161e; }
-  .quota-toggle button { min-height:32px; padding:5px 12px; border:0; background:none; font-size:12px; color:var(--dim); }
-  .quota-toggle button[aria-pressed="true"] { background:#c2d0f6; color:#19243a; font-weight:600; }
+  .quota-toggle { display:inline-flex; align-items:center; border:1px solid #424d62; border-radius:7px; padding:2px; background:#11161e; }
+  .quota-toggle button { min-height:40px; padding:5px 12px; border:0; background:none; font-size:12px; color:var(--dim); }
+  .quota-toggle button[aria-pressed="true"] { background:var(--text); color:var(--bg); font-weight:600; }
   .account-table-wrap { border:1px solid var(--line); border-radius:11px; overflow:auto; background:var(--panel); }
   table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
   th,td { text-align:left; padding:14px 16px; font-size:13px; border-bottom:1px solid var(--line); vertical-align:top; }
@@ -739,35 +1188,103 @@ const PAGE = `<!doctype html>
   tr:last-child td { border-bottom:0; }
   th.sortable { cursor:pointer; }
   .account-table { table-layout:fixed; }
-  .account-table th:first-child { width:25%; }
+  .account-table th:first-child { width:27%; }
   .account-table th:last-child { width:94px; }
-  .account-table th:nth-child(4) { width:25%; }
-  .account-table .provider-heading th { background:#1b2029; color:#dce4f2; padding:10px 16px; font-weight:600; }
-  .account-table td { padding-top:20px; padding-bottom:20px; }
+  .account-table th:nth-child(4) { width:24%; }
+  /* Provider tint lives on identity slots only: the group band, the row rail, the provider badge, the dialog top border. */
+  .account-table .provider-heading th { padding:9px 16px 9px 13px; font-weight:600; border-left:3px solid var(--other); background:var(--other-soft); color:var(--text); }
+  .account-table .provider-heading[data-provider="anthropic"] th { border-left-color:var(--claude); background:var(--claude-soft); }
+  .account-table .provider-heading[data-provider="codex"] th { border-left-color:var(--codex); background:var(--codex-soft); }
+  .provider-heading th b { font-weight:700; }
+  .provider-heading[data-provider="anthropic"] th b { color:var(--claude); }
+  .provider-heading[data-provider="codex"] th b { color:var(--codex); }
+  .provider-heading th span { color:var(--dim); font-weight:400; }
+  .account-table td { padding-top:18px; padding-bottom:18px; }
+  .account-row td:first-child { border-left:3px solid var(--other); padding-left:13px; }
+  .account-row[data-provider="anthropic"] td:first-child { border-left-color:var(--claude); }
+  .account-row[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
   .reset-table td { padding:12px 16px; }
   .reset-table th:first-child { white-space:nowrap; }
   .reset-table td small { display:block; font-size:11px; margin-top:3px; }
   #resetAccounts .card p { margin-top:8px; }
   #resetAccounts .card p.usage { margin-top:6px; line-height:1.5; }
+  /* Resets: the rail and the provider word are identity; the mini bars are grades. */
+  .card[data-provider] { border-left:3px solid var(--other); }
+  .card[data-provider="anthropic"] { border-left-color:var(--claude); }
+  .card[data-provider="codex"] { border-left-color:var(--codex); }
+  .card-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+  .card-head h3 { font-size:14px; overflow-wrap:anywhere; }
+  #resetAccounts .card p.totals { margin:0 0 4px; font-family:var(--mono); font-size:12px; color:var(--dim); }
+  .totals b { color:var(--text); font-weight:600; }
+  .totals .early b { color:var(--grade-near-ink); }
+  .mini { display:grid; grid-template-columns:110px minmax(0,1fr) 120px; gap:10px; align-items:center; margin-top:10px; font-size:12px; }
+  .mini .lbl { color:var(--dim); }
+  .mini .num { text-align:right; color:var(--dim); font-size:11px; white-space:nowrap; }
+  .mini .num b { color:var(--text); font-weight:600; }
+  #resetAccounts .card .mini + p { margin-top:12px; }
+  #resetAccounts { margin:14px 0; }
+  #resetAccounts .card { margin:0; }
+  #resetAccounts .card p.warnt { font-size:12px; line-height:1.5; }
+  #resetsSection .warnt { color:var(--grade-near-ink); }
+  .reset-table tr[data-provider] td:first-child { border-left:3px solid var(--other); padding-left:13px; }
+  .reset-table tr[data-provider="anthropic"] td:first-child { border-left-color:var(--claude); }
+  .reset-table tr[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
+  .reset-table tr[data-provider="anthropic"] .pv { color:var(--claude); }
+  .reset-table tr[data-provider="codex"] .pv { color:var(--codex); }
+  .reveal { margin:12px 0 0; }
+  /* Forecast: the card rail and badge are identity; thin evidence recedes so a real projection stands out. */
+  #forecastAccounts td.dim { color:var(--dim); }
+  #jobs tr[data-provider] td:first-child { border-left:3px solid var(--other); padding-left:13px; }
+  #jobs tr[data-provider="anthropic"] td:first-child { border-left-color:var(--claude); }
+  #jobs tr[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
+  #jobs tr[data-provider="anthropic"] .pv { color:var(--claude); }
+  #jobs tr[data-provider="codex"] .pv { color:var(--codex); }
+  #jobs .badt { color:var(--grade-at-ink); }
   .account-name { font-size:13px; font-weight:600; display:block; overflow-wrap:anywhere; margin-bottom:7px; }
   .account-meta { color:var(--dim); font-size:11px; margin-top:6px; }
   .badges { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
-  .badge { display:inline-block; font-size:11px; border-radius:5px; border:1px solid var(--line); padding:3px 7px; color:var(--dim); }
-  .badge.provider { color:var(--text); }
-  .badge.provider.codex { color:var(--accent); border-color:var(--accent); }
+  .badge { display:inline-block; font-size:11px; border-radius:5px; border:1px solid var(--line); padding:2px 7px; color:var(--dim); line-height:1.5; }
+  .badge.provider { color:var(--text); border-color:var(--other); }
+  .badge.provider.anthropic { color:var(--claude); border-color:var(--claude); background:var(--claude-soft); }
+  .badge.provider.codex { color:var(--codex); border-color:var(--codex); background:var(--codex-soft); }
   .badge.meta { color:var(--dim); }
-  .badge.current { color:var(--accent); border-color:var(--accent); }
-  .badge.active { color:var(--ok); background:#192c24; border-color:#2e4c3c; }
-  .badge.throttled,.badge.exhausted { color:var(--warn); background:#30271e; border-color:#51412b; }
-  .badge.error { color:var(--bad); border-color:#68423f; }
-  .quota+.quota { margin-top:18px; }
-  .quota-head { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:5px 12px; margin-bottom:8px; }
+  .badge.current { color:var(--text); border-color:#4a5568; font-weight:600; }
+  /* Status badges use the grade palette, so a badge and a bar of one severity read as the same thing. */
+  .badge.near { color:var(--grade-near-ink); background:var(--grade-near-soft); border-color:var(--grade-near); }
+  .badge.at,.badge.spent,.badge.error { color:var(--grade-at-ink); background:var(--grade-at-soft); border-color:var(--grade-at); }
+  /* The binding-limit line: the one line to read per account. */
+  .binding { display:grid; grid-template-columns:auto minmax(0,1fr); gap:0 8px; align-items:center; margin-top:10px; font-family:var(--mono); font-variant-numeric:tabular-nums; font-size:11.5px; line-height:1.55; color:var(--dim); }
+  .binding .dot { width:8px; height:8px; border-radius:2px; background:var(--dim); }
+  .binding .sub2 { grid-column:2; color:var(--dim); font-size:11px; }
+  .binding[data-grade="ok"] .dot { background:var(--grade-ok); }
+  .binding[data-grade="near"] .dot { background:var(--grade-near); }
+  .binding[data-grade="at"] .dot { background:var(--grade-at); }
+  .binding[data-grade="spent"] .dot { background:var(--grade-spent); }
+  .binding b { color:var(--text); font-weight:600; }
+  .binding .g { font-weight:700; text-transform:uppercase; letter-spacing:.4px; }
+  .binding[data-grade="ok"] .g { color:var(--grade-ok-ink); }
+  .binding[data-grade="near"] .g { color:var(--grade-near-ink); }
+  .binding[data-grade="at"] .g,.binding[data-grade="spent"] .g { color:var(--grade-at-ink); }
+  /* Quota rows and graded bars. Grade lands as a class and data-grade, never an inline color. */
+  .quota+.quota { margin-top:16px; }
+  .quota-head { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:5px 12px; margin-bottom:7px; }
   .quota .lbl { color:var(--dim); font-size:11px; overflow-wrap:anywhere; }
-  .quota .val { font-size:12px; font-weight:600; white-space:nowrap; }
-  .quota .val small { font-size:11px; color:var(--dim); font-weight:400; }
-  .bar { height:5px; border-radius:5px; background:#303744; overflow:hidden; }
-  .bar i { display:block; height:100%; border-radius:5px; background:#a4b9eb; }
-  .bar i.warn { background:#dbb16a; }
+  .quota .lbl.binding-mark::before { content:"▸ "; color:var(--text); }
+  .quota .val { font-size:12px; font-weight:600; white-space:nowrap; font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  .quota .val small { font-size:11px; color:var(--dim); font-weight:400; font-family:ui-sans-serif,system-ui,sans-serif; }
+  .quota .val .g { font-size:10px; font-weight:700; letter-spacing:.4px; text-transform:uppercase; margin-left:6px; font-family:ui-sans-serif,system-ui,sans-serif; }
+  .quota[data-grade="ok"] .g { color:var(--grade-ok-ink); }
+  .quota[data-grade="near"] .g { color:var(--grade-near-ink); }
+  .quota[data-grade="at"] .g,.quota[data-grade="spent"] .g { color:var(--grade-at-ink); }
+  .bar { position:relative; height:6px; border-radius:3px; background:var(--track); }
+  .bar i { display:block; height:100%; border-radius:3px; background:var(--dim); }
+  .bar[data-grade="ok"] i { background:var(--grade-ok); }
+  .bar[data-grade="near"] i { background:var(--grade-near); }
+  .bar[data-grade="at"] i { background:var(--grade-at); }
+  .bar[data-grade="spent"] i { background:var(--grade-spent); background-image:repeating-linear-gradient(135deg,transparent 0 4px,#0d101580 4px 6px); }
+  .bar b { position:absolute; top:-3px; width:2px; height:12px; background:var(--tick); border-radius:1px; transform:translateX(-1px); }
+  .bar b.cap { background:var(--grade-at-ink); width:3px; }
+  .bar b.cap::after { content:""; position:absolute; left:-3px; top:-4px; border:4px solid transparent; border-top-color:var(--grade-at-ink); border-bottom:0; }
   .quota-reset { font-size:11px; color:var(--dim); margin-top:6px; }
   .quota-reset span { display:block; }
   .quota-unknown { color:var(--dim); font-size:12px; }
@@ -782,7 +1299,11 @@ const PAGE = `<!doctype html>
   .split { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
   .stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin:22px 0; }
   .metric { border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:20px; }
-  .metric strong { display:block; font-size:30px; font-weight:600; margin:6px 0; }
+  .metric strong { display:block; font-size:30px; font-weight:600; margin:6px 0; font-family:var(--mono); font-variant-numeric:tabular-nums; letter-spacing:-.5px; }
+  #tokens dd,.mono { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  /* Activity: the chart card and the token card share the row and its height. */
+  .split>section { display:flex; flex-direction:column; min-width:0; }
+  .split>section>.card { flex:1; }
   .metric-label,.metric small { font-size:12px; color:var(--dim); }
   .details { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:0; }
   .details dt { color:var(--dim); font-size:12px; }
@@ -792,62 +1313,85 @@ const PAGE = `<!doctype html>
   td.num,th.num { text-align:right; }
   .dim,.no { color:var(--dim); }
   .no { text-decoration:line-through; }
-  .ok { color:var(--ok); }
-  .pin { color:var(--accent); }
-  .warnt,.blocked { color:var(--warn); }
-  .badt { color:var(--bad); }
+  .ok { color:var(--grade-ok-ink); }
+  .pin { color:var(--text); }
+  .warnt,.blocked { color:var(--grade-near-ink); }
+  .badt { color:var(--grade-at-ink); }
   .empty { color:var(--dim); padding:28px; text-align:center; }
   .history { height:90px; display:flex; align-items:end; gap:3px; margin:20px 0 12px; }
-  .history i { flex:1; background:var(--accent); border-radius:3px 3px 0 0; min-height:2px; }
+  /* A request count carries neither provider nor grade, so the bars stay dim. */
+  .history i { flex:1; background:var(--dim); border-radius:3px 3px 0 0; min-height:2px; }
+  .history.empty-chart { border:1px dashed var(--line); border-radius:8px; align-items:center; justify-content:center; color:var(--dim); font-size:12px; }
   .history-label { color:var(--dim); font-size:12px; }
   #err,#note,#problems { display:none; margin:0 0 20px; font-size:13px; }
-  #err { border:1px solid #68503c; background:#282019; padding:14px 17px; border-radius:8px; color:var(--warn); }
-  #problems>div { border:1px solid #68503c; background:#282019; padding:12px 17px; border-radius:8px; margin-bottom:9px; color:var(--warn); }
-  #problems>.bad { border-color:#6b4142; background:#2b1e21; color:var(--bad); }
+  #err { border:1px solid #5a4a1e; background:var(--grade-near-soft); padding:14px 17px; border-radius:8px; color:var(--grade-near-ink); }
+  #problems>div { border:1px solid #5a4a1e; border-left-width:3px; background:var(--grade-near-soft); padding:12px 17px 12px 14px; border-radius:8px; margin-bottom:9px; color:var(--grade-near-ink); }
+  #problems>div[data-provider] { border-left-color:var(--other); }
+  #problems>div[data-provider="anthropic"] { border-left-color:var(--claude); }
+  #problems>div[data-provider="codex"] { border-left-color:var(--codex); }
+  #problems .pv { font-weight:700; }
+  #problems>div[data-provider="anthropic"] .pv { color:var(--claude); }
+  #problems>div[data-provider="codex"] .pv { color:var(--codex); }
+  #problems>.bad { border-color:#6b2f3c; background:var(--grade-at-soft); color:var(--grade-at-ink); }
   #note { padding:13px 17px; border:1px solid var(--line); border-radius:8px; }
-  #note.warn,.dialog-result.warn { color:var(--warn); } #note.error,.dialog-result.error { color:var(--bad); }
-  .stale .provider-routing { opacity:.6; }
-  .stale .bar i { background:#7f8799; }
-  #keybox { display:none; max-width:440px; margin:12vh auto; padding:30px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+  #note.warn,.dialog-result.warn { color:var(--grade-near-ink); } #note.error,.dialog-result.error { color:var(--grade-at-ink); }
+  .stale .route-strip,.stale .provider-routing { opacity:.6; }
+  .stale .bar i { background:#7f8799; background-image:none; }
+  .stale-note { display:none; border:1px solid #6b2f3c; background:var(--grade-at-soft); color:var(--grade-at-ink); padding:12px 17px; border-radius:8px; margin:0 0 20px; font-size:13px; }
+  .stale .stale-note { display:block; }
+  #keybox { display:none; max-width:440px; margin:12vh auto; padding:30px; border:1px solid var(--line); border-top:3px solid var(--claude); border-radius:12px; background:var(--panel); }
+  #keybox .brand-mark { margin-bottom:18px; }
   #keybox input { width:100%; min-height:44px; margin:8px 0 16px; }
   #keybox label { display:block; margin-top:22px; }
   #keybox button { width:100%; }
-  #loginError { color:var(--bad); margin-top:12px; }
-  .primary { background:#c0cfff; color:#172239; border-color:#c0cfff; font-weight:600; }
+  #loginError { color:var(--grade-at-ink); margin-top:12px; }
+  .primary { background:var(--text); color:var(--bg); border-color:var(--text); font-weight:600; }
   dialog { width:550px; max-width:calc(100% - 32px); max-height:calc(100dvh - 40px); color:var(--text); background:#171c24; border:1px solid #3a4556; border-radius:14px; padding:27px; }
   dialog::backdrop { background:#03060aba; backdrop-filter:blur(3px); }
+  dialog[data-provider="anthropic"] { border-top:3px solid var(--claude); }
+  dialog[data-provider="codex"] { border-top:3px solid var(--codex); }
   .dialog-head { display:flex; align-items:start; justify-content:space-between; gap:20px; margin-bottom:15px; }
   .dialog-head h2 { font-size:22px; overflow-wrap:anywhere; }
   .dialog-head button { padding:5px 12px; min-height:40px; }
   .dialog-help { color:var(--dim); font-size:13px; margin:14px 0 20px; }
   dialog label { display:block; font-size:12px; margin:18px 0 8px; }
-  dialog select { width:100%; min-height:44px; }
+  dialog select { width:100%; min-height:44px; border-left:4px solid var(--line); }
+  dialog select[data-provider="anthropic"] { border-left-color:var(--claude); }
+  dialog select[data-provider="codex"] { border-left-color:var(--codex); }
   .explain { background:#202631; border:1px solid #354050; border-radius:8px; padding:14px 17px; color:#c5cedd; font-size:12px; margin:18px 0; }
   .explain ul { margin:9px 0 0; padding-left:18px; }
   .explain li+li { margin-top:8px; }
   fieldset { border:1px solid var(--line); border-radius:8px; margin:20px 0 0; padding:6px 15px 14px; }
   legend { color:var(--dim); font-size:12px; padding:0 6px; }
   .force-modes label { display:flex; align-items:center; gap:9px; margin:10px 0 0; font-size:13px; }
-  .force-modes input { width:16px; height:16px; padding:0; flex:0 0 auto; accent-color:#c0cfff; }
+  .force-modes input { width:16px; height:16px; padding:0; flex:0 0 auto; accent-color:var(--text); }
   .force-modes p { margin:5px 0 0 25px; }
-  #routes td .act+.act { margin-left:12px; }
+  /* Force controls live in the route's target cell, not a column of their own. */
+  .route-actions { display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-top:6px; }
+  .route-actions .act { min-height:40px; padding:2px 0; }
   #routes .chip { display:inline-block; }
+  #routes .chip.chip-line { display:block; margin-top:4px; }
+  #routes tr[data-provider] td:first-child { border-left:3px solid var(--other); padding-left:13px; }
+  #routes tr[data-provider="anthropic"] td:first-child { border-left-color:var(--claude); }
+  #routes tr[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
   .dialog-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:23px; }
   .dialog-result { font-size:13px; padding:13px 0; }
   #accountDetails .quota { margin:18px 0; }
   #accountDetails .quota-reset { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   #accountDetails .quota .lbl { font-size:13px; }
-  .section-body>h2 { margin:26px 0 12px; }
+  .section-body>h2,#routesWrap>h2 { margin:26px 0 12px; }
   footer { color:var(--dim); font-size:11px; margin-top:28px; }
-  @media(max-width:1150px) { .main-content { padding:26px; } #app { grid-template-columns:175px minmax(0,1fr); } .sidebar { padding:28px 12px; } .section-head { align-items:start; } .account-tools { justify-content:flex-end; } .account-table th:first-child { width:24%; } .account-table th:last-child { width:68px; } th,td { padding:14px 12px; } }
-  @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; overflow:auto; margin-top:18px; } nav a { white-space:nowrap; flex-shrink:0; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; } }
-  @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:38px; padding:6px 13px; } .route-panel .section-head { flex-direction:row; flex-wrap:wrap; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; background:none; border:0; padding:12px 0; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:14px; } .account-table td { border:0; padding:0 0 18px; } .account-table td:last-child { padding:0; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } }
-  @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } }
+  @media(max-width:1150px) { .main-content { padding:26px; } #app { grid-template-columns:175px minmax(0,1fr); } .sidebar { padding:28px 12px; } .section-head { align-items:start; } .account-tools { justify-content:flex-end; } .account-table th:first-child { width:24%; } .account-table th:last-child { width:68px; } th,td { padding:14px 12px; } .strip-line { grid-template-columns:120px minmax(0,1fr); } }
+  @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); grid-template-rows:auto 1fr; } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; flex-wrap:wrap; gap:6px; margin-top:16px; } nav a { padding:10px 12px; border:1px solid var(--line); border-left-width:3px; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; }
+    #routes thead { display:none; } #routes,#routes tbody,#routes tr,#routes td { display:block; width:100%; } #routes tr { padding:12px 0; border-bottom:1px solid var(--line); } #routes tr:last-child { border-bottom:0; } #routes tr[data-provider] { border-left:3px solid var(--other); } #routes tr[data-provider="anthropic"] { border-left-color:var(--claude); } #routes tr[data-provider="codex"] { border-left-color:var(--codex); } #routes tr[data-provider] td:first-child { border-left:0; padding-left:16px; } #routes td { border:0; padding:3px 16px; } #routes td[data-label]::before { content:attr(data-label) ": "; color:var(--dim); } #routes .route-actions { padding-top:4px; gap:0 8px; } #routes .route-actions .chip { flex-basis:100%; } #routes .route-actions .act { min-height:44px; } }
+  @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:40px; padding:6px 13px; } .route-panel .section-head,.route-strip .section-head { flex-direction:row; flex-wrap:wrap; } .strip-line { grid-template-columns:1fr; gap:4px; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .route-actions .act { width:auto; border-top:0; padding:2px 0; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } #keybox { margin:10vh 16px; padding:24px; } }
+  @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } .reset-table tr[data-provider] { border-left:3px solid var(--other); } .reset-table tr[data-provider="anthropic"] { border-left-color:var(--claude); } .reset-table tr[data-provider="codex"] { border-left-color:var(--codex); } .reset-table tr[data-provider] td:first-child { border-left:0; padding-left:16px; } .mini { grid-template-columns:90px minmax(0,1fr) 96px; } .reveal { width:100%; min-height:44px; } }
 </style>
 </head>
 <body>
 <a class="skip" href="#mainContent">Skip to dashboard</a>
 <div id="keybox">
+  <i class="brand-mark" aria-hidden="true"></i>
   <div class="eyebrow">Private workspace</div><h1>TeamClaude</h1>
   <p class="sub" id="loginHelp">Enter your proxy key to view status.</p>
   <label for="key" id="keyLabel">Proxy key</label><input id="key" type="password" autocomplete="current-password">
@@ -860,22 +1404,27 @@ const PAGE = `<!doctype html>
   </aside>
   <main id="mainContent" class="main-content">
     <header class="topline"><div><div class="eyebrow" id="breadcrumb">Dashboard / Overview</div><h1 id="pageTitle">Routing & capacity</h1><p class="sub" id="summary">Where requests are expected to go. How much quota each account has used.</p></div><div class="toolbar"><span class="live" id="connection" role="status">Connecting</span><button id="refresh">Refresh</button><button id="reload" type="button">Reload config</button><button id="probe" type="button">Probe quotas</button><button id="logout">Sign out</button></div></header>
-    <div id="err" role="alert"></div><div id="problems" role="status"></div><div id="note" role="status"></div>
-    <section aria-labelledby="modelRoutingTitle" id="modelRouting" class="route-panel" data-section="overview routing">
-      <div class="section-head"><div><h2 id="modelRoutingTitle">Expected routing</h2><p class="sub">Representative models, based on the latest router status</p></div><button id="manualSelection">Manual selection</button></div>
-      <div class="provider-routing" id="providerRouting"></div><p class="routing-help" id="currentAccounts" role="status" hidden></p><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
+    <div id="err" role="alert"></div><p class="stale-note" role="status">Bars are gray because these readings may be stale. They return to color when the connection does.</p><div id="problems" role="status"></div><div id="note" role="status"></div>
+    <section aria-labelledby="routeStripTitle" id="routeStrip" class="route-strip" data-section="overview">
+      <div class="section-head"><div><h2 id="routeStripTitle">Next request goes to</h2><p class="sub">Where each provider's representative models land, from the latest router status</p></div><button id="manualSelection">Manual selection</button></div>
+      <div id="routeStripLines"></div><p class="routing-help">Routing forecast, not live traffic. Sessions, request pins and retries can use another account. Per-model targets and configured routes are under Routing.</p>
     </section>
     <section id="accountSection" data-section="overview accounts">
       <div class="section-head"><div><h2>Account capacity <span class="tag" id="accountCount"></span></h2><p class="sub" id="quotaHelp">Bars and percentages show quota spent.</p></div><div class="account-tools"><div class="quota-toggle" role="group" aria-label="Quota display"><button id="quotaSpent" aria-pressed="true">Spent</button><button id="quotaLeft" aria-pressed="false">Left</button></div><input class="search" id="accountSearch" type="search" aria-label="Find an account" placeholder="Find an account"></div></div>
-      <div id="accounts"></div><div class="account-foot"><span id="quotaTimezone"></span><span>Requests, tokens, and account controls are in Details.</span></div>
+      <div id="accounts"></div><div class="account-foot"><span id="quotaTimezone"></span><span>▸ marks the limit the router gates on. Requests, tokens and account controls are in Details.</span></div>
     </section>
     <section data-section="activity" hidden class="section-body">
-      <div id="overview" class="stats"></div><div class="split"><section><h2>Request activity</h2><div class="card"><p class="usage">Requests observed while this page is open</p><div class="history" id="history" role="img" aria-label="Request activity"></div><p class="history-label" id="historyLabel">Collecting the first sample...</p></div></section><section><h2>Token accounting</h2><div class="card" id="tokens"></div></section></div>
+      <div id="overview" class="stats"></div><div class="split"><section><h2>Request activity</h2><div class="card"><p class="usage">Requests observed while this page is open</p><div class="history empty-chart" id="history" role="img" aria-label="This chart fills while the page is open and resets on reload.">No samples yet</div><p class="history-label" id="historyLabel">This chart fills while the page is open and resets on reload.</p></div></section><section><h2>Token accounting</h2><div class="card" id="tokens"></div></section></div>
       <div id="clientsWrap"><h2>Clients</h2><div class="card"><table id="clients"></table></div></div><div id="dimensionsWrap"></div>
       <section id="sessionsWrap"><h2>Claude session activity</h2><p class="sub" id="sessionActivity"></p><p class="usage" id="sessionKnown"></p><p class="usage">Counts only requests carrying a Claude session ID. A session remains recent for two minutes after a request, or while a request is running. Codex and requests without a session ID are not included. This does not count open apps or terminals.</p><div class="card"><div class="filters"><label>Project <select id="fProject"></select></label><label>Client <select id="fClient"></select></label><span class="hint" id="sessionCount"></span></div><table id="sessions"></table></div></section>
     </section>
-    <section data-section="routing" hidden class="section-body"><div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
-    <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table></div><p class="usage" id="resetHistoryNote"></p></section>
+    <section data-section="routing" hidden class="section-body">
+      <section aria-labelledby="modelRoutingTitle" id="modelRouting" class="route-panel" data-section="routing">
+        <div class="section-head"><div><h2 id="modelRoutingTitle">Expected routing per model</h2><p class="sub">Representative models, based on the latest router status</p></div><button id="routingManualSelection">Manual selection</button></div>
+        <div class="provider-routing" id="providerRouting"></div><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
+      </section>
+      <div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
+    <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table><div id="resetReveal"></div></div><p class="usage" id="resetHistoryNote"></p></section>
     <section data-section="forecast" hidden class="section-body" id="forecastSection">
       <div class="section-head"><div><h2>Subscription forecasts</h2><p class="sub">Account usage includes every machine using that subscription.</p></div><label>Work horizon <select id="forecastHorizon"><option value="2">2 hours</option><option value="8" selected>8 hours</option><option value="24">1 day</option><option value="72">3 days</option><option value="168">7 days</option></select></label></div>
       <div class="card"><p id="forecastSummary" role="status"></p><p class="usage" id="forecastCoverage"></p><p class="usage" id="forecastAssumptions"></p></div>
@@ -906,6 +1455,7 @@ const PAGE = `<!doctype html>
   var clearConfirmRoute = null;
   var clearConfirmFocus = false;
   var restoreClearFocus = null;
+  var routeFocus = null;
   var connected = false;
   var lastUpdated = null;
   var history = [];
@@ -918,7 +1468,11 @@ const PAGE = `<!doctype html>
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
-  var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
+  // The reset history opens on its newest rows (FR 22); the reveal is page
+  // state kept out here so the 5 s full re-render does not collapse it.
+  var RESET_HISTORY_DEFAULT = 20;
+  var resetHistoryExpanded = false;
+  var resetShowAll = null;
 
 ${SHARED_CONSTS}
 
@@ -966,60 +1520,119 @@ ${SHARED_HELPERS}
     return (s / 86400).toFixed(1) + 'd';
   }
 
-  function quotaRow(label, ratio, resetAt) {
+  // "switch at 98%" / "cap 60%": the number a bar is graded against, worded by
+  // which of the two limits binds. Rounded like the threshold badge.
+  function limitPct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  function limitText(kind, limit) { return (kind === 'cap' ? 'cap ' : 'switch at ') + limitPct(limit); }
+  // Why a short bar can carry a red grade: the router gated the family on the shared weekly (quotaGate).
+  function viaText(via, mode) { return via == null ? '' : ' · via shared weekly ' + quotaDisplay(via, mode) + '% ' + mode; }
+  function resetIn(resetAt) {
+    var ts = parseTs(resetAt);
+    if (isNaN(ts)) return 'reset time not reported';
+    return ts > Date.now() ? 'resets in ' + fmtIn((ts - Date.now()) / 1000) : 'reset time passed';
+  }
+
+  // The graded meter for one bucket (FR 4-6), shared by the account table and
+  // the Resets view's mini bars. The fill follows the Spent/Left toggle; the
+  // grade and the screen-reader text stay on the spent ratio.
+  function gradedBar(label, ratio, lim, grade, reset) {
+    var value = quotaDisplay(ratio, quotaMode);
+    var bar = el('div', 'bar');
+    bar.setAttribute('data-grade', grade);
+    bar.setAttribute('role', 'meter');
+    bar.setAttribute('aria-label', label + ', quota ' + quotaMode);
+    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
+    bar.setAttribute('aria-valuenow', String(value));
+    bar.setAttribute('aria-valuetext', quotaDisplay(ratio, 'spent') + '% spent, ' + grade + viaText(lim.via, 'spent').replace(' ·', ',') + ', ' + limitText(lim.kind, lim.limit) + ', ' + reset);
+    var fill = el('i', grade); fill.style.width = value + '%'; bar.appendChild(fill);
+    // The tick sits where the router gates; a fill may run past a cap tick, so a bar can be at well short of full (FR 6).
+    var tick = el('b', lim.kind === 'cap' ? 'cap' : ''); tick.style.left = limitPct(lim.limit); tick.title = limitText(lim.kind, lim.limit); bar.appendChild(tick);
+    return bar;
+  }
+
+  // One bucket of one account: label, value, the graded bar with its limit
+  // tick, and the reset. binding marks the bucket bindingLimit() named for
+  // this account (FR 18). Grade is computed on the spent ratio whatever the
+  // toggle shows, so Left changes the number and the fill, never the color.
+  function quotaRow(q, a, s, binding) {
     var row = el('div', 'quota');
     var head = el('div', 'quota-head');
-    head.appendChild(el('span', 'lbl', label));
-    var value = quotaDisplay(ratio, quotaMode);
+    head.appendChild(el('span', 'lbl' + (binding ? ' binding-mark' : ''), q.label));
+    var value = quotaDisplay(q.ratio, quotaMode);
     if (value == null) {
       head.appendChild(el('span', 'quota-unknown', 'Not reported'));
       row.appendChild(head);
       return row;
     }
+    // A Codex per-model row has no bucket key and grades against the account's default limit (FR 4).
+    var lim = quotaGate(a, q, s.switchThreshold, s.switchThresholds);
+    var grade = lim.grade;
+    row.setAttribute('data-grade', grade);
     var val = el('span', 'val', value + '% ');
     val.appendChild(el('small', '', quotaMode));
+    val.appendChild(el('span', 'g', grade));
+    if (lim.via != null) val.appendChild(el('small', 'via', viaText(lim.via, quotaMode)));
     head.appendChild(val); row.appendChild(head);
-    var bar = el('div', 'bar');
-    bar.setAttribute('role', 'meter');
-    bar.setAttribute('aria-label', label + ', quota ' + quotaMode);
-    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
-    bar.setAttribute('aria-valuenow', String(value));
-    var fill = el('i', ratio >= 1 ? 'warn' : ''); fill.style.width = value + '%'; bar.appendChild(fill); row.appendChild(bar);
-    var reset = el('div', 'quota-reset');
-    var ts = parseTs(resetAt);
-    if (!isNaN(ts)) {
-      reset.appendChild(el('span', '', ts > Date.now() ? 'Resets in ' + fmtIn((ts - Date.now()) / 1000) : 'Reset time passed'));
-      reset.appendChild(el('span', 'quota-date', new Date(ts).toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })));
-    } else reset.textContent = 'Reset time not reported';
-    row.appendChild(reset);
+    // The reset of the reading that binds (quotaGate), so a family barred by the shared weekly names that window's roll.
+    var reset = resetIn(lim.resetAt);
+    row.appendChild(gradedBar(q.label, q.ratio, lim, grade, reset));
+    var resetLine = el('div', 'quota-reset');
+    resetLine.appendChild(el('span', '', reset.charAt(0).toUpperCase() + reset.slice(1)));
+    var ts = parseTs(lim.resetAt);
+    if (!isNaN(ts)) resetLine.appendChild(el('span', 'quota-date', new Date(ts).toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })));
+    row.appendChild(resetLine);
     return row;
   }
 
-  function accountBadge(a) {
-    var text, kind = '';
-    if (a.disabled) { text = 'Disabled'; kind = 'error'; }
-    else if (a.unavailable) { text = UNAVAILABLE_TEXT[a.unavailable] || a.unavailable; kind = 'throttled'; }
-    else if (a.status === 'error') { text = 'Sign-in needed'; kind = 'error'; }
-    else if (a.status === 'throttled' || a.status === 'exhausted') { text = a.status === 'throttled' ? 'Rate limited' : 'Quota exhausted'; kind = 'throttled'; }
-    else {
-      var groups = accountQuotaGroups(a);
-      var quotas = groups.shared.concat(groups.session, groups.models);
-      var spent = quotas.filter(function (q) { return q.ratio >= 1; });
-      if (spent.length) { text = spent.map(function (q) { return q.label; }).join(', ') + ' exhausted'; kind = 'throttled'; }
-      else if (quotas.some(function (q) { return quotaDisplay(q.ratio) != null; })) { text = 'Within reported limits'; kind = 'active'; }
-      else text = 'Quota unknown';
-    }
-    return el('span', 'badge ' + kind, text);
+  // The one line to read per account (FR 9): the bucket that gates routing
+  // soonest, how far along it is, and the number it is measured against.
+  function bindingLine(b) {
+    var line = el('div', 'binding');
+    var dot = el('span', 'dot'); dot.setAttribute('aria-hidden', 'true'); line.appendChild(dot);
+    if (!b) { line.setAttribute('data-grade', 'none'); line.appendChild(el('span', '', 'No quota reported')); return line; }
+    line.setAttribute('data-grade', b.grade);
+    var main = el('span');
+    main.appendChild(el('b', '', b.label));
+    main.appendChild(el('span', '', ' ' + quotaDisplay(b.ratio, quotaMode) + '% ' + quotaMode + ' · '));
+    main.appendChild(el('span', 'g', b.grade));
+    if (b.via != null) main.appendChild(el('span', '', viaText(b.via, quotaMode)));
+    line.appendChild(main);
+    line.appendChild(el('span', 'sub2', limitText(b.limitKind, b.limit) + ' · ' + resetIn(b.resetAt)));
+    return line;
   }
 
-  function providerName(a) {
-    return a.provider === 'anthropic' ? 'Claude' : a.provider === 'codex' ? 'Codex' : a.provider || 'Other';
+  // Only the states that want a reader (FR 11); a healthy account has no
+  // status badge. Kinds are the grade palette: a self-clearing hold is near,
+  // a refusal is at, an empty bucket is spent, a broken login error.
+  function accountBadge(a) {
+    var text = null, kind = '';
+    if (a.disabled) { text = 'Disabled'; kind = 'error'; }
+    else if (a.unavailable) { text = UNAVAILABLE_TEXT[a.unavailable] || a.unavailable; kind = a.unavailable === 'throttled' || a.unavailable === 'entitlement' ? 'near' : 'at'; }
+    else if (a.status === 'error') { text = 'Sign-in needed'; kind = 'error'; }
+    else if (a.status === 'throttled') { text = 'Rate limited'; kind = 'near'; }
+    else if (a.status === 'exhausted') { text = 'Quota exhausted'; kind = 'spent'; }
+    else {
+      var groups = accountQuotaGroups(a);
+      var spent = groups.shared.concat(groups.session, groups.models).filter(function (q) { return q.ratio >= 1; });
+      if (spent.length) { text = spent.map(function (q) { return q.label; }).join(', ') + ' exhausted'; kind = 'spent'; }
+    }
+    return text ? el('span', 'badge ' + kind, text) : null;
+  }
+
+  // Group order for the account table (FR 3), the same providerOrder routeRows
+  // uses for its default rows. An account with no provider groups last under
+  // the neutral tint.
+  function providerKeys(accounts) {
+    var keys = [];
+    accounts.forEach(function (a) { var p = a.provider || ''; if (keys.indexOf(p) === -1) keys.push(p); });
+    return keys.sort(providerOrder);
   }
 
   function accountBadgeRow(a, s) {
     var row = el('div', 'badges');
-    row.appendChild(accountBadge(a));
-    var showProvider = uniqSorted((s.accounts || []).map(providerName)).length > 1;
+    var status = accountBadge(a);
+    if (status) row.appendChild(status);
+    var showProvider = providerKeys(s.accounts || []).length > 1;
     var badges = accountBadges(a, s.currentAccount, s.currentAccounts || null, null, s.switchThreshold, s.switchThresholds);
     ['current', 'provider', 'meta threshold'].forEach(function (kind) {
       var badge = badges.filter(function (item) {
@@ -1028,6 +1641,8 @@ ${SHARED_HELPERS}
       })[0];
       if (badge) row.appendChild(el('span', 'badge ' + badge.cls, badge.text));
     });
+    var cap = capBadgeText(a.maxUsage);
+    if (cap) row.appendChild(el('span', 'badge meta cap', cap));
     return row;
   }
 
@@ -1035,25 +1650,30 @@ ${SHARED_HELPERS}
     var wrap = document.getElementById('accounts'); wrap.textContent = '';
     var query = document.getElementById('accountSearch').value.toLowerCase();
     var accounts = s.accounts || [];
-    var visible = accounts.filter(function (a) { return (a.name + ' ' + a.type + ' ' + providerName(a)).toLowerCase().indexOf(query) !== -1; });
+    var visible = accounts.filter(function (a) { return (a.name + ' ' + a.type + ' ' + providerLabel(a.provider)).toLowerCase().indexOf(query) !== -1; });
     document.getElementById('accountCount').textContent = visible.length + (query ? ' of ' + accounts.length : '') + ' accounts';
     document.getElementById('quotaSpent').setAttribute('aria-pressed', String(quotaMode === 'spent'));
     document.getElementById('quotaLeft').setAttribute('aria-pressed', String(quotaMode === 'left'));
-    document.getElementById('quotaHelp').textContent = 'Bars and percentages show quota ' + quotaMode + '. Each limit has its own reset.';
+    document.getElementById('quotaHelp').textContent = 'Bars and percentages show quota ' + quotaMode + '. Fill color grades distance to the limit the router gates on; the tick is that limit.';
     if (!visible.length) { wrap.appendChild(el('div', 'empty', query ? 'No matching accounts.' : 'No accounts configured on the proxy.')); return; }
     var scroll = el('div', 'account-table-wrap');
     var table = el('table', 'account-table'); table.setAttribute('aria-label', 'Account capacity');
     var thead = el('thead'), header = el('tr');
     ['Account', 'Weekly / total quota', '5-hour quota', 'Model-specific weekly quota', ''].forEach(function (label) { var th = el('th', '', label); th.scope = 'col'; header.appendChild(th); });
     thead.appendChild(header); table.appendChild(thead);
-    var providers = uniqSorted(visible.map(providerName));
-    providers.forEach(function (provider) {
+    providerKeys(visible).forEach(function (provider) {
       var body = el('tbody'); table.appendChild(body);
-      var members = visible.filter(function (a) { return providerName(a) === provider; });
-      var group = el('tr', 'provider-heading'); var title = el('th', '', provider + ' / ' + members.length + ' accounts'); title.colSpan = 5; title.scope = 'rowgroup'; group.appendChild(title); body.appendChild(group);
+      var members = visible.filter(function (a) { return (a.provider || '') === provider; });
+      var group = el('tr', 'provider-heading'); group.setAttribute('data-provider', provider || 'unknown');
+      var title = el('th'); title.colSpan = 5; title.scope = 'rowgroup';
+      title.appendChild(el('b', '', providerLabel(provider)));
+      title.appendChild(el('span', '', ' · ' + members.length + (members.length === 1 ? ' account' : ' accounts')));
+      group.appendChild(title); body.appendChild(group);
       members.forEach(function (a) {
-        var tr = el('tr', 'account-row');
+        var tr = el('tr', 'account-row'); tr.setAttribute('data-provider', a.provider || 'unknown');
+        var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
         var identity = el('td'); identity.appendChild(el('span', 'account-name', a.name)); identity.appendChild(accountBadgeRow(a, s));
+        identity.appendChild(bindingLine(binding));
         identity.appendChild(el('div', 'account-meta', a.type === 'oauth' ? 'Subscription' : a.type === 'api_key' ? 'API account' : a.type));
         var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0];
         identity.appendChild(el('div', 'account-meta', probe && probe.lastProbedAt ? 'Last probe ' + fmtAgo(probe.lastProbedAt) + (probe.error ? ' · Failed' : '') : 'Quota reading time not reported'));
@@ -1061,7 +1681,7 @@ ${SHARED_HELPERS}
         var groups = accountQuotaGroups(a);
         ['shared', 'session', 'models'].forEach(function (key, index) {
           var td = el('td'); td.setAttribute('data-label', ['Weekly / total quota','5-hour quota','Model-specific weekly quota'][index]);
-          groups[key].forEach(function (q) { td.appendChild(quotaRow(q.label, q.ratio, q.resetAt)); });
+          groups[key].forEach(function (q) { td.appendChild(quotaRow(q, a, s, !!binding && binding.label === q.label)); });
           if (!groups[key].length) td.appendChild(el('span', 'quota-unknown', key === 'shared' ? 'Not reported' : 'No window reported'));
           tr.appendChild(td);
         });
@@ -1074,14 +1694,19 @@ ${SHARED_HELPERS}
   function renderAccountDetails() {
     var a = ((lastStatus || {}).accounts || []).filter(function (a) { return a.name === detailAccount; })[0];
     var wrap = document.getElementById('accountDetails'); wrap.textContent = '';
+    var dialog = document.getElementById('accountDialog');
     document.getElementById('accountManual').disabled = !connected || !a;
-    if (!a) { wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
+    if (!a) { dialog.removeAttribute('data-provider'); wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
+    dialog.setAttribute('data-provider', a.provider || 'unknown');
     document.getElementById('accountDialogTitle').textContent = a.name;
-    wrap.appendChild(accountBadgeRow(a, lastStatus || {}));
+    var s = lastStatus || {};
+    wrap.appendChild(accountBadgeRow(a, s));
     if (!connected) { var warning = el('p', 'warnt', 'Connection lost. These quota values may be stale.'); warning.setAttribute('role', 'status'); wrap.appendChild(warning); }
-    wrap.appendChild(el('p', 'usage', providerName(a) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
+    var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
+    wrap.appendChild(bindingLine(binding));
+    wrap.appendChild(el('p', 'usage', providerLabel(a.provider) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
     var groups = accountQuotaGroups(a);
-    groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q.label, q.ratio, q.resetAt)); });
+    groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q, a, s, !!binding && binding.label === q.label)); });
     var q = a.quota || {}, u = a.usage || {};
     if (a.provider === 'anthropic') wrap.appendChild(el('p', 'usage', 'Recent Claude session IDs: ' + (typeof a.sessions === 'number' ? a.sessions : 'not reported') + '. Only IDs active within two minutes or with a request in flight are counted.'));
     if (q.planType) wrap.appendChild(el('p', 'usage', 'Plan: ' + q.planType));
@@ -1273,7 +1898,8 @@ ${SHARED_HELPERS}
   // Provider-specific samples use the server's targets and eligibility.
   function renderRoutes(s) {
     var wrap = document.getElementById('routesWrap');
-    var rows = routeRows(s);
+    // Per-provider default rows belong to the Overview strip (FR 13-14).
+    var rows = routeRows(s).filter(function (r) { return r.kind === 'route'; });
     var blockedNote = document.getElementById('forceBlocked');
     var forceBlocked = !!(s || {}).forceBlocked;
     blockedNote.hidden = !forceBlocked;
@@ -1283,64 +1909,62 @@ ${SHARED_HELPERS}
     wrap.style.display = '';
     var table = document.getElementById('routes');
     table.textContent = '';
-    var hr = el('tr');
-    ['Route / sample', 'Target preview', 'Can serve sample', 'Force'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
-    table.appendChild(hr);
+    var head = el('thead'), hr = el('tr');
+    ['Route / sample', 'Target preview', 'Can serve sample'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    head.appendChild(hr); table.appendChild(head);
+    var body = el('tbody'); table.appendChild(body);
     // A route with two globs previews twice. The override belongs to the route,
     // not the sample, so its controls go on the route's first row only.
     var controlled = Object.create(null);
     rows.forEach(function (r) {
       var tr = el('tr');
+      tr.setAttribute('data-provider', r.provider || '');
       var fam = el('td', '', r.label + (r.match ? ' ' : ''));
+      fam.setAttribute('data-label', 'Route');
       if (r.match) fam.appendChild(el('span', 'tag', r.match));
       if (r.sampleModel) fam.title = 'Representative model: ' + r.sampleModel;
-      var configured = r.kind === 'route' && !r.autocreated;
-      var first = configured && !controlled[r.name];
+      var first = !r.autocreated && !controlled[r.name];
       if (first) controlled[r.name] = true;
       if (first && r.override && r.override.account) {
         fam.appendChild(el('div', 'hint', 'Stays forced until you clear it. Sessions pinned with TC_ACCT are not affected.'));
       }
       tr.appendChild(fam);
       var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
+      to.setAttribute('data-label', 'Target');
       if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
       if (r.pinMismatch) to.appendChild(el('span', 'warnt', ' (not eligible)'));
-      var chip = chipFor(r);
-      if (chip) {
-        var chipEl = el('span', 'chip ' + (CHIP_CLASS[chip.kind] || ''), ' · ' + chip.text);
-        chipEl.tabIndex = -1;
-        to.appendChild(chipEl);
-        // After a successful Apply the page moves the reader to the answer:
-        // what the router now says about the route it just changed.
-        if (first && forceFocusRoute === r.name) { forceFocusRoute = null; chipEl.focus(); }
-      }
-      if (r.kind === 'default' && r.target !== r.current) {
-        to.appendChild(el('span', 'warnt', r.currentUnavailable
-          ? ' · current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
-          : ' · outranks the current account ' + r.current));
-      }
       if (r.provider) to.appendChild(el('span', 'tag', ' · ' + providerLabel(r.provider)));
+      var chip = chipFor(r);
+      // The route's first row carries the chip inside its controls; a second
+      // sample of the same route keeps it inline so the state still reads.
+      if (chip && !first) to.appendChild(el('div', 'chip chip-line ' + (CHIP_CLASS[chip.kind] || ''), chip.text));
+      if (first) to.appendChild(routeActions(r, chip, forceBlocked));
       tr.appendChild(to);
-      var can = el('td', r.kind === 'default' ? 'dim' : '');
-      if (r.kind === 'default') can.textContent = 'no route of its own';
-      else if (r.blocked) can.textContent = '—';
+      var can = el('td');
+      can.setAttribute('data-label', 'Can serve');
+      if (r.blocked) can.textContent = '—';
       else if (!r.eligible.length && !r.ineligible.length) can.textContent = '—';
       else {
         can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length) + (r.ineligible.length ? ' ' : '')));
         if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.join(', ')));
       }
       tr.appendChild(can);
-      tr.appendChild(forceCell(r, first, forceBlocked));
-      table.appendChild(tr);
+      body.appendChild(tr);
     });
+    // Focus only once the rows are in the document: a detached button ignores focus().
+    if (routeFocus) { routeFocus.focus(); routeFocus = null; }
   }
 
-  function forceCell(r, first, forceBlocked) {
-    var cell = el('td');
-    if (!first) return cell;
+  // The Force controls for a configured route's first row, inline at the foot
+  // of its target cell (FR 16): the chip and Change…/Clear force when forced,
+  // Force… otherwise, or the Clear/Keep confirm in their place.
+  function routeActions(r, chip, forceBlocked) {
+    var cell = el('div', 'route-actions');
     var forced = !!(r.override && r.override.account);
     if (clearConfirmRoute === r.name) {
-      cell.appendChild(el('div', 'hint', 'Clear force on ' + r.name + '?'));
+      cell.appendChild(el('span', 'hint', 'Clear force on ' + r.name + '?'));
       var yes = el('button', 'act', 'Clear');
+      yes.disabled = !connected;
       yes.addEventListener('click', function () {
         clearConfirmRoute = null;
         sendOverride(r.name, expectedFor(r), { clear: true }, null);
@@ -1351,8 +1975,16 @@ ${SHARED_HELPERS}
         if (lastStatus) renderRoutes(lastStatus);
       });
       cell.appendChild(yes); cell.appendChild(keep);
-      if (clearConfirmFocus) { clearConfirmFocus = false; yes.focus(); }
+      if (clearConfirmFocus) { clearConfirmFocus = false; routeFocus = yes; }
       return cell;
+    }
+    if (chip) {
+      var chipEl = el('span', 'chip ' + (CHIP_CLASS[chip.kind] || ''), chip.text);
+      chipEl.tabIndex = -1;
+      cell.appendChild(chipEl);
+      // After a successful Apply the page moves the reader to the answer:
+      // what the router now says about the route it just changed.
+      if (forceFocusRoute === r.name) { forceFocusRoute = null; routeFocus = chipEl; }
     }
     var open = el('button', 'act', forced ? 'Change…' : 'Force…');
     open.setAttribute('aria-haspopup', 'dialog');
@@ -1364,7 +1996,7 @@ ${SHARED_HELPERS}
     cell.appendChild(open);
     // A cleared route has no chip to move to, and the button the confirm
     // replaced is gone, so focus lands here instead of on the document.
-    if (forceFocusRoute === r.name) { forceFocusRoute = null; open.focus(); }
+    if (forceFocusRoute === r.name) { forceFocusRoute = null; routeFocus = open; }
     if (forced) {
       // Clearing is exempt from the ownership-claim refusal: a route that
       // cannot be un-forced would be a trap.
@@ -1376,7 +2008,7 @@ ${SHARED_HELPERS}
         if (lastStatus) renderRoutes(lastStatus);
       });
       cell.appendChild(clear);
-      if (restoreClearFocus === r.name) { restoreClearFocus = null; clear.focus(); }
+      if (restoreClearFocus === r.name) { restoreClearFocus = null; routeFocus = clear; }
     }
     return cell;
   }
@@ -1389,44 +2021,67 @@ ${SHARED_HELPERS}
     wrap.textContent = '';
     if (!list.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = 'block';
-    list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
+    list.forEach(function (p) {
+      var line = el('div', p.severity);
+      // An account line leads with its provider word and wears its tint (RT 1);
+      // session lines name no account and stay neutral.
+      if (p.kind === 'account') {
+        line.setAttribute('data-provider', p.provider || '');
+        line.appendChild(el('span', 'pv', providerLabel(p.provider)));
+        line.appendChild(el('span', '', ' · ' + p.text));
+      } else line.textContent = p.text;
+      wrap.appendChild(line);
+    });
   }
 
 
   function renderProviderRouting(s) {
     var wrap = document.getElementById('providerRouting'); wrap.textContent = '';
     var cards = routingCards(s);
-    if (!cards.length) wrap.appendChild(el('p', 'empty', 'Provider routing is unavailable on this proxy.'));
-    else {
-      cards.forEach(function (provider) {
-        provider.groups.forEach(function (group) {
-          var card = el('div', 'provider-card'); card.setAttribute('data-provider', provider.provider);
-          card.appendChild(el('h3', '', provider.label + ' · ' + group.labels.join(', ')));
-          card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), group.target || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
-          var models = el('div', 'provider-models', group.models.join(', ')); models.title = 'Representative models'; card.appendChild(models);
-          wrap.appendChild(card);
-        });
+    if (!cards.length) { wrap.appendChild(el('p', 'empty', 'Provider routing is unavailable on this proxy.')); return; }
+    cards.forEach(function (provider) {
+      provider.groups.forEach(function (group) {
+        var card = el('div', 'provider-card'); card.setAttribute('data-provider', provider.provider);
+        var h = el('h3'); h.appendChild(el('b', '', providerLabel(provider.provider))); h.appendChild(el('span', '', ' · ' + group.labels.join(', ')));
+        card.appendChild(h);
+        card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), group.target || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
+        var models = el('div', 'provider-models', group.models.join(', ')); models.title = 'Representative models'; card.appendChild(models);
+        wrap.appendChild(card);
       });
+    });
+  }
+
+  // Overview's one line per provider (FR 13). The wording is routeStripLines';
+  // this only lays it out.
+  function renderRouteStrip(s) {
+    var wrap = document.getElementById('routeStripLines'); wrap.textContent = '';
+    // An empty fleet still reports providerRouting entries (all Unavailable);
+    // the honest line is that there is nothing to route to.
+    var lines = (s.accounts || []).length ? routeStripLines(s) : [];
+    if (!lines.length) {
+      wrap.appendChild(el('p', 'empty', (s.accounts || []).length ? 'Provider routing is unavailable on this proxy.' : 'No accounts configured on the proxy.'));
+      return;
     }
-    var current = document.getElementById('currentAccounts');
-    var currentAccounts = s.currentAccounts || null;
-    var providers = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
-      if (a === 'anthropic') return -1;
-      if (b === 'anthropic') return 1;
-      return a < b ? -1 : a > b ? 1 : 0;
-    }) : [];
-    if (providers.length) {
-      current.textContent = 'Current account · ' + providers.map(function (provider) {
-        return providerLabel(provider) + ': ' + (currentAccounts[provider] || 'none');
-      }).join(' · ');
-      current.hidden = false;
-    } else if (s.currentAccount) {
-      current.textContent = 'Current account · ' + s.currentAccount;
-      current.hidden = false;
-    } else {
-      current.textContent = '';
-      current.hidden = true;
-    }
+    lines.forEach(function (line) {
+      var row = el('div', 'strip-line'); row.setAttribute('data-provider', line.provider || '');
+      var who = el('div', 'strip-provider');
+      who.appendChild(el('b', '', line.label));
+      who.appendChild(el('small', '', line.accounts + (line.accounts === 1 ? ' account' : ' accounts')));
+      row.appendChild(who);
+      var what = el('div');
+      var target = el('div', 'strip-target' + (line.resolved ? '' : ' warnt'), line.headline);
+      if (line.tag) target.appendChild(el('span', 'badge meta', line.tag));
+      what.appendChild(target);
+      line.groups.forEach(function (g) {
+        var sub = el('div', 'strip-group', g.labels + ' → ');
+        sub.appendChild(el('span', g.missing ? 'badt' : '', g.target));
+        if (g.tag) sub.appendChild(el('span', 'badge meta', g.tag));
+        what.appendChild(sub);
+      });
+      line.why.forEach(function (w) { what.appendChild(el('div', 'strip-why' + (w.warn ? ' warnt' : ''), w.text)); });
+      row.appendChild(what);
+      wrap.appendChild(row);
+    });
   }
 
   function renderOverview(s) {
@@ -1463,14 +2118,116 @@ ${SHARED_HELPERS}
 
   function pct(reading) { return Math.round(reading.utilization * 100); }
 
-  // One line per limit the tracker is watching on an account. A window whose
+  // One mini bar per limit the tracker is watching on an account (FR 21),
+  // graded against the same limit as that bucket's account bar. A window whose
   // reset time has passed is the held pre-expiry reading (see reset-tracker):
-  // the account has not been used since, so there is no live window to show.
-  function windowLine(w) {
+  // the account has not been used since, so it reads "ended".
+  function miniRow(key, w, a, s) {
+    var row = el('div', 'mini');
+    row.appendChild(el('span', 'lbl', w.label));
     var shown = quotaDisplay(w.utilization, quotaMode);
     var due = parseTs(w.resetAt);
-    return el('p', 'usage', w.label + ' · ' + (shown == null ? 'unknown' : shown + '% ' + quotaMode) + ' · '
-      + (!isNaN(due) && due <= Date.now() ? 'ended ' + shortDate(due) + ', no new window yet' : 'resets ' + shortDate(due)));
+    var ended = !isNaN(due) && due <= Date.now();
+    var when = isNaN(due) ? 'reset not reported' : ended ? 'ended' : fmtIn((due - Date.now()) / 1000);
+    if (shown == null) {
+      row.appendChild(el('span', 'bar'));
+      row.appendChild(el('span', 'num', 'unknown · ' + when));
+      return row;
+    }
+    var lim = quotaGate(a, { bucket: RESET_WINDOW_BUCKETS[key] || null, ratio: w.utilization, resetAt: w.resetAt }, s.switchThreshold, s.switchThresholds);
+    var grade = lim.grade;
+    // The visible countdown stays this window's own roll; the meter's reset names when the limit lifts.
+    row.appendChild(gradedBar(w.label, w.utilization, lim, grade, lim.resetAt !== w.resetAt ? resetIn(lim.resetAt) : ended ? 'ended ' + shortDate(due) + ', no new window yet' : resetIn(w.resetAt)));
+    var num = el('span', 'num');
+    num.appendChild(el('b', '', shown + '%'));
+    num.appendChild(el('span', '', ' ' + quotaMode + ' · ' + when));
+    if (!isNaN(due)) num.title = (ended ? 'Ended ' : 'Resets ') + shortDate(due);
+    row.appendChild(num);
+    return row;
+  }
+
+  // One count per timing on one line; a non-zero early count reads in near ink.
+  function totalsLine(totals) {
+    var line = el('p', 'totals');
+    [[totals.scheduled, 'on schedule', ''], [totals.early, 'early', 'early'], [totals.uncertain, 'unclear', '']].forEach(function (t, i) {
+      if (i) line.appendChild(el('span', 'sep', ' · '));
+      var part = el('span', t[2] && t[0] ? t[2] : '');
+      part.appendChild(el('b', '', String(t[0] || 0)));
+      part.appendChild(el('span', '', ' ' + t[1]));
+      line.appendChild(part);
+    });
+    return line;
+  }
+
+  function resetCard(account, s) {
+    var card = el('div', 'card');
+    card.setAttribute('data-provider', account.provider || 'unknown');
+    var head = el('div', 'card-head');
+    head.appendChild(el('h3', '', account.name));
+    head.appendChild(el('span', 'badge provider ' + (account.provider || 'unknown'), providerLabel(account.provider)));
+    card.appendChild(head);
+    card.appendChild(totalsLine(account.totals || {}));
+    // Names are unique only within a provider, so match on both: a Claude and a
+    // Codex account may share a display name and still gate at different limits.
+    var provider = account.provider || 'unknown';
+    var a = (s.accounts || []).filter(function (x) { return x.name === account.name && (x.provider || 'unknown') === provider; })[0] || {};
+    var windows = account.windows || {};
+    var keys = Object.keys(windows);
+    if (keys.length) keys.forEach(function (key) { card.appendChild(miniRow(key, windows[key], a, s)); });
+    else card.appendChild(el('p', 'usage', 'No limit windows reported yet.'));
+    (account.pending || []).forEach(function (pending) {
+      card.appendChild(el('p', 'warnt', 'Possible early reset on ' + pending.after.label + ', ' + pct(pending.before) + '% → ' + pct(pending.after) + '% spent, waiting for the next probe.'));
+    });
+    if (account.provider === 'codex' || account.provider === 'anthropic') {
+      var inventory = account.credits;
+      card.appendChild(el('p', 'usage', inventory ? 'Banked resets: ' + inventory.availableCount + ' available' + (inventory.observedAt ? ', checked ' + fmtAgo(inventory.observedAt) : '') : 'Banked resets: unknown'));
+      if (inventory) inventory.credits.filter(function (credit) { return credit.status === 'available'; }).forEach(function (credit) {
+        card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'expired ' : 'expires ') + shortDate(credit.expiresAt) : 'no expiry reported')
+          + (credit.source === 'manual' ? ' · entered manually' : '')));
+      });
+      // Anthropic lists web-issued banked resets to claude.ai sessions only.
+      if (inventory && inventory.oauth && !inventory.oauth.eligible) {
+        var hidden = el('p', 'usage dim', 'Not listed to the proxy by Anthropic; add them under bankedResets in the config.');
+        hidden.title = 'Anthropic lists banked resets to claude.ai sessions only' + (inventory.oauth.reason ? ' (' + inventory.oauth.reason + ')' : '') + '. Copy one from claude.ai Settings > Usage.';
+        card.appendChild(hidden);
+      }
+      if (account.creditError) card.appendChild(el('p', 'warnt', account.creditError + ', showing the last good inventory.'));
+    }
+    card.appendChild(el('p', 'usage', account.lastObservedAt ? 'Last probed ' + fmtAgo(account.lastObservedAt) : 'Not probed yet'));
+    return card;
+  }
+
+  function resetHistoryRow(row) {
+    var tr = el('tr');
+    tr.setAttribute('data-provider', row.provider || 'unknown');
+    tr.title = 'Seen between ' + resetDate(row.observed[0]) + ' and ' + resetDate(row.observed[1]) + '. Reset time ' + resetDate(row.resetAt[0]) + ' → ' + resetDate(row.resetAt[1]) + '.';
+    [['When', shortDate(row.when), ''], ['Account', row.account, ''], ['Limit', row.window, ''],
+      ['What happened', row.what, row.kind === 'warn' ? 'warnt' : row.kind === 'dim' ? 'dim' : ''],
+      ['Spent before → after', row.before + '% → ' + row.after + '%', '']].forEach(function (cell) {
+      var td = el('td', cell[2], cell[1]); td.setAttribute('data-label', cell[0]); tr.appendChild(td);
+      // The probe pair that bounds the detection, visible rather than hover-only.
+      if (cell[0] === 'When') td.appendChild(el('small', 'dim', 'probes ' + shortDate(row.observed[0]) + ' and ' + shortDate(row.observed[1])));
+      // The provider word follows the account name (FR 1); the rail carries the tint.
+      if (cell[0] === 'Account') { var tag = el('span', 'tag', ' · '); tag.appendChild(el('span', 'pv', providerLabel(row.provider))); td.appendChild(tag); }
+    });
+    return tr;
+  }
+
+  // The reveal under the history (FR 22). One button lives for as long as the
+  // history outgrows the cap: the table re-renders around it on every poll,
+  // but the button itself is never detached, so it keeps keyboard focus.
+  function syncResetReveal(total) {
+    var reveal = document.getElementById('resetReveal');
+    if (total <= RESET_HISTORY_DEFAULT) { reveal.textContent = ''; resetShowAll = null; return; }
+    if (!resetShowAll) {
+      resetShowAll = el('button', 'reveal');
+      resetShowAll.setAttribute('id', 'resetShowAll'); resetShowAll.setAttribute('type', 'button');
+      resetShowAll.setAttribute('aria-controls', 'resetEvents');
+      resetShowAll.addEventListener('click', function () { resetHistoryExpanded = !resetHistoryExpanded; if (lastStatus) renderResets(lastStatus); });
+      reveal.textContent = ''; reveal.appendChild(resetShowAll);
+    }
+    resetShowAll.textContent = resetHistoryExpanded ? 'Show the latest ' + RESET_HISTORY_DEFAULT : 'Show all ' + total + ' rows';
+    resetShowAll.setAttribute('aria-expanded', String(resetHistoryExpanded));
   }
 
   function renderResets(s) {
@@ -1479,43 +2236,13 @@ ${SHARED_HELPERS}
     var accounts = document.getElementById('resetAccounts'); accounts.textContent = '';
     var history = document.getElementById('resetEvents'); history.textContent = '';
     var note = document.getElementById('resetHistoryNote'); note.textContent = '';
-    if (!data) { summary.textContent = 'Reset tracking is unavailable on this proxy.'; return; }
+    if (!data) { summary.textContent = 'Reset tracking is unavailable on this proxy.'; syncResetReveal(0); return; }
     var probe = s.probe || {}, notifications = data.notifications || {};
     summary.textContent = (probe.enabled ? 'Each account is probed every ' + fmtIn(probe.intervalSeconds) + '. ' : 'Quota probes are off, so nothing here updates. ')
       + 'Tracking since ' + shortDate(data.startedAt) + '. '
       + (notifications.enabled ? 'Early resets go to Google Chat' + (notifications.pending ? ' (' + notifications.pending + ' waiting to send)' : '') + '.' : 'Google Chat alerts are off.')
       + (data.error ? ' ' + data.error : '') + (notifications.error ? ' ' + notifications.error : '');
-    (data.accounts || []).forEach(function (account) {
-      var card = el('div', 'card');
-      card.appendChild(el('h3', '', account.name));
-      var totals = account.totals || {};
-      var early = totals.early || 0, scheduled = totals.scheduled || 0, unclear = totals.uncertain || 0;
-      card.appendChild(el('p', early ? 'warnt' : '', scheduled + ' on-schedule rollover' + (scheduled === 1 ? '' : 's') + ' · ' + early + ' early reset' + (early === 1 ? '' : 's')
-        + (unclear ? ' · ' + unclear + ' with unclear timing' : '')));
-      var windows = account.windows || {};
-      var keys = Object.keys(windows);
-      if (keys.length) keys.forEach(function (key) { card.appendChild(windowLine(windows[key])); });
-      else card.appendChild(el('p', 'usage', 'No limit windows reported yet.'));
-      (account.pending || []).forEach(function (pending) {
-        card.appendChild(el('p', 'warnt', 'Possible early reset on ' + pending.after.label + ', ' + pct(pending.before) + '% → ' + pct(pending.after) + '% spent. Waiting for the next probe to confirm.'));
-      });
-      if (account.provider === 'codex' || account.provider === 'anthropic') {
-        var inventory = account.credits;
-        card.appendChild(el('p', '', inventory ? 'Banked resets: ' + inventory.availableCount + ' available' + (inventory.observedAt ? ', checked ' + fmtAgo(inventory.observedAt) : '') : 'Banked resets: unknown'));
-        if (inventory) inventory.credits.filter(function (credit) { return credit.status === 'available'; }).forEach(function (credit) {
-          card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'expired ' : 'expires ') + shortDate(credit.expiresAt) : 'no expiry reported')
-            + (credit.source === 'manual' ? ' · entered manually' : '')));
-        });
-        // Anthropic lists web-issued banked resets to claude.ai sessions only.
-        if (inventory && inventory.oauth && !inventory.oauth.eligible) {
-          card.appendChild(el('p', 'usage dim', 'Anthropic does not list banked resets for this account to the proxy' + (inventory.oauth.reason ? ' (' + inventory.oauth.reason + ')' : '')
-            + '. Add one you see in claude.ai Settings > Usage under bankedResets in the config.'));
-        }
-        if (account.creditError) card.appendChild(el('p', 'warnt', account.creditError + '. Showing the last successful inventory.'));
-      }
-      card.appendChild(el('p', 'usage', account.lastObservedAt ? 'Last probed ' + fmtAgo(account.lastObservedAt) : 'Not probed yet'));
-      accounts.appendChild(card);
-    });
+    (data.accounts || []).forEach(function (account) { accounts.appendChild(resetCard(account, s)); });
     if (!(data.accounts || []).length) accounts.appendChild(el('p', 'usage', 'Waiting for the first successful quota probe.'));
     var rows = resetHistoryRows(data.events);
     var head = el('thead'), headRow = el('tr');
@@ -1523,19 +2250,10 @@ ${SHARED_HELPERS}
     head.appendChild(headRow); history.appendChild(head);
     var body = el('tbody');
     if (!rows.length) { var emptyRow = el('tr'), empty = el('td', 'empty', 'No resets seen yet.'); empty.colSpan = 5; emptyRow.appendChild(empty); body.appendChild(emptyRow); }
-    rows.forEach(function (row) {
-      var tr = el('tr');
-      tr.title = 'Seen between ' + resetDate(row.observed[0]) + ' and ' + resetDate(row.observed[1]) + '. Reset time ' + resetDate(row.resetAt[0]) + ' → ' + resetDate(row.resetAt[1]) + '.';
-      [['When', shortDate(row.when), ''], ['Account', row.account, ''], ['Limit', row.window, ''],
-        ['What happened', row.what, row.kind === 'warn' ? 'warnt' : row.kind === 'dim' ? 'dim' : ''],
-        ['Spent before → after', row.before + '% → ' + row.after + '%', '']].forEach(function (cell) {
-        var td = el('td', cell[2], cell[1]); td.setAttribute('data-label', cell[0]); tr.appendChild(td);
-        // The probe pair that bounds the detection, visible rather than hover-only.
-        if (cell[0] === 'When') td.appendChild(el('small', 'dim', 'probes ' + shortDate(row.observed[0]) + ' and ' + shortDate(row.observed[1])));
-      });
-      body.appendChild(tr);
-    });
+    // Newest first, capped until the reader asks for the rest (FR 22, RT 2).
+    (resetHistoryExpanded ? rows : rows.slice(0, RESET_HISTORY_DEFAULT)).forEach(function (row) { body.appendChild(resetHistoryRow(row)); });
     history.appendChild(body);
+    syncResetReveal(rows.length);
     note.textContent = 'Resets are inferred from probe readings, so a small drop or a long gap between probes can be missed.'
       + ((data.events || []).length >= 500 ? ' Showing the latest 500 events; the account counts include older ones.' : '');
   }
@@ -1543,15 +2261,31 @@ ${SHARED_HELPERS}
   function renderDiagnostics(s) {
     var server = s.server || {}, loop = server.eventLoop || {}, pool = s.upstreamPool || {};
     details('serverInfo', [['Proxy uptime', server.uptimeSeconds == null ? null : fmtIn(server.uptimeSeconds)], ['Proxy port', server.port], ['Event loop lag', loop.lastLagMs == null ? null : loop.lastLagMs + ' ms'], ['Worst lag', loop.maxLagMs == null ? null : loop.maxLagMs + ' ms'], ['Active upstream requests', pool.active], ['Queued upstream requests', pool.queued]]);
-    details('routingInfo', [['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%'], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
+    // Fleet per-bucket overrides ride on the threshold line (FR 25); per-account caps live on the account row.
+    var fleetTable = s.switchThresholds || {};
+    var perBucket = Object.keys(fleetTable).filter(function (k) { return k !== 'default' && typeof fleetTable[k] === 'number' && isFinite(fleetTable[k]); })
+      .map(function (k) { return bucketLabel(k) + ' ' + Math.round(fleetTable[k] * 100) + '%'; });
+    details('routingInfo', [['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%' + (perBucket.length ? ' · per bucket: ' + perBucket.join(', ') : '')], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
     var overrides = ((s.fableDepletionRouting || {}).models || []);
     if (overrides.length) { var box = document.getElementById('routingInfo'); box.appendChild(el('p', 'usage', 'Fable depletion overrides')); overrides.forEach(function (r) { box.appendChild(el('p', 'usage', r.model + ' → ' + (r.target || 'None') + ' · ' + r.reason)); }); }
     var table = document.getElementById('jobs'); table.textContent = '';
     var hr = el('tr'); ['Account', 'Quota probe', 'Last checked', 'Warmup', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); }); table.appendChild(hr);
-    (s.accounts || []).forEach(function (a) {
-      var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0] || {};
-      var warm = ((s.warm || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0] || {};
-      var row = el('tr'); [a.name, probe.status || 'Unknown', probe.lastProbedAt ? fmtAgo(probe.lastProbedAt) : 'Never', warm.status || 'Unknown', probe.error || warm.error || (probe.durationMs == null ? 'No measurement' : probe.durationMs + ' ms')].forEach(function (v) { row.appendChild(el('td', '', v)); }); table.appendChild(row);
+    // Job rows come from the same account list in the same order, but names are
+    // unique only within a provider: take the row at this index when it is the
+    // same account, else the first with this name and (when stated) provider.
+    var jobFor = function (list, a, i) {
+      var same = function (p) { return p && p.name === a.name && (p.provider == null || p.provider === a.provider); };
+      return same(list[i]) ? list[i] : list.filter(same)[0] || {};
+    };
+    (s.accounts || []).forEach(function (a, i) {
+      var probe = jobFor((s.probe || {}).accounts || [], a, i);
+      var warm = jobFor((s.warm || {}).accounts || [], a, i);
+      var row = el('tr'); row.setAttribute('data-provider', a.provider || 'unknown');
+      var name = el('td', '', a.name); var tag = el('span', 'tag', ' · '); tag.appendChild(el('span', 'pv', providerLabel(a.provider))); name.appendChild(tag); row.appendChild(name);
+      var error = probe.error || warm.error;
+      [[probe.status || 'Unknown', probe.error ? 'badt' : ''], [probe.lastProbedAt ? fmtAgo(probe.lastProbedAt) : 'Never', ''], [warm.status || 'Unknown', warm.error ? 'badt' : ''],
+        [error || (probe.durationMs == null ? 'No measurement' : probe.durationMs + ' ms'), error ? 'badt' : probe.durationMs == null ? '' : 'mono']].forEach(function (c) { row.appendChild(el('td', c[1], c[0])); });
+      table.appendChild(row);
     });
   }
 
@@ -1563,22 +2297,18 @@ ${SHARED_HELPERS}
       if (history.length > 60) history.shift();
     } else history = [];
     previousSample = { total: total, time: now, started: started };
-    var chart = document.getElementById('history'); chart.textContent = '';
+    var chart = document.getElementById('history'); chart.textContent = history.length ? '' : 'No samples yet';
+    chart.className = history.length ? 'history' : 'history empty-chart';
     var max = Math.max.apply(null, [1].concat(history.map(function (h) { return h.count / h.seconds; })));
     history.forEach(function (h) { var bar = el('i'); bar.style.height = Math.max(2, h.count / h.seconds / max * 100) + '%'; bar.title = h.count + ' requests in ' + Math.round(h.seconds) + 's'; chart.appendChild(bar); });
     var count = history.reduce(function (n, h) { return n + h.count; }, 0), seconds = history.reduce(function (n, h) { return n + h.seconds; }, 0);
-    var label = history.length ? count + ' requests over ' + Math.round(seconds) + 's · ' + (count / seconds * 60).toFixed(1) + ' req/min' : 'Collecting the first sample...';
+    var label = history.length ? count + ' requests over ' + Math.round(seconds) + 's · ' + (count / seconds * 60).toFixed(1) + ' req/min' : 'This chart fills while the page is open and resets on reload.';
     document.getElementById('historyLabel').textContent = label; chart.setAttribute('aria-label', label);
   }
 
   function renderForecast(f) {
     f = f || { status: 'Forecast history is disabled', coverage: {}, accounts: [], recommendations: [] };
     var hours = Number(document.getElementById('forecastHorizon').value);
-    var windowLabel = function (bucket, durationMs) {
-      if (bucket.indexOf('shared:') === 0) return durationMs === 18000000 ? 'Shared five-hour window' : durationMs === 604800000 ? 'Shared weekly window' : 'Shared quota window';
-      if (bucket.indexOf('family:') === 0) return bucket.slice(7) + ' weekly window';
-      return bucket.replace(/:/g, ' ');
-    };
     var end = Date.now() + hours * 3600000;
     var date = function (t) { return t == null ? 'Unknown' : new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }); };
     var timing = function (t) { return date(t) + (t > Date.now() ? ', in ' + ((t - Date.now()) / 3600000).toFixed(1) + ' hours' : ''); };
@@ -1588,7 +2318,9 @@ ${SHARED_HELPERS}
     document.getElementById('forecastAssumptions').textContent = 'Experimental current-pace scenario. Each subscription keeps its observed total workload. Future resets are conditional. Account percentages and times are not added into a pooled balance.';
     var root = document.getElementById('forecastAccounts'); root.replaceChildren();
     (f.accounts || []).forEach(function (a) {
-      var card = el('section', 'card'); card.appendChild(el('h3', '', a.name + ' · ' + (a.provider === 'codex' ? 'Codex' : 'Claude')));
+      var card = el('section', 'card'); card.setAttribute('data-provider', a.provider || 'unknown');
+      var head = el('div', 'card-head'); head.appendChild(el('h3', '', a.name));
+      head.appendChild(el('span', 'badge provider ' + (a.provider || 'unknown'), providerLabel(a.provider))); card.appendChild(head);
       if (a.disabled) card.appendChild(el('p', 'usage', 'Disabled. Excluded from usable capacity.'));
       if (!a.windows.length) card.appendChild(el('p', 'usage', 'No fresh provider windows recorded yet.'));
       var table = el('table'); var head = el('tr'); ['Quota window', 'Spent', 'Pace per hour', 'Provider limit', 'Reported reset'].forEach(function (h) { head.appendChild(el('th', '', h)); }); table.appendChild(head);
@@ -1598,7 +2330,13 @@ ${SHARED_HELPERS}
         if (w.limitAt != null && w.resetAt > Date.now()) {
           projection = w.limitAt >= w.resetAt ? 'Reset occurs first; continuation conditional' : w.limitAt > end ? 'No limit projected through target' : timing(w.limitAt);
         }
-        [windowLabel(w.bucket, w.durationMs), w.utilization == null ? 'Unknown' : (w.utilization * 100).toFixed(1) + '%', w.ratePerHour == null ? 'Not enough evidence' : (w.ratePerHour * 100).toFixed(2) + ' percentage points', projection, date(w.resetAt)].forEach(function (value) { row.appendChild(el('td', '', value)); });
+        // [text, class]: numbers take the mono role; thin evidence and unknowns take --dim.
+        var thin = w.ratePerHour == null;
+        [[forecastWindowLabel(w.bucket, w.durationMs), ''],
+          w.utilization == null ? ['Unknown', 'dim'] : [(w.utilization * 100).toFixed(1) + '%', 'mono'],
+          thin ? ['Not enough evidence', 'dim'] : [(w.ratePerHour * 100).toFixed(2) + ' percentage points', 'mono'],
+          [projection, thin && w.limitAt == null ? 'dim' : ''],
+          [date(w.resetAt), w.resetAt == null ? 'dim' : '']].forEach(function (c) { row.appendChild(el('td', c[1], c[0])); });
         table.appendChild(row);
         if (w.hardCapAt != null || w.softThresholdAt != null || w.lastEstimate) {
           var notes = el('tr'); var cell = el('td', 'usage'); cell.colSpan = 5;
@@ -1614,7 +2352,7 @@ ${SHARED_HELPERS}
     var advice = document.getElementById('forecastAdvice'); advice.replaceChildren();
     if (!(f.recommendations || []).length) advice.appendChild(el('p', '', coverage.adviceReason || 'No supported model alternatives yet.'));
     (f.recommendations || []).forEach(function (r) {
-      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + r.account + ' avoids ' + r.avoidedConstraints.map(windowLabel).join(', ') + '.'));
+      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + r.account + ' avoids ' + r.avoidedConstraints.map(function (b) { return forecastWindowLabel(b); }).join(', ') + '.'));
       advice.appendChild(el('p', 'usage', r.evidence + '. ' + r.gainReason + '. ' + r.tradeoff));
     });
   }
@@ -1628,6 +2366,7 @@ ${SHARED_HELPERS}
     probeButton.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeButton.disabled = !!probe.running;
     document.getElementById('reload').disabled = false;
+    renderRouteStrip(s);
     renderProviderRouting(s);
     renderAccounts(s);
     if (document.getElementById('accountDialog').open) renderAccountDetails();
@@ -1659,18 +2398,24 @@ ${SHARED_HELPERS}
     var help = !connected ? 'The proxy is disconnected. Wait for a fresh status before selecting an account.'
       : !a ? 'Choose an account to review it before applying.'
       : a.disabled || a.unavailable || a.status === 'error' ? 'The router may skip this account: ' + (a.disabled ? 'disabled' : UNAVAILABLE_TEXT[a.unavailable] || a.unavailable || 'sign-in needed')
-      : 'Recorded starting account: ' + ((lastStatus || {}).currentAccount || 'not reported') + '. Model routes and availability can override this choice.';
+      : 'Recorded starting account: ' + (currentFor(lastStatus, a.provider) || 'not reported') + '. Model routes and availability can override this choice.';
     if (a && connected) {
       var exhausted = accountQuotaGroups(a).models.filter(function (q) { return q.ratio >= 1; });
       if (exhausted.length) help += ' ' + exhausted.map(function (q) { return q.label; }).join(', ') + ' exhausted. Selecting this account does not restore those limits.';
+      var b = bindingLimit(a, lastStatus.switchThreshold, lastStatus.switchThresholds);
+      help += b ? ' Binding limit: ' + b.label + ' ' + quotaDisplay(b.ratio, 'spent') + '% spent · ' + b.grade + viaText(b.via, 'spent') + ', ' + limitText(b.limitKind, b.limit) + '.' : ' No quota reported.';
     }
     document.getElementById('switchHelp').textContent = help;
+    tintSelect('switchAccount', a);
   }
 
   function showSwitch(name) {
     var select = document.getElementById('switchAccount'); select.textContent = '';
     var placeholder = el('option', '', 'Choose an account'); placeholder.value = ''; select.appendChild(placeholder);
-    ((lastStatus || {}).accounts || []).forEach(function (a) { var option = el('option', '', a.name + ' · ' + providerName(a)); option.value = a.name; select.appendChild(option); });
+    ((lastStatus || {}).accounts || []).forEach(function (a) {
+      var option = el('option', '', providerLabel(a.provider) + ' · ' + a.name + skipSuffix(a)); option.value = a.name;
+      option.setAttribute('data-provider', a.provider || ''); select.appendChild(option);
+    });
     select.value = name || ''; document.getElementById('switchResult').textContent = '';
     updateSwitchHelp(); document.getElementById('switchDialog').showModal();
   }
@@ -1712,16 +2457,35 @@ ${SHARED_HELPERS}
     var q = a.quota || {};
     var used = quotaDisplay(q.unified7d, 'spent');
     var reset = parseTs(q.unified7dReset);
-    var option = el('option', '', name + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
+    var option = el('option', '', providerLabel(a.provider) + ' · ' + name + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
       + (isNaN(reset) ? 'reset time not reported'
-        : reset > Date.now() ? 'resets in ' + fmtIn((reset - Date.now()) / 1000) : 'reset time passed'));
+        : reset > Date.now() ? 'resets in ' + fmtIn((reset - Date.now()) / 1000) : 'reset time passed') + skipSuffix(a));
     option.value = name;
+    option.setAttribute('data-provider', a.provider || '');
     return option;
+  }
+
+  // Why the router may skip an account, appended to its dialog option so the
+  // choice is visible before it is made. Same wording as #switchHelp.
+  function skipSuffix(a) {
+    if (!a) return '';
+    if (a.disabled) return ' · disabled';
+    if (a.unavailable) return ' · ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable);
+    return a.status === 'error' ? ' · sign-in needed' : '';
+  }
+
+  // The select's left border takes the chosen account's provider tint (FR 28);
+  // an option cannot be colored reliably, its container can.
+  function tintSelect(id, a) {
+    var select = document.getElementById(id);
+    if (a && a.provider) select.setAttribute('data-provider', a.provider);
+    else select.removeAttribute('data-provider');
   }
 
   function updateForceHelp() {
     var row = forceRoute ? forceRowFor(forceRoute) : null;
     var account = document.getElementById('forceAccount').value;
+    tintSelect('forceAccount', ((lastStatus || {}).accounts || []).filter(function (a) { return a.name === account; })[0]);
     document.getElementById('applyForce').disabled = !row || !account || !connected || forcePending;
     document.getElementById('forceHelp').textContent = !connected
       ? 'The proxy is disconnected. Wait for a fresh status before applying.'
@@ -1871,20 +2635,24 @@ ${SHARED_HELPERS}
       document.getElementById('err').style.display = 'none';
       connected = true; lastUpdated = Date.now(); document.body.classList.remove('stale');
       document.getElementById('manualSelection').disabled = false;
+      document.getElementById('routingManualSelection').disabled = false;
       document.getElementById('reload').disabled = false;
       document.getElementById('connection').textContent = 'Connected · 5s refresh';
+      document.getElementById('connection').className = 'live on';
       recordActivity(s); render(s);
       if (!timer) timer = setInterval(poll, POLL_MS);
     } catch (e) {
       if (generation !== authGeneration) return;
       connected = false; document.body.classList.add('stale');
       document.getElementById('manualSelection').disabled = true;
+      document.getElementById('routingManualSelection').disabled = true;
       document.getElementById('reload').disabled = true;
       document.getElementById('probe').disabled = true;
       document.getElementById('accountManual').disabled = true; updateSwitchHelp(); updateForceHelp();
       if (document.getElementById('accountDialog').open) renderAccountDetails();
       if (lastStatus) renderRoutes(lastStatus);
       document.getElementById('connection').textContent = 'Disconnected';
+      document.getElementById('connection').className = 'live';
       var err = document.getElementById('err'); err.style.display = 'block';
       if (lastStatus) err.textContent = 'Connection lost. ' + (lastUpdated ? 'Showing status received ' + fmtAgo(lastUpdated) + '. Routing and quota may have changed. ' : '') + e.message;
       else {
@@ -1936,6 +2704,7 @@ ${SHARED_HELPERS}
   });
   document.querySelectorAll('[data-close]').forEach(function (button) { button.addEventListener('click', function () { document.getElementById(button.getAttribute('data-close')).close(); }); });
   document.getElementById('manualSelection').addEventListener('click', function () { showSwitch(); });
+  document.getElementById('routingManualSelection').addEventListener('click', function () { showSwitch(); });
   document.getElementById('accountManual').addEventListener('click', function () { document.getElementById('accountDialog').close(); showSwitch(detailAccount); });
   document.getElementById('switchAccount').addEventListener('change', updateSwitchHelp);
   document.getElementById('applySwitch').addEventListener('click', doSwitch);
