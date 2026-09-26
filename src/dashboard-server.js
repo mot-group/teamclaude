@@ -90,7 +90,8 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
       const allowed = req.method === 'GET' && ['/teamclaude/status', '/teamclaude/quota', '/teamclaude/forecast'].includes(req.url);
       const switching = req.method === 'POST' && req.url === '/teamclaude/switch';
       const forcing = req.method === 'POST' && req.url === '/teamclaude/routes/override';
-      if (!allowed && !switching && !forcing) { reply(404, { error: 'Not found' }); return; }
+      const labeling = req.method === 'POST' && req.url === '/teamclaude/accounts/label';
+      if (!allowed && !switching && !forcing && !labeling) { reply(404, { error: 'Not found' }); return; }
       let payload;
       if (switching) {
         if (!String(req.headers['content-type']).startsWith('application/json')) { reply(415, { error: 'Use JSON' }); return; }
@@ -120,6 +121,13 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
           ...(data.clear === true ? { clear: true } : { account: data.account, whenSpent: data.whenSpent }),
         });
       }
+      if (labeling) {
+        if (!String(req.headers['content-type']).startsWith('application/json')) { reply(415, { error: 'Use JSON' }); return; }
+        const data = await body(req);
+        const text = v => typeof v === 'string' && v.length <= 256;
+        if (!text(data.account) || !data.account || !text(data.provider) || !text(data.label)) { reply(400, { error: 'Rename request is malformed' }); return; }
+        payload = JSON.stringify({ account: data.account, provider: data.provider, label: data.label });
+      }
       const response = await fetch(new URL(req.url, upstream), {
         method: req.method, headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         body: payload, signal: AbortSignal.timeout(10000), redirect: 'error',
@@ -131,7 +139,7 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
       // 500 included: the endpoint answers a failed reload with
       // `{ persisted: true, applied: false }`, and swapping that for the generic
       // error told the operator nothing changed after the config write landed.
-      const explained = forcing && [400, 404, 409, 500].includes(response.status);
+      const explained = (forcing || labeling) && [400, 404, 409, 500].includes(response.status);
       if (!response.ok && !explained) { reply(response.status === 401 ? 502 : response.status, { error: 'Proxy request failed' }); return; }
       reply(response.status, await response.json());
     } catch (err) {

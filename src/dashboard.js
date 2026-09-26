@@ -891,7 +891,7 @@ export function problems(status) {
     var why = ATTENTION[a.unavailable];
     // provider and account let the banner tint the line and lead with the
     // provider word (FR 1); the text itself stays provider-neutral.
-    if (why) out.push({ severity: 'warn', kind: 'account', provider: a.provider || null, account: a.name, text: 'Account ' + a.name + ' ' + why + '.' });
+    if (why) out.push({ severity: 'warn', kind: 'account', provider: a.provider || null, account: a.name, text: 'Account ' + (a.label || a.name) + ' ' + why + '.' });
   });
 
   // Deliberately no spend line. `usedMinor` is month-to-date overage, so on a
@@ -1376,6 +1376,7 @@ const PAGE = `<!doctype html>
   #routes tr[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
   .dialog-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:23px; }
   .dialog-result { font-size:13px; padding:13px 0; }
+  .rename { display:flex; gap:8px; } .rename input { flex:1; min-width:0; }
   #accountDetails .quota { margin:18px 0; }
   #accountDetails .quota-reset { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   #accountDetails .quota .lbl { font-size:13px; }
@@ -1434,7 +1435,7 @@ const PAGE = `<!doctype html>
     <footer id="foot"></footer>
   </main>
 </div>
-<dialog id="accountDialog" aria-labelledby="accountDialogTitle"><div class="dialog-head"><h2 id="accountDialogTitle">Account details</h2><button data-close="accountDialog" aria-label="Close account details">×</button></div><div id="accountDetails"></div><div class="dialog-actions"><button data-close="accountDialog">Close</button><button id="accountManual">Manual selection</button></div></dialog>
+<dialog id="accountDialog" aria-labelledby="accountDialogTitle"><div class="dialog-head"><h2 id="accountDialogTitle">Account details</h2><button data-close="accountDialog" aria-label="Close account details">×</button></div><div id="accountDetails"></div><label for="accountLabel">Display name</label><div class="rename"><input id="accountLabel" maxlength="64" placeholder="Leave empty to show the config name"><button id="saveLabel">Save name</button></div><p class="dialog-help">Changes only what this dashboard shows. The config name stays the key for routes, logs and the TUI.</p><div id="labelResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="accountDialog">Close</button><button id="accountManual">Manual selection</button></div></dialog>
 <dialog id="switchDialog" aria-labelledby="switchTitle"><div class="dialog-head"><div><div class="eyebrow">Routing control</div><h2 id="switchTitle">Select starting account</h2></div><button data-close="switchDialog" aria-label="Close manual selection">×</button></div><p class="dialog-help">Rotation continues from the selected account. Eligibility and model routes can select another account immediately.</p><label for="switchAccount">Account</label><select id="switchAccount"></select><div class="explain"><strong>What changes</strong><ul><li>The router records this starting account for rotation.</li><li>It does not pin a model or change account priority.</li><li>Existing sessions, model routes, and request pins still apply.</li></ul></div><p id="switchHelp" class="dialog-help"></p><div id="switchResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="switchDialog">Close</button><button id="applySwitch" class="primary" disabled>Set starting account</button></div></dialog>
 <dialog id="forceDialog" aria-labelledby="forceTitle"><div class="dialog-head"><div><div class="eyebrow">Routing control</div><h2 id="forceTitle">Force a route to one account</h2></div><button data-close="forceDialog" aria-label="Close force route">×</button></div><p class="dialog-help" id="forceRouteHelp"></p><label for="forceAccount">Account</label><select id="forceAccount"></select><fieldset class="force-modes"><legend>When it runs out of usage</legend><label for="forceFallback"><input type="radio" name="forceWhenSpent" id="forceFallback" value="fallback" checked>Fall back to automatic routing</label><p class="dialog-help">The other members of this route serve it until the forced account is eligible again.</p><label for="forceHold"><input type="radio" name="forceWhenSpent" id="forceHold" value="hold">Hold on it</label><p class="dialog-help">No other member serves this route. Requests get a 429 with a retry-after until the forced account is eligible again.</p></fieldset><div class="explain"><strong>What changes</strong><ul><li>Every request matching this route goes to the selected account.</li><li>It stays forced until you clear it. There is no timer.</li><li>Sessions pinned with TC_ACCT bypass routes and are not affected.</li></ul></div><p id="forceHelp" class="dialog-help"></p><div id="forceResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="forceDialog">Cancel</button><button id="forceUseCurrent" hidden>Use current</button><button id="applyForce" class="primary" disabled>Apply</button></div></dialog>
 <script>
@@ -1442,6 +1443,11 @@ const PAGE = `<!doctype html>
   'use strict';
   var SESSION_AUTH = false;
   var KEY = 'teamclaude-dashboard-key';
+  // The dashboard name for an account: its label if one is set, else the config name.
+  function shown(name, provider) {
+    var a = ((lastStatus || {}).accounts || []).filter(function (x) { return x.name === name && (provider == null || x.provider === provider); })[0];
+    return (a && a.label) || name;
+  }
   var quotaMode = 'spent';
   try { if (localStorage.getItem('teamclaude-quota-display') === 'left') quotaMode = 'left'; } catch {}
   var detailAccount = null;
@@ -1650,7 +1656,7 @@ ${SHARED_HELPERS}
     var wrap = document.getElementById('accounts'); wrap.textContent = '';
     var query = document.getElementById('accountSearch').value.toLowerCase();
     var accounts = s.accounts || [];
-    var visible = accounts.filter(function (a) { return (a.name + ' ' + a.type + ' ' + providerLabel(a.provider)).toLowerCase().indexOf(query) !== -1; });
+    var visible = accounts.filter(function (a) { return (a.name + ' ' + (a.label || '') + ' ' + a.type + ' ' + providerLabel(a.provider)).toLowerCase().indexOf(query) !== -1; });
     document.getElementById('accountCount').textContent = visible.length + (query ? ' of ' + accounts.length : '') + ' accounts';
     document.getElementById('quotaSpent').setAttribute('aria-pressed', String(quotaMode === 'spent'));
     document.getElementById('quotaLeft').setAttribute('aria-pressed', String(quotaMode === 'left'));
@@ -1672,7 +1678,7 @@ ${SHARED_HELPERS}
       members.forEach(function (a) {
         var tr = el('tr', 'account-row'); tr.setAttribute('data-provider', a.provider || 'unknown');
         var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
-        var identity = el('td'); identity.appendChild(el('span', 'account-name', a.name)); identity.appendChild(accountBadgeRow(a, s));
+        var identity = el('td'); identity.appendChild(el('span', 'account-name', a.label || a.name)); identity.appendChild(accountBadgeRow(a, s));
         identity.appendChild(bindingLine(binding));
         identity.appendChild(el('div', 'account-meta', a.type === 'oauth' ? 'Subscription' : a.type === 'api_key' ? 'API account' : a.type));
         var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0];
@@ -1685,7 +1691,7 @@ ${SHARED_HELPERS}
           if (!groups[key].length) td.appendChild(el('span', 'quota-unknown', key === 'shared' ? 'Not reported' : 'No window reported'));
           tr.appendChild(td);
         });
-        var action = el('td'); var btn = el('button', 'act', 'Details →'); btn.setAttribute('aria-label', 'Details for ' + a.name); btn.addEventListener('click', function () { showAccount(a.name); }); action.appendChild(btn); tr.appendChild(action); body.appendChild(tr);
+        var action = el('td'); var btn = el('button', 'act', 'Details →'); btn.setAttribute('aria-label', 'Details for ' + (a.label || a.name)); btn.addEventListener('click', function () { showAccount(a.name); }); action.appendChild(btn); tr.appendChild(action); body.appendChild(tr);
       });
     });
     scroll.appendChild(table); wrap.appendChild(scroll);
@@ -1696,14 +1702,16 @@ ${SHARED_HELPERS}
     var wrap = document.getElementById('accountDetails'); wrap.textContent = '';
     var dialog = document.getElementById('accountDialog');
     document.getElementById('accountManual').disabled = !connected || !a;
-    if (!a) { dialog.removeAttribute('data-provider'); wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
+    if (!a) { dialog.removeAttribute('data-provider'); document.getElementById('saveLabel').disabled = true; wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
     dialog.setAttribute('data-provider', a.provider || 'unknown');
-    document.getElementById('accountDialogTitle').textContent = a.name;
+    document.getElementById('accountDialogTitle').textContent = a.label || a.name;
+    document.getElementById('saveLabel').disabled = !connected || labelPending;
     var s = lastStatus || {};
     wrap.appendChild(accountBadgeRow(a, s));
     if (!connected) { var warning = el('p', 'warnt', 'Connection lost. These quota values may be stale.'); warning.setAttribute('role', 'status'); wrap.appendChild(warning); }
     var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
     wrap.appendChild(bindingLine(binding));
+    if (a.label) wrap.appendChild(el('p', 'usage', 'Config name: ' + a.name));
     wrap.appendChild(el('p', 'usage', providerLabel(a.provider) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
     var groups = accountQuotaGroups(a);
     groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q, a, s, !!binding && binding.label === q.label)); });
@@ -1717,7 +1725,37 @@ ${SHARED_HELPERS}
   }
 
   function showAccount(name) {
-    detailAccount = name; renderAccountDetails(); document.getElementById('accountDialog').showModal();
+    detailAccount = name;
+    var a = ((lastStatus || {}).accounts || []).filter(function (x) { return x.name === name; })[0];
+    document.getElementById('accountLabel').value = (a && a.label) || '';
+    document.getElementById('labelResult').textContent = '';
+    renderAccountDetails(); document.getElementById('accountDialog').showModal();
+  }
+
+  var labelPending = false;
+  async function saveLabel() {
+    var a = ((lastStatus || {}).accounts || []).filter(function (x) { return x.name === detailAccount; })[0];
+    if (!a || !connected || labelPending) return;
+    labelPending = true; document.getElementById('saveLabel').disabled = true;
+    var generation = authGeneration;
+    var result = document.getElementById('labelResult'); result.className = 'dialog-result'; result.textContent = 'Saving...';
+    try {
+      var res = await fetch('/teamclaude/accounts/label', {
+        method: 'POST',
+        headers: { 'x-api-key': SESSION_AUTH ? '' : localStorage.getItem(KEY) || '', 'content-type': 'application/json' },
+        body: JSON.stringify({ account: a.name, provider: a.provider, label: document.getElementById('accountLabel').value.trim() }),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      if (generation !== authGeneration) return;
+      result.className = 'dialog-result ' + (json.ok ? 'ok' : 'error');
+      result.textContent = json.ok ? (json.label ? 'Saved.' : 'Name cleared. Showing the config name.') : 'Not saved: ' + (json.error || 'status ' + res.status);
+      await poll(true);
+    } catch (e) {
+      if (generation === authGeneration) { result.className = 'dialog-result error'; result.textContent = 'Could not confirm the change. ' + e.message; }
+    } finally { labelPending = false; document.getElementById('saveLabel').disabled = !connected; }
   }
 
   function emptyTable(id, text) {
@@ -2163,7 +2201,7 @@ ${SHARED_HELPERS}
     var card = el('div', 'card');
     card.setAttribute('data-provider', account.provider || 'unknown');
     var head = el('div', 'card-head');
-    head.appendChild(el('h3', '', account.name));
+    head.appendChild(el('h3', '', shown(account.name, account.provider)));
     head.appendChild(el('span', 'badge provider ' + (account.provider || 'unknown'), providerLabel(account.provider)));
     card.appendChild(head);
     card.appendChild(totalsLine(account.totals || {}));
@@ -2281,7 +2319,7 @@ ${SHARED_HELPERS}
       var probe = jobFor((s.probe || {}).accounts || [], a, i);
       var warm = jobFor((s.warm || {}).accounts || [], a, i);
       var row = el('tr'); row.setAttribute('data-provider', a.provider || 'unknown');
-      var name = el('td', '', a.name); var tag = el('span', 'tag', ' · '); tag.appendChild(el('span', 'pv', providerLabel(a.provider))); name.appendChild(tag); row.appendChild(name);
+      var name = el('td', '', a.label || a.name); var tag = el('span', 'tag', ' · '); tag.appendChild(el('span', 'pv', providerLabel(a.provider))); name.appendChild(tag); row.appendChild(name);
       var error = probe.error || warm.error;
       [[probe.status || 'Unknown', probe.error ? 'badt' : ''], [probe.lastProbedAt ? fmtAgo(probe.lastProbedAt) : 'Never', ''], [warm.status || 'Unknown', warm.error ? 'badt' : ''],
         [error || (probe.durationMs == null ? 'No measurement' : probe.durationMs + ' ms'), error ? 'badt' : probe.durationMs == null ? '' : 'mono']].forEach(function (c) { row.appendChild(el('td', c[1], c[0])); });
@@ -2319,7 +2357,7 @@ ${SHARED_HELPERS}
     var root = document.getElementById('forecastAccounts'); root.replaceChildren();
     (f.accounts || []).forEach(function (a) {
       var card = el('section', 'card'); card.setAttribute('data-provider', a.provider || 'unknown');
-      var head = el('div', 'card-head'); head.appendChild(el('h3', '', a.name));
+      var head = el('div', 'card-head'); head.appendChild(el('h3', '', shown(a.name, a.provider)));
       head.appendChild(el('span', 'badge provider ' + (a.provider || 'unknown'), providerLabel(a.provider))); card.appendChild(head);
       if (a.disabled) card.appendChild(el('p', 'usage', 'Disabled. Excluded from usable capacity.'));
       if (!a.windows.length) card.appendChild(el('p', 'usage', 'No fresh provider windows recorded yet.'));
@@ -2348,7 +2386,7 @@ ${SHARED_HELPERS}
       (a.models || []).forEach(function (m) { card.appendChild(el('p', 'usage', m.model + ': ' + (m.eligible ? 'Reported constraints permit this model; existing session restrictions still apply' : m.reason))); });
       root.appendChild(card);
     });
-    (coverage.exclusions || []).forEach(function (a) { root.appendChild(el('p', 'usage', a.name + ': ' + a.reason)); });
+    (coverage.exclusions || []).forEach(function (a) { root.appendChild(el('p', 'usage', shown(a.name, a.provider) + ': ' + a.reason)); });
     var advice = document.getElementById('forecastAdvice'); advice.replaceChildren();
     if (!(f.recommendations || []).length) advice.appendChild(el('p', '', coverage.adviceReason || 'No supported model alternatives yet.'));
     (f.recommendations || []).forEach(function (r) {
@@ -2413,7 +2451,7 @@ ${SHARED_HELPERS}
     var select = document.getElementById('switchAccount'); select.textContent = '';
     var placeholder = el('option', '', 'Choose an account'); placeholder.value = ''; select.appendChild(placeholder);
     ((lastStatus || {}).accounts || []).forEach(function (a) {
-      var option = el('option', '', providerLabel(a.provider) + ' · ' + a.name + skipSuffix(a)); option.value = a.name;
+      var option = el('option', '', providerLabel(a.provider) + ' · ' + (a.label || a.name) + skipSuffix(a)); option.value = a.name;
       option.setAttribute('data-provider', a.provider || ''); select.appendChild(option);
     });
     select.value = name || ''; document.getElementById('switchResult').textContent = '';
@@ -2457,7 +2495,7 @@ ${SHARED_HELPERS}
     var q = a.quota || {};
     var used = quotaDisplay(q.unified7d, 'spent');
     var reset = parseTs(q.unified7dReset);
-    var option = el('option', '', providerLabel(a.provider) + ' · ' + name + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
+    var option = el('option', '', providerLabel(a.provider) + ' · ' + (a.label || name) + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
       + (isNaN(reset) ? 'reset time not reported'
         : reset > Date.now() ? 'resets in ' + fmtIn((reset - Date.now()) / 1000) : 'reset time passed') + skipSuffix(a));
     option.value = name;
@@ -2707,6 +2745,8 @@ ${SHARED_HELPERS}
   document.getElementById('routingManualSelection').addEventListener('click', function () { showSwitch(); });
   document.getElementById('accountManual').addEventListener('click', function () { document.getElementById('accountDialog').close(); showSwitch(detailAccount); });
   document.getElementById('switchAccount').addEventListener('change', updateSwitchHelp);
+  document.getElementById('saveLabel').addEventListener('click', saveLabel);
+  document.getElementById('accountLabel').addEventListener('keydown', function (e) { if (e.key === 'Enter') saveLabel(); });
   document.getElementById('applySwitch').addEventListener('click', doSwitch);
   document.getElementById('forceAccount').addEventListener('change', updateForceHelp);
   document.getElementById('applyForce').addEventListener('click', applyForce);

@@ -31,6 +31,7 @@ import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
  * @property {(() => Promise<number>)} [reload]
  * @property {(() => Promise<unknown>)} [persistAccounts]
  * @property {((change: Record<string, any>) => Promise<any>)} [saveOverride]
+ * @property {((change: { account: string, provider: string, label: string }) => Promise<void>)} [saveLabel]
  * @property {((hours?: number) => any)} [getForecast]
  * @property {(() => Record<string, any>)} [getStatusExtra]
  * @property {(() => Record<string, any>)} [getQuotaExtra]
@@ -674,6 +675,43 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             applied: false,
             error: persisted ? 'reload failed; see the proxy log' : 'could not save the override; see the proxy log',
           }));
+        }
+        return;
+      }
+
+      // Label endpoint: the dashboard's rename. Sets or clears an account's
+      // display-only `label` in the config, then reloads. Body:
+      // {"account": "<name>", "provider": "anthropic|codex", "label": "<text or empty to clear>"}.
+      if (req.method === 'POST' && req.url === '/teamclaude/accounts/label') {
+        if (!hooks.saveLabel) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'rename not supported' }));
+          return;
+        }
+        let payload;
+        try {
+          payload = JSON.parse(await readControlBody(req) || '{}');
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid request body' }));
+          return;
+        }
+        const label = typeof payload?.label === 'string' ? payload.label.trim() : null;
+        if (typeof payload?.account !== 'string' || !payload.account || typeof payload.provider !== 'string'
+          || label == null || label.length > 64 || /[\x00-\x1f\x7f-\x9f]/.test(label)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'a label is at most 64 characters with no control characters' }));
+          return;
+        }
+        try {
+          await hooks.saveLabel({ account: payload.account, provider: payload.provider, label });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, label: label || null }));
+        } catch (err) {
+          const missing = err.code === 'no-such-account';
+          if (!missing) console.error('[TeamClaude] Rename failed:', err.message);
+          res.writeHead(missing ? 404 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: missing ? 'no such account' : 'could not save the name; see the proxy log' }));
         }
         return;
       }

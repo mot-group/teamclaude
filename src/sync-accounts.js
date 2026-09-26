@@ -110,6 +110,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];
     }
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
+    mgr.label = diskAcct.label || null;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
     // A list position edited on disk applies on reload for the same reason a
     // priority edit does, and `null` rather than `??` so deleting the field
@@ -175,6 +176,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
+      if (diskAcct.label) cfgAcct.label = diskAcct.label; else delete cfgAcct.label;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
