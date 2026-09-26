@@ -234,6 +234,21 @@ export function gatingUtilization(quota, bucketKey) {
 }
 
 /**
+ * The latest of several reset times (ms or date string), as given; null when
+ * any is unknown, so a limit never claims an earlier recovery than the router's.
+ * @param {any[]} resets
+ * @returns {any}
+ */
+export function latestReset(resets) {
+  /** @param {any} v */
+  var ts = function (v) { var t = typeof v === 'number' ? v : Date.parse(v); return isFinite(t) ? t : NaN; };
+  return resets.reduce(function (latest, v) {
+    if (latest === null || isNaN(ts(v))) return null;
+    return latest === undefined || ts(v) > ts(latest) ? v : latest;
+  }, undefined);
+}
+
+/**
  * How the router gates one accountQuotaGroups row, so grade, headroom and tick
  * match rotation. A family's switch threshold is compared against
  * gatingUtilization (_isNearQuota), but its maxUsage cap against the family
@@ -270,8 +285,6 @@ export function quotaGate(account, row, fleetThreshold, fleetThresholds) {
   var limit = capBinds ? /** @type {number} */ (lim.cap) : lim.threshold;
   var via = ratio != null && own != null && ratio > own ? ratio : null;
   var shared = q.unified7d == null ? null : q.unified7d;
-  /** @param {any} v */
-  var ts = function (v) { var t = typeof v === 'number' ? v : Date.parse(v); return isFinite(t) ? t : NaN; };
   // Every reading that bars the row right now, whichever won the headroom
   // comparison: it recovers only once the last of their windows rolls.
   var capReset = !r.bucket && r.gate ? q.unified7dReset : r.resetAt;
@@ -280,12 +293,7 @@ export function quotaGate(account, row, fleetThreshold, fleetThresholds) {
   if (own != null && own >= lim.threshold) blocking.push(r.resetAt);
   if (family && shared != null && shared >= lim.threshold) blocking.push(q.unified7dReset);
   var resetAt = via != null ? (q.unified7dReset == null ? null : q.unified7dReset) : r.resetAt;
-  if (blocking.length) {
-    resetAt = blocking.reduce(function (latest, v) {
-      if (latest === null || isNaN(ts(v))) return null;
-      return latest === undefined || ts(v) > ts(latest) ? v : latest;
-    }, undefined);
-  }
+  if (blocking.length) resetAt = latestReset(blocking);
   return {
     limit: limit, kind: capBinds ? 'cap' : 'threshold', ratio: ratio,
     headroom: ratio == null ? null : limit - ratio, grade: quotaGrade(ratio, limit, QUOTA_NEAR_BAND),
@@ -953,7 +961,12 @@ export function accountQuotaGroups(account = {}) {
  * least headroom (quotaGate's limit minus the reading it gates on, so a
  * family is measured the way the router gates it); ties go to the earlier key.
  * A scoped family binds under its `gate` key; Codex per-model rows never bind.
- * Null when nothing gates.
+ * A blocked binding row reports when its models recover: the latest reset of
+ * every blocked row that gates those models, mirroring the router. The 5-hour,
+ * tokens and requests rows gate every model, as does the Weekly row, except
+ * that a family with its own bucket meets the shared weekly through its own
+ * threshold (already in its gate) and is barred directly only by the shared
+ * cap (capExceeded). Another family's row never gates it. Null when nothing gates.
  * @param {Record<string, any>|null|undefined} account
  * @param {number|null|undefined} fleetThreshold
  * @param {Object<string, number>|null|undefined} fleetThresholds
@@ -963,11 +976,16 @@ export function bindingLimit(account, fleetThreshold, fleetThresholds) {
   var groups = accountQuotaGroups(account || {});
   /** @type {ReturnType<typeof bindingLimit>} */
   var best = null;
+  /** @type {QuotaRow|null} */
+  var bestRow = null;
+  /** @type {Array<{ row: QuotaRow, g: ReturnType<typeof quotaGate> }>} */
+  var gated = [];
   groups.shared.concat(groups.session, groups.models).forEach(function (row) {
     var bucket = row.bucket || row.gate || null;
     var order = bucket ? THRESHOLD_BUCKET_KEYS.indexOf(bucket) : -1;
     if (!bucket || order === -1 || typeof row.ratio !== 'number' || !isFinite(row.ratio)) return;
     var g = quotaGate(account, row, fleetThreshold, fleetThresholds);
+    gated.push({ row: row, g: g });
     var headroom = /** @type {number} */ (g.headroom);
     // `>=` on order keeps a scoped family that ties the Weekly row it gates under from displacing it.
     if (best && (headroom > best.headroom || (headroom === best.headroom && order >= THRESHOLD_BUCKET_KEYS.indexOf(best.bucket)))) return;
@@ -975,8 +993,29 @@ export function bindingLimit(account, fleetThreshold, fleetThresholds) {
       bucket: bucket, label: row.label, ratio: row.ratio, limit: g.limit, limitKind: g.kind,
       headroom: headroom, grade: g.grade, via: g.via, resetAt: g.resetAt,
     };
+    bestRow = row;
   });
-  return best;
+  // The forEach assigned these; TS narrows both to their null initializers without the casts.
+  var found = /** @type {ReturnType<typeof bindingLimit>} */ (best);
+  var binding = /** @type {QuotaRow|null} */ (bestRow);
+  if (found && binding && (found.grade === 'at' || found.grade === 'spent')) {
+    var q = (account || {}).quota || {};
+    var dedicated = groups.models.indexOf(binding) !== -1 && !!binding.bucket;
+    var cap7d = effectiveLimit(account, 'unified7d', fleetThreshold, fleetThresholds).cap;
+    /** @type {any[]} */
+    var resets = [];
+    gated.forEach(function (e) {
+      if (e.row === binding) { resets.push(e.g.resetAt); return; }
+      if (groups.models.indexOf(e.row) !== -1) return;
+      if (e.row.bucket === 'unified7d' && dedicated) {
+        if (cap7d != null && q.unified7d != null && q.unified7d >= cap7d) resets.push(e.row.resetAt);
+        return;
+      }
+      if (e.g.grade === 'at' || e.g.grade === 'spent') resets.push(e.g.resetAt);
+    });
+    found.resetAt = latestReset(resets);
+  }
+  return found;
 }
 
 // The reset tracker names its watched windows by limit; the grading helpers
@@ -1023,7 +1062,7 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
-  currentFor, gatingUtilization, quotaGate,
+  currentFor, gatingUtilization, quotaGate, latestReset,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and

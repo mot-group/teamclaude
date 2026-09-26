@@ -1152,6 +1152,34 @@ test('a family limit reports the reset of the reading that binds it', () => {
   assert.equal(quotaGate(opus, accountQuotaGroups(opus).models[0], 0.98, null).resetAt, 6 * DAY);
 });
 
+test('a blocked binding row reports recovery from every limit blocking its models', () => {
+  const DAY = 86400000;
+  // Codex's case: a bare maxUsage caps the shared weekly for every model, the family included.
+  const bare = { maxUsage: 0.5, switchThreshold: { unified7dFable: 0.8 }, quota: {
+    unified7d: 0.55, unified7dReset: 6 * DAY, unified7dFable: 0.7, unified7dFableReset: DAY } };
+  const b = bindingLimit(bare, 0.98, null);
+  assert.deepEqual([b.label, b.grade, b.resetAt], ['Fable weekly', 'at', 6 * DAY]);
+  // The 5-hour window gates every model: a spent 5-hour resetting later wins.
+  const th = { switchThreshold: { unified7dFable: 0.8 } };
+  /** @param {Record<string, any>} quota */
+  const at = quota => bindingLimit({ ...th, quota }, 0.98, null);
+  const fiveHour = at({ unified5h: 1, unified5hReset: 6 * DAY, unified7d: 0.2, unified7dReset: 3 * DAY, unified7dFable: 0.9, unified7dFableReset: DAY });
+  assert.deepEqual([fiveHour.label, fiveHour.resetAt], ['Fable weekly', 6 * DAY]);
+  assert.equal(at({ unified5h: 1, unified5hReset: DAY, unified7d: 0.2, unified7dFable: 0.9, unified7dFableReset: 5 * DAY }).resetAt, 5 * DAY);
+  // Another family's block does not delay this family's recovery.
+  const other = at({ unified7d: 0.2, unified7dFable: 0.95, unified7dFableReset: DAY, unified7dSonnet: 0.99, unified7dSonnetReset: 6 * DAY });
+  assert.deepEqual([other.label, other.resetAt], ['Fable weekly', DAY]);
+  // The shared weekly over the Weekly threshold but under the family's does not delay the family:
+  // the router meets the shared reading only through the family threshold, or the shared cap.
+  const loose = bindingLimit({ switchThreshold: { unified7dFable: 0.6, unified7d: 0.5 }, quota: {
+    unified7d: 0.55, unified7dReset: 6 * DAY, unified7dFable: 0.9, unified7dFableReset: DAY } }, 0.98, null);
+  assert.deepEqual([loose.label, loose.resetAt], ['Fable weekly', DAY]);
+  // A blocking limit with no known reset: none is claimed.
+  assert.equal(at({ unified5h: 1, unified7d: 0.2, unified7dFable: 0.9, unified7dFableReset: DAY }).resetAt, null);
+  // Not blocked: the row's own reset, unchanged.
+  assert.equal(at({ unified5h: 0.5, unified5hReset: 6 * DAY, unified7d: 0.2, unified7dFable: 0.7, unified7dFableReset: DAY }).resetAt, DAY);
+});
+
 test('fixture grades are unchanged by the governing-weekly gate', () => {
   // Quotas copied from the fixture (FLEET above); none has the shared weekly above its family.
   const work = { quota: { unified5h: 0, unified7d: 0.23, unified7dFable: 0.25, scopedWeekly: { fable: { utilization: 0.25 } } } };
