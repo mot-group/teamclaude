@@ -242,12 +242,15 @@ export function gatingUtilization(quota, bucketKey) {
  * (`gate: 'unified7d'`) is gated like _governingWeekly gates it, against the
  * shared weekly's threshold. `ratio` is the reading the limit is measured on;
  * `via` repeats it when the shared weekly pushed it past the row's own reading,
- * else null. The bar keeps showing the row's own ratio.
+ * else null. The bar keeps showing the row's own ratio. `resetAt` is when the
+ * limit lifts: the shared weekly's reset when that reading binds, the later of
+ * the two when both are at the limit, null when a reset it needs is unknown
+ * (never an earlier recovery than the router's), else the row's own.
  * @param {Record<string, any>|null|undefined} account
- * @param {{ ratio?: any, bucket?: string|null, gate?: string }|null|undefined} row
+ * @param {{ ratio?: any, bucket?: string|null, gate?: string, resetAt?: any }|null|undefined} row
  * @param {number|null|undefined} fleetThreshold
  * @param {Object<string, number>|null|undefined} fleetThresholds
- * @returns {{ limit: number, kind: 'threshold'|'cap', ratio: number|null, headroom: number|null, grade: 'ok'|'near'|'at'|'spent'|null, via: number|null }}
+ * @returns {{ limit: number, kind: 'threshold'|'cap', ratio: number|null, headroom: number|null, grade: 'ok'|'near'|'at'|'spent'|null, via: number|null, resetAt: any }}
  */
 export function quotaGate(account, row, fleetThreshold, fleetThresholds) {
   var q = (account || {}).quota || {};
@@ -264,10 +267,20 @@ export function quotaGate(account, row, fleetThreshold, fleetThresholds) {
   var capBinds = gating != null && capRoom < lim.threshold - gating;
   var ratio = capBinds ? capOn : gating;
   var limit = capBinds ? /** @type {number} */ (lim.cap) : lim.threshold;
+  var via = ratio != null && own != null && ratio > own ? ratio : null;
+  var shared = q.unified7d == null ? null : q.unified7d;
+  /** @param {any} v */
+  var ts = function (v) { var t = typeof v === 'number' ? v : Date.parse(v); return isFinite(t) ? t : NaN; };
+  var resetAt = r.resetAt;
+  if (family && !capBinds && own != null && own >= limit && shared != null && shared >= limit) {
+    // Both readings bar the family: it stays barred until the later window rolls.
+    var a = ts(r.resetAt), b = ts(q.unified7dReset);
+    resetAt = isNaN(a) || isNaN(b) ? null : a >= b ? r.resetAt : q.unified7dReset;
+  } else if (via != null) resetAt = q.unified7dReset == null ? null : q.unified7dReset;
   return {
     limit: limit, kind: capBinds ? 'cap' : 'threshold', ratio: ratio,
     headroom: ratio == null ? null : limit - ratio, grade: quotaGrade(ratio, limit, QUOTA_NEAR_BAND),
-    via: ratio != null && own != null && ratio > own ? ratio : null,
+    via: via, resetAt: resetAt,
   };
 }
 
@@ -951,7 +964,7 @@ export function bindingLimit(account, fleetThreshold, fleetThresholds) {
     if (best && (headroom > best.headroom || (headroom === best.headroom && order >= THRESHOLD_BUCKET_KEYS.indexOf(best.bucket)))) return;
     best = {
       bucket: bucket, label: row.label, ratio: row.ratio, limit: g.limit, limitKind: g.kind,
-      headroom: headroom, grade: g.grade, via: g.via, resetAt: row.resetAt,
+      headroom: headroom, grade: g.grade, via: g.via, resetAt: g.resetAt,
     };
   });
   return best;
@@ -1512,11 +1525,12 @@ ${SHARED_HELPERS}
     val.appendChild(el('span', 'g', grade));
     if (lim.via != null) val.appendChild(el('small', 'via', viaText(lim.via, quotaMode)));
     head.appendChild(val); row.appendChild(head);
-    var reset = resetIn(q.resetAt);
+    // The reset of the reading that binds (quotaGate), so a family barred by the shared weekly names that window's roll.
+    var reset = resetIn(lim.resetAt);
     row.appendChild(gradedBar(q.label, q.ratio, lim, grade, reset));
     var resetLine = el('div', 'quota-reset');
     resetLine.appendChild(el('span', '', reset.charAt(0).toUpperCase() + reset.slice(1)));
-    var ts = parseTs(q.resetAt);
+    var ts = parseTs(lim.resetAt);
     if (!isNaN(ts)) resetLine.appendChild(el('span', 'quota-date', new Date(ts).toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })));
     row.appendChild(resetLine);
     return row;
@@ -2072,9 +2086,10 @@ ${SHARED_HELPERS}
       row.appendChild(el('span', 'num', 'unknown · ' + when));
       return row;
     }
-    var lim = quotaGate(a, { bucket: RESET_WINDOW_BUCKETS[key] || null, ratio: w.utilization }, s.switchThreshold, s.switchThresholds);
+    var lim = quotaGate(a, { bucket: RESET_WINDOW_BUCKETS[key] || null, ratio: w.utilization, resetAt: w.resetAt }, s.switchThreshold, s.switchThresholds);
     var grade = lim.grade;
-    row.appendChild(gradedBar(w.label, w.utilization, lim, grade, ended ? 'ended ' + shortDate(due) + ', no new window yet' : resetIn(w.resetAt)));
+    // The visible countdown stays this window's own roll; the meter's reset names when the limit lifts.
+    row.appendChild(gradedBar(w.label, w.utilization, lim, grade, lim.resetAt !== w.resetAt ? resetIn(lim.resetAt) : ended ? 'ended ' + shortDate(due) + ', no new window yet' : resetIn(w.resetAt)));
     var num = el('span', 'num');
     num.appendChild(el('b', '', shown + '%'));
     num.appendChild(el('span', '', ' ' + quotaMode + ' · ' + when));

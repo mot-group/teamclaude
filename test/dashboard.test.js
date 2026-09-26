@@ -1095,7 +1095,7 @@ test('a family gates on the higher of its own weekly and the shared one, as the 
   // Family threshold 0.8, shared 1.0: the shared weekly at 0.9 bars Fable at 0.2.
   const account = { switchThreshold: { unified7dFable: 0.8, unified7d: 1 }, quota: { unified7d: 0.9, unified7dFable: 0.2, unified7dFableReset: 4 } };
   const fable = accountQuotaGroups(account).models[0];
-  assert.deepEqual(quotaGate(account, fable, 0.98, null), { limit: 0.8, kind: 'threshold', ratio: 0.9, headroom: 0.8 - 0.9, grade: 'at', via: 0.9 });
+  assert.deepEqual(quotaGate(account, fable, 0.98, null), { limit: 0.8, kind: 'threshold', ratio: 0.9, headroom: 0.8 - 0.9, grade: 'at', via: 0.9, resetAt: null });
   const b = bindingLimit(account, 0.98, null);
   assert.deepEqual([b.bucket, b.label, b.ratio, b.grade, b.via, b.limit], ['unified7dFable', 'Fable weekly', 0.2, 'at', 0.9, 0.8]);
   // The shared row itself grades on its own reading, with nothing to explain.
@@ -1103,7 +1103,7 @@ test('a family gates on the higher of its own weekly and the shared one, as the 
 
   // A family cap compares the family reading alone (capExceeded), so it can still bind.
   const capped = { maxUsage: { unified7dFable: 0.3 }, quota: { unified7d: 0.5, unified7dFable: 0.25 } };
-  assert.deepEqual(quotaGate(capped, accountQuotaGroups(capped).models[0], 0.98, null), { limit: 0.3, kind: 'cap', ratio: 0.25, headroom: 0.3 - 0.25, grade: 'near', via: null });
+  assert.deepEqual(quotaGate(capped, accountQuotaGroups(capped).models[0], 0.98, null), { limit: 0.3, kind: 'cap', ratio: 0.25, headroom: 0.3 - 0.25, grade: 'near', via: null, resetAt: undefined });
 
   // A scoped family with no key gates on max(shared, scoped) against the shared threshold, and binds when it is tighter.
   const opus = { quota: { unified7d: 0.5, scopedWeekly: { opus: { utilization: 0.97 } } } };
@@ -1113,6 +1113,24 @@ test('a family gates on the higher of its own weekly and the shared one, as the 
   const tied = { quota: { unified7d: 0.6, scopedWeekly: { opus: { utilization: 0.1 } } } };
   assert.equal(bindingLimit(tied, 0.98, null).label, 'Weekly');
   assert.equal(quotaGate(tied, accountQuotaGroups(tied).models[0], 0.98, null).via, 0.6);
+});
+
+test('a family limit reports the reset of the reading that binds it', () => {
+  const DAY = 86400000;
+  const th = { switchThreshold: { unified7dFable: 0.8, unified7d: 1 } };
+  /** @param {Record<string, any>} quota */
+  const reset = quota => bindingLimit({ ...th, quota }, 0.98, null).resetAt;
+  // Shared weekly 90% resetting in 6 days bars Fable 20% resetting tomorrow: the shared reset.
+  assert.equal(reset({ unified7d: 0.9, unified7dReset: 6 * DAY, unified7dFable: 0.2, unified7dFableReset: DAY }), 6 * DAY);
+  // Both readings at the limit: the later of the two resets, whichever it is.
+  assert.equal(reset({ unified7d: 0.9, unified7dReset: 2 * DAY, unified7dFable: 0.85, unified7dFableReset: 5 * DAY }), 5 * DAY);
+  assert.equal(reset({ unified7d: 0.95, unified7dReset: 6 * DAY, unified7dFable: 0.85, unified7dFableReset: DAY }), 6 * DAY);
+  // A reset the answer needs is unknown: no earlier recovery is claimed.
+  assert.equal(reset({ unified7d: 0.9, unified7dFable: 0.2, unified7dFableReset: DAY }), null);
+  assert.equal(reset({ unified7d: 0.9, unified7dReset: 6 * DAY, unified7dFable: 0.85 }), null);
+  // The family's own reading binds alone: its own reset, as before.
+  assert.equal(reset({ unified7d: 0.3, unified7dReset: 6 * DAY, unified7dFable: 0.85, unified7dFableReset: DAY }), DAY);
+  assert.equal(bindingLimit(fixtureAlex, FLEET.threshold, FLEET.table).resetAt, 30);
 });
 
 test('fixture grades are unchanged by the governing-weekly gate', () => {
