@@ -701,15 +701,18 @@ async function serverCommand() {
   hooks.saveOverride = saveOverride;
   // The dashboard's rename. Written by entry id, never by name: `name` is what
   // routes and name-matched pairing key on, so only the display label changes.
-  hooks.saveLabel = (/** @type {{ account: string, provider: string, label: string }} */ { account, provider, label }) => queued(async () => {
-    const live = accountManager.accounts.find(a => a.name === account && providerOf(a) === provider);
-    if (!live?.id) throw fail('no-such-account', `no account "${account}"`);
+  hooks.saveLabel = (/** @type {{ id: string, label: string }} */ { id, label }) => queued(async () => {
+    if (!accountManager.accounts.some(a => a.id === id)) throw fail('no-such-account', `no account with id "${id}"`);
     await atomicConfigUpdate(async diskConfig => {
-      const row = (diskConfig.accounts || []).find((/** @type {any} */ a) => a?.id === live.id);
-      if (!row) throw fail('no-such-account', `no config entry for "${account}"`);
+      const row = (diskConfig.accounts || []).find((/** @type {any} */ a) => a?.id === id);
+      if (!row) throw fail('no-such-account', `no config entry with id "${id}"`);
       if (label) row.label = label; else delete row.label;
     });
-    await reloadAccounts();
+    try {
+      await reloadAccounts();
+    } catch (err) {
+      throw fail('reload-failed', /** @type {Error} */ (err).message);
+    }
   });
   hooks.getStatusExtra = () => ({
     forecast: hooks.getForecast(),

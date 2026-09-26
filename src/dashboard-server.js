@@ -125,8 +125,8 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
         if (!String(req.headers['content-type']).startsWith('application/json')) { reply(415, { error: 'Use JSON' }); return; }
         const data = await body(req);
         const text = (/** @type {unknown} */ v) => typeof v === 'string' && v.length <= 256;
-        if (!text(data.account) || !data.account || !text(data.provider) || !text(data.label)) { reply(400, { error: 'Rename request is malformed' }); return; }
-        payload = JSON.stringify({ account: data.account, provider: data.provider, label: data.label });
+        if (!text(data.id) || !data.id || !text(data.label)) { reply(400, { error: 'Rename request is malformed' }); return; }
+        payload = JSON.stringify({ id: data.id, label: data.label });
       }
       const response = await fetch(new URL(req.url, upstream), {
         method: req.method, headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },

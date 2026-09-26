@@ -11,7 +11,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routeStripLines, problems, STARVED_MIN, STARVED_LIST_MAX,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows, RESET_WINDOW_BUCKETS,
-  currentFor, gatingUtilization, quotaGate,
+  currentFor, accountLabel, gatingUtilization, quotaGate,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder, forecastWindowLabel, bucketLabel,
 } from '../src/dashboard.js';
 
@@ -1210,6 +1210,31 @@ test('currentAccounts is authoritative; the global currentAccount only answers w
   const legacy = { currentAccount: 'a', accounts: [{ name: 'a', provider: 'anthropic' }, { name: 'b', provider: 'anthropic' }],
     defaultTargets: { anthropic: 'b' }, providerRouting: [{ provider: 'anthropic', models: [] }] };
   assert.ok(routeStripLines(legacy)[0].why.some(w => /^Current: a/.test(w.text)));
+});
+
+test('display labels replace account names in routing text, matched by provider; names stay the values', () => {
+  const status = {
+    currentAccounts: { anthropic: 'a' },
+    accounts: [
+      { name: 'x', provider: 'anthropic', label: 'Claude X' },
+      { name: 'x', provider: 'codex', label: null },
+      { name: 'a', provider: 'anthropic', label: 'Team A' },
+    ],
+    defaultTargets: { anthropic: 'x' },
+    providerRouting: [{ provider: 'anthropic', models: [{ model: 'm', label: 'Opus', target: 'x' }] }],
+  };
+  assert.equal(accountLabel(status, 'x', 'anthropic'), 'Claude X');
+  assert.equal(accountLabel(status, 'x', 'codex'), 'x', 'the codex namesake has no label');
+  assert.equal(accountLabel(status, 'Partially available', 'anthropic'), 'Partially available');
+  assert.equal(accountLabel(null, 'x'), 'x');
+  const [line] = routeStripLines(status);
+  assert.equal(line.headline, 'Claude X');
+  assert.ok(line.why.some(w => w.text === 'Current: Team A'), JSON.stringify(line.why));
+  const row = { provider: 'anthropic', target: 'a', override: { account: 'x', state: 'unavailable', reason: 'spent' } };
+  assert.equal(chipFor(row, status).text, 'forced to Claude X · Claude X is spent · serving from Team A');
+  assert.equal(chipFor(row).text, 'forced to x · x is spent · serving from a', 'no status, no labels');
+  assert.match(switchOutcome({ ok: true, account: 'a', eligible: true }, status).text, /recorded: Team A\./);
+  assert.match(overrideOutcome({ ok: true, row: { provider: 'anthropic', override: { account: 'x' } }, applied: true }, status).text, /^Forced to Claude X,/);
 });
 
 test('requests takes part in least-headroom selection and is last in the tie-break', () => {

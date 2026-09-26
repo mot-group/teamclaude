@@ -4530,6 +4530,9 @@ export class AccountManager {
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
       accounts: this.accounts.map(a => ({
+        // The config entry's id: the one handle that tells apart two accounts
+        // sharing a name, which the dashboard's rename needs.
+        id: a.id || null,
         name: a.name,
         label: a.label || null,
         provider: providerOf(a),

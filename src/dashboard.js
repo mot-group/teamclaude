@@ -394,6 +394,20 @@ export function capBadgeText(maxUsage) {
 }
 
 /**
+ * The name the dashboard shows for an account: its display label when the
+ * status row with that config name (and provider, when given) carries one,
+ * else the name itself. Anything that is not an account name passes through.
+ * @param {Record<string, any>|null|undefined} status
+ * @param {string|null|undefined} name
+ * @param {string|null} [provider]
+ */
+export function accountLabel(status, name, provider) {
+  if (!name) return name;
+  var a = ((status || {}).accounts || []).filter(/** @param {Record<string, any>} x */ function (x) { return x.name === name && (provider == null || x.provider === provider); })[0];
+  return (a && a.label) || name;
+}
+
+/**
  * The account one provider's cursor sits on. `currentAccounts` is authoritative
  * whenever the server sends it: a provider missing from the map has no current
  * account, so a Claude-only fleet never shows its Claude account as Codex's.
@@ -540,10 +554,12 @@ export function switchRequest(name, key) {
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
-export function switchOutcome(res) {
+/** @param {any} res @param {Record<string, any>|null} [status]  for display labels */
+export function switchOutcome(res, status) {
   if (!res || !res.ok) return { kind: 'error', text: 'Selection failed' + (res && res.error ? ': ' + res.error : '') };
-  if (res.eligible === false) return { kind: 'warn', text: 'Starting account recorded: ' + res.account + '. Rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
-  return { kind: 'ok', text: 'Starting account recorded: ' + res.account + '. Normal routing still applies.' };
+  var shownAccount = accountLabel(status, res.account);
+  if (res.eligible === false) return { kind: 'warn', text: 'Starting account recorded: ' + shownAccount + '. Rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
+  return { kind: 'ok', text: 'Starting account recorded: ' + shownAccount + '. Normal routing still applies.' };
 }
 
 // One row per route the server reports, each model family the fleet meters
@@ -678,17 +694,19 @@ export function routeStripLines(status) {
     var def = defaults[card.provider] || null;
     var target = def ? def.target : null;
     var current = currentFor(s, card.provider);
+    /** @param {string|null} n */
+    var show = function (n) { return accountLabel(s, n, card.provider); };
     var why = [];
-    if (target && target !== card.headline) why.push({ text: 'Default target: ' + target, warn: false });
+    if (target && target !== card.headline) why.push({ text: 'Default target: ' + show(target), warn: false });
     if (current && current === card.headline) why.push({ text: 'Also the current account', warn: false });
     else if (current) {
       // Like the old default row: any default that is not the current account
       // explains itself, even a null one (nothing can serve); only "outranks"
       // needs an account to name.
       var reason = !def || target === current ? ''
-        : def.currentUnavailable ? ' · current account ' + current + ' is blocked: ' + (/** @type {Record<string, string>} */ (UNAVAILABLE_TEXT)[def.currentUnavailable] || def.currentUnavailable)
-        : target ? ' · ' + target + ' outranks the current account ' + current : '';
-      why.push({ text: 'Current: ' + current + reason, warn: !!reason });
+        : def.currentUnavailable ? ' · current account ' + show(current) + ' is blocked: ' + (/** @type {Record<string, string>} */ (UNAVAILABLE_TEXT)[def.currentUnavailable] || def.currentUnavailable)
+        : target ? ' · ' + show(target) + ' outranks the current account ' + show(current) : '';
+      why.push({ text: 'Current: ' + show(current) + reason, warn: !!reason });
     }
     /** @param {Array<Record<string, any>>} ms */
     var tagOf = function (ms) {
@@ -700,14 +718,14 @@ export function routeStripLines(status) {
     return {
       provider: card.provider, label: providerLabel(card.provider),
       accounts: (s.accounts || []).filter(/** @param {Record<string, any>} a */ function (a) { return a.provider === card.provider; }).length,
-      headline: card.headline,
+      headline: show(card.headline),
       resolved: resolved,
       tag: resolved ? tagOf(models) : null,
       // A summary headline hides which families went where, so each of
       // routingCards' groups gets a sub-line; the tag moves to its group.
       groups: resolved ? [] : card.groups.map(/** @param {Record<string, any>} g */ function (g) {
         return { labels: g.labels.join(', '),
-          target: g.target || (g.blocked ? 'blocked by policy' : 'no eligible account'), missing: !g.target,
+          target: show(g.target) || (g.blocked ? 'blocked by policy' : 'no eligible account'), missing: !g.target,
           tag: tagOf(models.filter(/** @param {Record<string, any>} m */ function (m) { return (m.target || null) === g.target && !!m.blocked === g.blocked; })) };
       }),
       why: why,
@@ -720,14 +738,15 @@ export function routeStripLines(status) {
 // page never re-derives it from quota bars: `unavailable` means traffic is
 // going elsewhere while the force stands, `holding` means requests are being
 // refused on purpose, and those two read very differently to an operator.
-export function chipFor(row) {
+/** @param {any} row @param {Record<string, any>|null} [status]  for display labels */
+export function chipFor(row, status) {
   var r = row || {};
   var o = r.override || null;
   if (!o || !o.account) return null;
-  var x = o.account;
+  var x = accountLabel(status, o.account, r.provider);
   var why = o.reason || 'not available';
   var out;
-  if (o.state === 'unavailable') out = { kind: 'warn', text: 'forced to ' + x + ' · ' + x + ' is ' + why + ' · serving from ' + (r.target || 'nothing') };
+  if (o.state === 'unavailable') out = { kind: 'warn', text: 'forced to ' + x + ' · ' + x + ' is ' + why + ' · serving from ' + (accountLabel(status, r.target, r.provider) || 'nothing') };
   else if (o.state === 'holding') out = { kind: 'bad', text: 'held on ' + x + ' · ' + x + ' is ' + why + ' · requests get 429' };
   else if (o.state === 'no-target') out = { kind: 'bad', text: 'forced to ' + x + ' · nothing can serve right now' };
   else out = { kind: 'accent', text: o.whenSpent === 'hold' ? 'forced · held' : 'forced · falls back when spent' };
@@ -792,12 +811,13 @@ export function overrideRequest(payload, key) {
 // and applying it to the running router separately, and the difference matters:
 // `persisted` without `applied` means the next reload will pick the override up
 // while the live fleet is still routing the old way.
-export function overrideOutcome(res) {
+/** @param {any} res @param {Record<string, any>|null} [status]  for display labels */
+export function overrideOutcome(res, status) {
   var r = res || {};
   if (r.ok) {
     var o = (r.row || {}).override || null;
     var text = o && o.account
-      ? 'Forced to ' + o.account + (o.whenSpent === 'hold' ? ', held on it.' : ', falling back when it is spent.')
+      ? 'Forced to ' + accountLabel(status, o.account, (r.row || {}).provider) + (o.whenSpent === 'hold' ? ', held on it.' : ', falling back when it is spent.')
       : 'Force cleared. Normal routing applies.';
     var warnings = (r.warnings || []).join(' ');
     if (r.applied === false) return { kind: 'warn', row: r.row || null, text: text + ' Saved, but the router did not reload; see the proxy log.' };
@@ -1062,7 +1082,7 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
-  currentFor, gatingUtilization, quotaGate, latestReset,
+  currentFor, accountLabel, gatingUtilization, quotaGate, latestReset,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1444,10 +1464,7 @@ const PAGE = `<!doctype html>
   var SESSION_AUTH = false;
   var KEY = 'teamclaude-dashboard-key';
   // The dashboard name for an account: its label if one is set, else the config name.
-  function shown(name, provider) {
-    var a = ((lastStatus || {}).accounts || []).filter(function (x) { return x.name === name && (provider == null || x.provider === provider); })[0];
-    return (a && a.label) || name;
-  }
+  function shown(name, provider) { return accountLabel(lastStatus, name, provider); }
   var quotaMode = 'spent';
   try { if (localStorage.getItem('teamclaude-quota-display') === 'left') quotaMode = 'left'; } catch {}
   var detailAccount = null;
@@ -1691,14 +1708,14 @@ ${SHARED_HELPERS}
           if (!groups[key].length) td.appendChild(el('span', 'quota-unknown', key === 'shared' ? 'Not reported' : 'No window reported'));
           tr.appendChild(td);
         });
-        var action = el('td'); var btn = el('button', 'act', 'Details →'); btn.setAttribute('aria-label', 'Details for ' + (a.label || a.name)); btn.addEventListener('click', function () { showAccount(a.name); }); action.appendChild(btn); tr.appendChild(action); body.appendChild(tr);
+        var action = el('td'); var btn = el('button', 'act', 'Details →'); btn.setAttribute('aria-label', 'Details for ' + (a.label || a.name)); btn.addEventListener('click', function () { showAccount(a); }); action.appendChild(btn); tr.appendChild(action); body.appendChild(tr);
       });
     });
     scroll.appendChild(table); wrap.appendChild(scroll);
   }
 
   function renderAccountDetails() {
-    var a = ((lastStatus || {}).accounts || []).filter(function (a) { return a.name === detailAccount; })[0];
+    var a = detailRow();
     var wrap = document.getElementById('accountDetails'); wrap.textContent = '';
     var dialog = document.getElementById('accountDialog');
     document.getElementById('accountManual').disabled = !connected || !a;
@@ -1724,9 +1741,16 @@ ${SHARED_HELPERS}
     if (a.pausedUntil || a.rateLimitedUntil) wrap.appendChild(el('p', 'usage', 'Paused until ' + resetDate(a.pausedUntil || a.rateLimitedUntil)));
   }
 
-  function showAccount(name) {
-    detailAccount = name;
-    var a = ((lastStatus || {}).accounts || []).filter(function (x) { return x.name === name; })[0];
+  // The details dialog follows an account by entry id, since two accounts can
+  // share a name. A server that sends no id falls back to name and provider.
+  function detailRow() {
+    var k = detailAccount || {};
+    return ((lastStatus || {}).accounts || []).filter(function (x) { return k.id ? x.id === k.id : x.name === k.name && x.provider === k.provider; })[0];
+  }
+
+  function showAccount(account) {
+    detailAccount = { id: account.id || null, name: account.name, provider: account.provider };
+    var a = detailRow();
     document.getElementById('accountLabel').value = (a && a.label) || '';
     document.getElementById('labelResult').textContent = '';
     renderAccountDetails(); document.getElementById('accountDialog').showModal();
@@ -1734,7 +1758,7 @@ ${SHARED_HELPERS}
 
   var labelPending = false;
   async function saveLabel() {
-    var a = ((lastStatus || {}).accounts || []).filter(function (x) { return x.name === detailAccount; })[0];
+    var a = detailRow();
     if (!a || !connected || labelPending) return;
     labelPending = true; document.getElementById('saveLabel').disabled = true;
     var generation = authGeneration;
@@ -1743,15 +1767,15 @@ ${SHARED_HELPERS}
       var res = await fetch('/teamclaude/accounts/label', {
         method: 'POST',
         headers: { 'x-api-key': SESSION_AUTH ? '' : localStorage.getItem(KEY) || '', 'content-type': 'application/json' },
-        body: JSON.stringify({ account: a.name, provider: a.provider, label: document.getElementById('accountLabel').value.trim() }),
+        body: JSON.stringify({ id: a.id, label: document.getElementById('accountLabel').value.trim() }),
         signal: AbortSignal.timeout(12000),
       });
       if (generation !== authGeneration) return;
       if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
       if (generation !== authGeneration) return;
-      result.className = 'dialog-result ' + (json.ok ? 'ok' : 'error');
-      result.textContent = json.ok ? (json.label ? 'Saved.' : 'Name cleared. Showing the config name.') : 'Not saved: ' + (json.error || 'status ' + res.status);
+      result.className = 'dialog-result ' + (json.ok ? 'ok' : json.persisted ? 'warn' : 'error');
+      result.textContent = json.ok ? (json.label ? 'Saved.' : 'Name cleared. Showing the config name.') : (json.persisted ? 'Saved, but not applied: ' : 'Not saved: ') + (json.error || 'status ' + res.status);
       await poll(true);
     } catch (e) {
       if (generation === authGeneration) { result.className = 'dialog-result error'; result.textContent = 'Could not confirm the change. ' + e.message; }
@@ -1967,12 +1991,12 @@ ${SHARED_HELPERS}
         fam.appendChild(el('div', 'hint', 'Stays forced until you clear it. Sessions pinned with TC_ACCT are not affected.'));
       }
       tr.appendChild(fam);
-      var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
+      var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (shown(r.target, r.provider) || '—'));
       to.setAttribute('data-label', 'Target');
-      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
+      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + shown(r.pinned, r.provider)));
       if (r.pinMismatch) to.appendChild(el('span', 'warnt', ' (not eligible)'));
       if (r.provider) to.appendChild(el('span', 'tag', ' · ' + providerLabel(r.provider)));
-      var chip = chipFor(r);
+      var chip = chipFor(r, lastStatus);
       // The route's first row carries the chip inside its controls; a second
       // sample of the same route keeps it inline so the state still reads.
       if (chip && !first) to.appendChild(el('div', 'chip chip-line ' + (CHIP_CLASS[chip.kind] || ''), chip.text));
@@ -1984,7 +2008,7 @@ ${SHARED_HELPERS}
       else if (!r.eligible.length && !r.ineligible.length) can.textContent = '—';
       else {
         can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length) + (r.ineligible.length ? ' ' : '')));
-        if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.join(', ')));
+        if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.map(function (n) { return shown(n, r.provider); }).join(', ')));
       }
       tr.appendChild(can);
       body.appendChild(tr);
@@ -2082,7 +2106,7 @@ ${SHARED_HELPERS}
         var card = el('div', 'provider-card'); card.setAttribute('data-provider', provider.provider);
         var h = el('h3'); h.appendChild(el('b', '', providerLabel(provider.provider))); h.appendChild(el('span', '', ' · ' + group.labels.join(', ')));
         card.appendChild(h);
-        card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), group.target || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
+        card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), shown(group.target, provider.provider) || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
         var models = el('div', 'provider-models', group.models.join(', ')); models.title = 'Representative models'; card.appendChild(models);
         wrap.appendChild(card);
       });
@@ -2239,7 +2263,7 @@ ${SHARED_HELPERS}
     var tr = el('tr');
     tr.setAttribute('data-provider', row.provider || 'unknown');
     tr.title = 'Seen between ' + resetDate(row.observed[0]) + ' and ' + resetDate(row.observed[1]) + '. Reset time ' + resetDate(row.resetAt[0]) + ' → ' + resetDate(row.resetAt[1]) + '.';
-    [['When', shortDate(row.when), ''], ['Account', row.account, ''], ['Limit', row.window, ''],
+    [['When', shortDate(row.when), ''], ['Account', shown(row.account, row.provider), ''], ['Limit', row.window, ''],
       ['What happened', row.what, row.kind === 'warn' ? 'warnt' : row.kind === 'dim' ? 'dim' : ''],
       ['Spent before → after', row.before + '% → ' + row.after + '%', '']].forEach(function (cell) {
       var td = el('td', cell[2], cell[1]); td.setAttribute('data-label', cell[0]); tr.appendChild(td);
@@ -2305,7 +2329,7 @@ ${SHARED_HELPERS}
       .map(function (k) { return bucketLabel(k) + ' ' + Math.round(fleetTable[k] * 100) + '%'; });
     details('routingInfo', [['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%' + (perBucket.length ? ' · per bucket: ' + perBucket.join(', ') : '')], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
     var overrides = ((s.fableDepletionRouting || {}).models || []);
-    if (overrides.length) { var box = document.getElementById('routingInfo'); box.appendChild(el('p', 'usage', 'Fable depletion overrides')); overrides.forEach(function (r) { box.appendChild(el('p', 'usage', r.model + ' → ' + (r.target || 'None') + ' · ' + r.reason)); }); }
+    if (overrides.length) { var box = document.getElementById('routingInfo'); box.appendChild(el('p', 'usage', 'Fable depletion overrides')); overrides.forEach(function (r) { box.appendChild(el('p', 'usage', r.model + ' → ' + (shown(r.target) || 'None') + ' · ' + r.reason)); }); }
     var table = document.getElementById('jobs'); table.textContent = '';
     var hr = el('tr'); ['Account', 'Quota probe', 'Last checked', 'Warmup', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); }); table.appendChild(hr);
     // Job rows come from the same account list in the same order, but names are
@@ -2390,7 +2414,7 @@ ${SHARED_HELPERS}
     var advice = document.getElementById('forecastAdvice'); advice.replaceChildren();
     if (!(f.recommendations || []).length) advice.appendChild(el('p', '', coverage.adviceReason || 'No supported model alternatives yet.'));
     (f.recommendations || []).forEach(function (r) {
-      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + r.account + ' avoids ' + r.avoidedConstraints.map(function (b) { return forecastWindowLabel(b); }).join(', ') + '.'));
+      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + shown(r.account) + ' avoids ' + r.avoidedConstraints.map(function (b) { return forecastWindowLabel(b); }).join(', ') + '.'));
       advice.appendChild(el('p', 'usage', r.evidence + '. ' + r.gainReason + '. ' + r.tradeoff));
     });
   }
@@ -2436,7 +2460,7 @@ ${SHARED_HELPERS}
     var help = !connected ? 'The proxy is disconnected. Wait for a fresh status before selecting an account.'
       : !a ? 'Choose an account to review it before applying.'
       : a.disabled || a.unavailable || a.status === 'error' ? 'The router may skip this account: ' + (a.disabled ? 'disabled' : UNAVAILABLE_TEXT[a.unavailable] || a.unavailable || 'sign-in needed')
-      : 'Recorded starting account: ' + (currentFor(lastStatus, a.provider) || 'not reported') + '. Model routes and availability can override this choice.';
+      : 'Recorded starting account: ' + (shown(currentFor(lastStatus, a.provider), a.provider) || 'not reported') + '. Model routes and availability can override this choice.';
     if (a && connected) {
       var exhausted = accountQuotaGroups(a).models.filter(function (q) { return q.ratio >= 1; });
       if (exhausted.length) help += ' ' + exhausted.map(function (q) { return q.label; }).join(', ') + ' exhausted. Selecting this account does not restore those limits.';
@@ -2471,7 +2495,7 @@ ${SHARED_HELPERS}
       if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       var json = await res.json();
       if (generation !== authGeneration) return;
-      var out = switchOutcome(json);
+      var out = switchOutcome(json, lastStatus);
       result.className = 'dialog-result ' + out.kind;
       result.textContent = out.text;
       note(out.kind, result.textContent);
@@ -2568,7 +2592,7 @@ ${SHARED_HELPERS}
       if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       var json = await res.json();
       if (generation !== authGeneration) return;
-      var out = overrideOutcome(json);
+      var out = overrideOutcome(json, lastStatus);
       var text = out.text;
       if (out.conflict) {
         forceConflictRow = out.row || null;
@@ -2743,7 +2767,7 @@ ${SHARED_HELPERS}
   document.querySelectorAll('[data-close]').forEach(function (button) { button.addEventListener('click', function () { document.getElementById(button.getAttribute('data-close')).close(); }); });
   document.getElementById('manualSelection').addEventListener('click', function () { showSwitch(); });
   document.getElementById('routingManualSelection').addEventListener('click', function () { showSwitch(); });
-  document.getElementById('accountManual').addEventListener('click', function () { document.getElementById('accountDialog').close(); showSwitch(detailAccount); });
+  document.getElementById('accountManual').addEventListener('click', function () { var a = detailRow(); document.getElementById('accountDialog').close(); showSwitch(a && a.name); });
   document.getElementById('switchAccount').addEventListener('change', updateSwitchHelp);
   document.getElementById('saveLabel').addEventListener('click', saveLabel);
   document.getElementById('accountLabel').addEventListener('keydown', function (e) { if (e.key === 'Enter') saveLabel(); });
