@@ -699,6 +699,21 @@ async function serverCommand() {
   // reachable on the background-service deployment the dashboard serves, and
   // the queue is the same one either way.
   hooks.saveOverride = saveOverride;
+  // The dashboard's rename. Written by entry id, never by name: `name` is what
+  // routes and name-matched pairing key on, so only the display label changes.
+  hooks.saveLabel = (/** @type {{ id: string, label: string }} */ { id, label }) => queued(async () => {
+    if (!accountManager.accounts.some(a => a.id === id)) throw fail('no-such-account', `no account with id "${id}"`);
+    await atomicConfigUpdate(async diskConfig => {
+      const row = (diskConfig.accounts || []).find((/** @type {any} */ a) => a?.id === id);
+      if (!row) throw fail('no-such-account', `no config entry with id "${id}"`);
+      if (label) row.label = label; else delete row.label;
+    });
+    try {
+      await reloadAccounts();
+    } catch (err) {
+      throw fail('reload-failed', /** @type {Error} */ (err).message);
+    }
+  });
   hooks.getStatusExtra = () => ({
     forecast: hooks.getForecast(),
     // Read live from the shared config (not a startup snapshot) so the TUI's

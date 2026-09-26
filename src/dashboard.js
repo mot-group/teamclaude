@@ -394,6 +394,20 @@ export function capBadgeText(maxUsage) {
 }
 
 /**
+ * The name the dashboard shows for an account: its display label when the
+ * status row with that config name (and provider, when given) carries one,
+ * else the name itself. Anything that is not an account name passes through.
+ * @param {Record<string, any>|null|undefined} status
+ * @param {string|null|undefined} name
+ * @param {string|null} [provider]
+ */
+export function accountLabel(status, name, provider) {
+  if (!name) return name;
+  var a = ((status || {}).accounts || []).filter(/** @param {Record<string, any>} x */ function (x) { return x.name === name && (provider == null || x.provider === provider); })[0];
+  return (a && a.label) || name;
+}
+
+/**
  * The account one provider's cursor sits on. `currentAccounts` is authoritative
  * whenever the server sends it: a provider missing from the map has no current
  * account, so a Claude-only fleet never shows its Claude account as Codex's.
@@ -540,10 +554,12 @@ export function switchRequest(name, key) {
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
-export function switchOutcome(res) {
+/** @param {any} res @param {Record<string, any>|null} [status]  for display labels */
+export function switchOutcome(res, status) {
   if (!res || !res.ok) return { kind: 'error', text: 'Selection failed' + (res && res.error ? ': ' + res.error : '') };
-  if (res.eligible === false) return { kind: 'warn', text: 'Starting account recorded: ' + res.account + '. Rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
-  return { kind: 'ok', text: 'Starting account recorded: ' + res.account + '. Normal routing still applies.' };
+  var shownAccount = accountLabel(status, res.account);
+  if (res.eligible === false) return { kind: 'warn', text: 'Starting account recorded: ' + shownAccount + '. Rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
+  return { kind: 'ok', text: 'Starting account recorded: ' + shownAccount + '. Normal routing still applies.' };
 }
 
 // One row per route the server reports, each model family the fleet meters
@@ -678,17 +694,19 @@ export function routeStripLines(status) {
     var def = defaults[card.provider] || null;
     var target = def ? def.target : null;
     var current = currentFor(s, card.provider);
+    /** @param {string|null} n */
+    var show = function (n) { return accountLabel(s, n, card.provider); };
     var why = [];
-    if (target && target !== card.headline) why.push({ text: 'Default target: ' + target, warn: false });
+    if (target && target !== card.headline) why.push({ text: 'Default target: ' + show(target), warn: false });
     if (current && current === card.headline) why.push({ text: 'Also the current account', warn: false });
     else if (current) {
       // Like the old default row: any default that is not the current account
       // explains itself, even a null one (nothing can serve); only "outranks"
       // needs an account to name.
       var reason = !def || target === current ? ''
-        : def.currentUnavailable ? ' · current account ' + current + ' is blocked: ' + (/** @type {Record<string, string>} */ (UNAVAILABLE_TEXT)[def.currentUnavailable] || def.currentUnavailable)
-        : target ? ' · ' + target + ' outranks the current account ' + current : '';
-      why.push({ text: 'Current: ' + current + reason, warn: !!reason });
+        : def.currentUnavailable ? ' · current account ' + show(current) + ' is blocked: ' + (/** @type {Record<string, string>} */ (UNAVAILABLE_TEXT)[def.currentUnavailable] || def.currentUnavailable)
+        : target ? ' · ' + show(target) + ' outranks the current account ' + show(current) : '';
+      why.push({ text: 'Current: ' + show(current) + reason, warn: !!reason });
     }
     /** @param {Array<Record<string, any>>} ms */
     var tagOf = function (ms) {
@@ -700,14 +718,14 @@ export function routeStripLines(status) {
     return {
       provider: card.provider, label: providerLabel(card.provider),
       accounts: (s.accounts || []).filter(/** @param {Record<string, any>} a */ function (a) { return a.provider === card.provider; }).length,
-      headline: card.headline,
+      headline: show(card.headline),
       resolved: resolved,
       tag: resolved ? tagOf(models) : null,
       // A summary headline hides which families went where, so each of
       // routingCards' groups gets a sub-line; the tag moves to its group.
       groups: resolved ? [] : card.groups.map(/** @param {Record<string, any>} g */ function (g) {
         return { labels: g.labels.join(', '),
-          target: g.target || (g.blocked ? 'blocked by policy' : 'no eligible account'), missing: !g.target,
+          target: show(g.target) || (g.blocked ? 'blocked by policy' : 'no eligible account'), missing: !g.target,
           tag: tagOf(models.filter(/** @param {Record<string, any>} m */ function (m) { return (m.target || null) === g.target && !!m.blocked === g.blocked; })) };
       }),
       why: why,
@@ -720,14 +738,15 @@ export function routeStripLines(status) {
 // page never re-derives it from quota bars: `unavailable` means traffic is
 // going elsewhere while the force stands, `holding` means requests are being
 // refused on purpose, and those two read very differently to an operator.
-export function chipFor(row) {
+/** @param {any} row @param {Record<string, any>|null} [status]  for display labels */
+export function chipFor(row, status) {
   var r = row || {};
   var o = r.override || null;
   if (!o || !o.account) return null;
-  var x = o.account;
+  var x = accountLabel(status, o.account, r.provider);
   var why = o.reason || 'not available';
   var out;
-  if (o.state === 'unavailable') out = { kind: 'warn', text: 'forced to ' + x + ' · ' + x + ' is ' + why + ' · serving from ' + (r.target || 'nothing') };
+  if (o.state === 'unavailable') out = { kind: 'warn', text: 'forced to ' + x + ' · ' + x + ' is ' + why + ' · serving from ' + (accountLabel(status, r.target, r.provider) || 'nothing') };
   else if (o.state === 'holding') out = { kind: 'bad', text: 'held on ' + x + ' · ' + x + ' is ' + why + ' · requests get 429' };
   else if (o.state === 'no-target') out = { kind: 'bad', text: 'forced to ' + x + ' · nothing can serve right now' };
   else out = { kind: 'accent', text: o.whenSpent === 'hold' ? 'forced · held' : 'forced · falls back when spent' };
@@ -792,12 +811,13 @@ export function overrideRequest(payload, key) {
 // and applying it to the running router separately, and the difference matters:
 // `persisted` without `applied` means the next reload will pick the override up
 // while the live fleet is still routing the old way.
-export function overrideOutcome(res) {
+/** @param {any} res @param {Record<string, any>|null} [status]  for display labels */
+export function overrideOutcome(res, status) {
   var r = res || {};
   if (r.ok) {
     var o = (r.row || {}).override || null;
     var text = o && o.account
-      ? 'Forced to ' + o.account + (o.whenSpent === 'hold' ? ', held on it.' : ', falling back when it is spent.')
+      ? 'Forced to ' + accountLabel(status, o.account, (r.row || {}).provider) + (o.whenSpent === 'hold' ? ', held on it.' : ', falling back when it is spent.')
       : 'Force cleared. Normal routing applies.';
     var warnings = (r.warnings || []).join(' ');
     if (r.applied === false) return { kind: 'warn', row: r.row || null, text: text + ' Saved, but the router did not reload; see the proxy log.' };
@@ -891,7 +911,7 @@ export function problems(status) {
     var why = ATTENTION[a.unavailable];
     // provider and account let the banner tint the line and lead with the
     // provider word (FR 1); the text itself stays provider-neutral.
-    if (why) out.push({ severity: 'warn', kind: 'account', provider: a.provider || null, account: a.name, text: 'Account ' + a.name + ' ' + why + '.' });
+    if (why) out.push({ severity: 'warn', kind: 'account', provider: a.provider || null, account: a.name, text: 'Account ' + (a.label || a.name) + ' ' + why + '.' });
   });
 
   // Deliberately no spend line. `usedMinor` is month-to-date overage, so on a
@@ -1062,7 +1082,7 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
-  currentFor, gatingUtilization, quotaGate, latestReset,
+  currentFor, accountLabel, gatingUtilization, quotaGate, latestReset,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1376,6 +1396,7 @@ const PAGE = `<!doctype html>
   #routes tr[data-provider="codex"] td:first-child { border-left-color:var(--codex); }
   .dialog-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:23px; }
   .dialog-result { font-size:13px; padding:13px 0; }
+  .rename { display:flex; gap:8px; } .rename input { flex:1; min-width:0; }
   #accountDetails .quota { margin:18px 0; }
   #accountDetails .quota-reset { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   #accountDetails .quota .lbl { font-size:13px; }
@@ -1434,7 +1455,7 @@ const PAGE = `<!doctype html>
     <footer id="foot"></footer>
   </main>
 </div>
-<dialog id="accountDialog" aria-labelledby="accountDialogTitle"><div class="dialog-head"><h2 id="accountDialogTitle">Account details</h2><button data-close="accountDialog" aria-label="Close account details">×</button></div><div id="accountDetails"></div><div class="dialog-actions"><button data-close="accountDialog">Close</button><button id="accountManual">Manual selection</button></div></dialog>
+<dialog id="accountDialog" aria-labelledby="accountDialogTitle"><div class="dialog-head"><h2 id="accountDialogTitle">Account details</h2><button data-close="accountDialog" aria-label="Close account details">×</button></div><div id="accountDetails"></div><label for="accountLabel">Display name</label><div class="rename"><input id="accountLabel" maxlength="64" placeholder="Leave empty to show the config name"><button id="saveLabel">Save name</button></div><p class="dialog-help">Changes only what this dashboard shows. The config name stays the key for routes, logs and the TUI.</p><div id="labelResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="accountDialog">Close</button><button id="accountManual">Manual selection</button></div></dialog>
 <dialog id="switchDialog" aria-labelledby="switchTitle"><div class="dialog-head"><div><div class="eyebrow">Routing control</div><h2 id="switchTitle">Select starting account</h2></div><button data-close="switchDialog" aria-label="Close manual selection">×</button></div><p class="dialog-help">Rotation continues from the selected account. Eligibility and model routes can select another account immediately.</p><label for="switchAccount">Account</label><select id="switchAccount"></select><div class="explain"><strong>What changes</strong><ul><li>The router records this starting account for rotation.</li><li>It does not pin a model or change account priority.</li><li>Existing sessions, model routes, and request pins still apply.</li></ul></div><p id="switchHelp" class="dialog-help"></p><div id="switchResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="switchDialog">Close</button><button id="applySwitch" class="primary" disabled>Set starting account</button></div></dialog>
 <dialog id="forceDialog" aria-labelledby="forceTitle"><div class="dialog-head"><div><div class="eyebrow">Routing control</div><h2 id="forceTitle">Force a route to one account</h2></div><button data-close="forceDialog" aria-label="Close force route">×</button></div><p class="dialog-help" id="forceRouteHelp"></p><label for="forceAccount">Account</label><select id="forceAccount"></select><fieldset class="force-modes"><legend>When it runs out of usage</legend><label for="forceFallback"><input type="radio" name="forceWhenSpent" id="forceFallback" value="fallback" checked>Fall back to automatic routing</label><p class="dialog-help">The other members of this route serve it until the forced account is eligible again.</p><label for="forceHold"><input type="radio" name="forceWhenSpent" id="forceHold" value="hold">Hold on it</label><p class="dialog-help">No other member serves this route. Requests get a 429 with a retry-after until the forced account is eligible again.</p></fieldset><div class="explain"><strong>What changes</strong><ul><li>Every request matching this route goes to the selected account.</li><li>It stays forced until you clear it. There is no timer.</li><li>Sessions pinned with TC_ACCT bypass routes and are not affected.</li></ul></div><p id="forceHelp" class="dialog-help"></p><div id="forceResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="forceDialog">Cancel</button><button id="forceUseCurrent" hidden>Use current</button><button id="applyForce" class="primary" disabled>Apply</button></div></dialog>
 <script>
@@ -1442,6 +1463,8 @@ const PAGE = `<!doctype html>
   'use strict';
   var SESSION_AUTH = false;
   var KEY = 'teamclaude-dashboard-key';
+  // The dashboard name for an account: its label if one is set, else the config name.
+  function shown(name, provider) { return accountLabel(lastStatus, name, provider); }
   var quotaMode = 'spent';
   try { if (localStorage.getItem('teamclaude-quota-display') === 'left') quotaMode = 'left'; } catch {}
   var detailAccount = null;
@@ -1650,7 +1673,7 @@ ${SHARED_HELPERS}
     var wrap = document.getElementById('accounts'); wrap.textContent = '';
     var query = document.getElementById('accountSearch').value.toLowerCase();
     var accounts = s.accounts || [];
-    var visible = accounts.filter(function (a) { return (a.name + ' ' + a.type + ' ' + providerLabel(a.provider)).toLowerCase().indexOf(query) !== -1; });
+    var visible = accounts.filter(function (a) { return (a.name + ' ' + (a.label || '') + ' ' + a.type + ' ' + providerLabel(a.provider)).toLowerCase().indexOf(query) !== -1; });
     document.getElementById('accountCount').textContent = visible.length + (query ? ' of ' + accounts.length : '') + ' accounts';
     document.getElementById('quotaSpent').setAttribute('aria-pressed', String(quotaMode === 'spent'));
     document.getElementById('quotaLeft').setAttribute('aria-pressed', String(quotaMode === 'left'));
@@ -1672,7 +1695,7 @@ ${SHARED_HELPERS}
       members.forEach(function (a) {
         var tr = el('tr', 'account-row'); tr.setAttribute('data-provider', a.provider || 'unknown');
         var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
-        var identity = el('td'); identity.appendChild(el('span', 'account-name', a.name)); identity.appendChild(accountBadgeRow(a, s));
+        var identity = el('td'); identity.appendChild(el('span', 'account-name', a.label || a.name)); identity.appendChild(accountBadgeRow(a, s));
         identity.appendChild(bindingLine(binding));
         identity.appendChild(el('div', 'account-meta', a.type === 'oauth' ? 'Subscription' : a.type === 'api_key' ? 'API account' : a.type));
         var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0];
@@ -1685,25 +1708,27 @@ ${SHARED_HELPERS}
           if (!groups[key].length) td.appendChild(el('span', 'quota-unknown', key === 'shared' ? 'Not reported' : 'No window reported'));
           tr.appendChild(td);
         });
-        var action = el('td'); var btn = el('button', 'act', 'Details →'); btn.setAttribute('aria-label', 'Details for ' + a.name); btn.addEventListener('click', function () { showAccount(a.name); }); action.appendChild(btn); tr.appendChild(action); body.appendChild(tr);
+        var action = el('td'); var btn = el('button', 'act', 'Details →'); btn.setAttribute('aria-label', 'Details for ' + (a.label || a.name)); btn.addEventListener('click', function () { showAccount(a); }); action.appendChild(btn); tr.appendChild(action); body.appendChild(tr);
       });
     });
     scroll.appendChild(table); wrap.appendChild(scroll);
   }
 
   function renderAccountDetails() {
-    var a = ((lastStatus || {}).accounts || []).filter(function (a) { return a.name === detailAccount; })[0];
+    var a = detailRow();
     var wrap = document.getElementById('accountDetails'); wrap.textContent = '';
     var dialog = document.getElementById('accountDialog');
     document.getElementById('accountManual').disabled = !connected || !a;
-    if (!a) { dialog.removeAttribute('data-provider'); wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
+    if (!a) { dialog.removeAttribute('data-provider'); document.getElementById('saveLabel').disabled = true; wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
     dialog.setAttribute('data-provider', a.provider || 'unknown');
-    document.getElementById('accountDialogTitle').textContent = a.name;
+    document.getElementById('accountDialogTitle').textContent = a.label || a.name;
+    document.getElementById('saveLabel').disabled = !connected || labelPending;
     var s = lastStatus || {};
     wrap.appendChild(accountBadgeRow(a, s));
     if (!connected) { var warning = el('p', 'warnt', 'Connection lost. These quota values may be stale.'); warning.setAttribute('role', 'status'); wrap.appendChild(warning); }
     var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
     wrap.appendChild(bindingLine(binding));
+    if (a.label) wrap.appendChild(el('p', 'usage', 'Config name: ' + a.name));
     wrap.appendChild(el('p', 'usage', providerLabel(a.provider) + ' · ' + a.type + ' · Priority ' + (a.priority || 0)));
     var groups = accountQuotaGroups(a);
     groups.shared.concat(groups.session, groups.models).forEach(function (q) { wrap.appendChild(quotaRow(q, a, s, !!binding && binding.label === q.label)); });
@@ -1716,8 +1741,45 @@ ${SHARED_HELPERS}
     if (a.pausedUntil || a.rateLimitedUntil) wrap.appendChild(el('p', 'usage', 'Paused until ' + resetDate(a.pausedUntil || a.rateLimitedUntil)));
   }
 
-  function showAccount(name) {
-    detailAccount = name; renderAccountDetails(); document.getElementById('accountDialog').showModal();
+  // The details dialog follows an account by entry id, since two accounts can
+  // share a name. A server that sends no id falls back to name and provider.
+  function detailRow() {
+    var k = detailAccount || {};
+    return ((lastStatus || {}).accounts || []).filter(function (x) { return k.id ? x.id === k.id : x.name === k.name && x.provider === k.provider; })[0];
+  }
+
+  function showAccount(account) {
+    detailAccount = { id: account.id || null, name: account.name, provider: account.provider };
+    var a = detailRow();
+    document.getElementById('accountLabel').value = (a && a.label) || '';
+    document.getElementById('labelResult').textContent = '';
+    renderAccountDetails(); document.getElementById('accountDialog').showModal();
+  }
+
+  var labelPending = false;
+  async function saveLabel() {
+    var a = detailRow();
+    if (!a || !connected || labelPending) return;
+    labelPending = true; document.getElementById('saveLabel').disabled = true;
+    var generation = authGeneration;
+    var result = document.getElementById('labelResult'); result.className = 'dialog-result'; result.textContent = 'Saving...';
+    try {
+      var res = await fetch('/teamclaude/accounts/label', {
+        method: 'POST',
+        headers: { 'x-api-key': SESSION_AUTH ? '' : localStorage.getItem(KEY) || '', 'content-type': 'application/json' },
+        body: JSON.stringify({ id: a.id, label: document.getElementById('accountLabel').value.trim() }),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      if (generation !== authGeneration) return;
+      result.className = 'dialog-result ' + (json.ok ? 'ok' : json.persisted ? 'warn' : 'error');
+      result.textContent = json.ok ? (json.label ? 'Saved.' : 'Name cleared. Showing the config name.') : (json.persisted ? 'Saved, but not applied: ' : 'Not saved: ') + (json.error || 'status ' + res.status);
+      await poll(true);
+    } catch (e) {
+      if (generation === authGeneration) { result.className = 'dialog-result error'; result.textContent = 'Could not confirm the change. ' + e.message; }
+    } finally { labelPending = false; document.getElementById('saveLabel').disabled = !connected; }
   }
 
   function emptyTable(id, text) {
@@ -1929,12 +1991,12 @@ ${SHARED_HELPERS}
         fam.appendChild(el('div', 'hint', 'Stays forced until you clear it. Sessions pinned with TC_ACCT are not affected.'));
       }
       tr.appendChild(fam);
-      var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
+      var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (shown(r.target, r.provider) || '—'));
       to.setAttribute('data-label', 'Target');
-      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
+      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + shown(r.pinned, r.provider)));
       if (r.pinMismatch) to.appendChild(el('span', 'warnt', ' (not eligible)'));
       if (r.provider) to.appendChild(el('span', 'tag', ' · ' + providerLabel(r.provider)));
-      var chip = chipFor(r);
+      var chip = chipFor(r, lastStatus);
       // The route's first row carries the chip inside its controls; a second
       // sample of the same route keeps it inline so the state still reads.
       if (chip && !first) to.appendChild(el('div', 'chip chip-line ' + (CHIP_CLASS[chip.kind] || ''), chip.text));
@@ -1946,7 +2008,7 @@ ${SHARED_HELPERS}
       else if (!r.eligible.length && !r.ineligible.length) can.textContent = '—';
       else {
         can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length) + (r.ineligible.length ? ' ' : '')));
-        if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.join(', ')));
+        if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.map(function (n) { return shown(n, r.provider); }).join(', ')));
       }
       tr.appendChild(can);
       body.appendChild(tr);
@@ -2044,7 +2106,7 @@ ${SHARED_HELPERS}
         var card = el('div', 'provider-card'); card.setAttribute('data-provider', provider.provider);
         var h = el('h3'); h.appendChild(el('b', '', providerLabel(provider.provider))); h.appendChild(el('span', '', ' · ' + group.labels.join(', ')));
         card.appendChild(h);
-        card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), group.target || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
+        card.appendChild(el('div', 'provider-target' + (group.target ? '' : ' warnt'), shown(group.target, provider.provider) || (group.blocked ? 'Blocked by policy' : 'No eligible account')));
         var models = el('div', 'provider-models', group.models.join(', ')); models.title = 'Representative models'; card.appendChild(models);
         wrap.appendChild(card);
       });
@@ -2163,7 +2225,7 @@ ${SHARED_HELPERS}
     var card = el('div', 'card');
     card.setAttribute('data-provider', account.provider || 'unknown');
     var head = el('div', 'card-head');
-    head.appendChild(el('h3', '', account.name));
+    head.appendChild(el('h3', '', shown(account.name, account.provider)));
     head.appendChild(el('span', 'badge provider ' + (account.provider || 'unknown'), providerLabel(account.provider)));
     card.appendChild(head);
     card.appendChild(totalsLine(account.totals || {}));
@@ -2201,7 +2263,7 @@ ${SHARED_HELPERS}
     var tr = el('tr');
     tr.setAttribute('data-provider', row.provider || 'unknown');
     tr.title = 'Seen between ' + resetDate(row.observed[0]) + ' and ' + resetDate(row.observed[1]) + '. Reset time ' + resetDate(row.resetAt[0]) + ' → ' + resetDate(row.resetAt[1]) + '.';
-    [['When', shortDate(row.when), ''], ['Account', row.account, ''], ['Limit', row.window, ''],
+    [['When', shortDate(row.when), ''], ['Account', shown(row.account, row.provider), ''], ['Limit', row.window, ''],
       ['What happened', row.what, row.kind === 'warn' ? 'warnt' : row.kind === 'dim' ? 'dim' : ''],
       ['Spent before → after', row.before + '% → ' + row.after + '%', '']].forEach(function (cell) {
       var td = el('td', cell[2], cell[1]); td.setAttribute('data-label', cell[0]); tr.appendChild(td);
@@ -2267,7 +2329,7 @@ ${SHARED_HELPERS}
       .map(function (k) { return bucketLabel(k) + ' ' + Math.round(fleetTable[k] * 100) + '%'; });
     details('routingInfo', [['Switch threshold', s.switchThreshold == null ? null : Math.round(s.switchThreshold * 100) + '%' + (perBucket.length ? ' · per bucket: ' + perBucket.join(', ') : '')], ['Session distribution', (s.sessions || {}).mode || 'off'], ['Blocked models', (s.blockedModels || []).join(', ') || 'None'], ['Quota probes', s.probe && s.probe.enabled ? 'Every ' + fmtIn(s.probe.intervalSeconds) : 'Off'], ['Warmup', s.warm && s.warm.enabled ? s.warm.mode || 'On' : 'Off']]);
     var overrides = ((s.fableDepletionRouting || {}).models || []);
-    if (overrides.length) { var box = document.getElementById('routingInfo'); box.appendChild(el('p', 'usage', 'Fable depletion overrides')); overrides.forEach(function (r) { box.appendChild(el('p', 'usage', r.model + ' → ' + (r.target || 'None') + ' · ' + r.reason)); }); }
+    if (overrides.length) { var box = document.getElementById('routingInfo'); box.appendChild(el('p', 'usage', 'Fable depletion overrides')); overrides.forEach(function (r) { box.appendChild(el('p', 'usage', r.model + ' → ' + (shown(r.target) || 'None') + ' · ' + r.reason)); }); }
     var table = document.getElementById('jobs'); table.textContent = '';
     var hr = el('tr'); ['Account', 'Quota probe', 'Last checked', 'Warmup', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); }); table.appendChild(hr);
     // Job rows come from the same account list in the same order, but names are
@@ -2281,7 +2343,7 @@ ${SHARED_HELPERS}
       var probe = jobFor((s.probe || {}).accounts || [], a, i);
       var warm = jobFor((s.warm || {}).accounts || [], a, i);
       var row = el('tr'); row.setAttribute('data-provider', a.provider || 'unknown');
-      var name = el('td', '', a.name); var tag = el('span', 'tag', ' · '); tag.appendChild(el('span', 'pv', providerLabel(a.provider))); name.appendChild(tag); row.appendChild(name);
+      var name = el('td', '', a.label || a.name); var tag = el('span', 'tag', ' · '); tag.appendChild(el('span', 'pv', providerLabel(a.provider))); name.appendChild(tag); row.appendChild(name);
       var error = probe.error || warm.error;
       [[probe.status || 'Unknown', probe.error ? 'badt' : ''], [probe.lastProbedAt ? fmtAgo(probe.lastProbedAt) : 'Never', ''], [warm.status || 'Unknown', warm.error ? 'badt' : ''],
         [error || (probe.durationMs == null ? 'No measurement' : probe.durationMs + ' ms'), error ? 'badt' : probe.durationMs == null ? '' : 'mono']].forEach(function (c) { row.appendChild(el('td', c[1], c[0])); });
@@ -2319,7 +2381,7 @@ ${SHARED_HELPERS}
     var root = document.getElementById('forecastAccounts'); root.replaceChildren();
     (f.accounts || []).forEach(function (a) {
       var card = el('section', 'card'); card.setAttribute('data-provider', a.provider || 'unknown');
-      var head = el('div', 'card-head'); head.appendChild(el('h3', '', a.name));
+      var head = el('div', 'card-head'); head.appendChild(el('h3', '', shown(a.name, a.provider)));
       head.appendChild(el('span', 'badge provider ' + (a.provider || 'unknown'), providerLabel(a.provider))); card.appendChild(head);
       if (a.disabled) card.appendChild(el('p', 'usage', 'Disabled. Excluded from usable capacity.'));
       if (!a.windows.length) card.appendChild(el('p', 'usage', 'No fresh provider windows recorded yet.'));
@@ -2348,11 +2410,11 @@ ${SHARED_HELPERS}
       (a.models || []).forEach(function (m) { card.appendChild(el('p', 'usage', m.model + ': ' + (m.eligible ? 'Reported constraints permit this model; existing session restrictions still apply' : m.reason))); });
       root.appendChild(card);
     });
-    (coverage.exclusions || []).forEach(function (a) { root.appendChild(el('p', 'usage', a.name + ': ' + a.reason)); });
+    (coverage.exclusions || []).forEach(function (a) { root.appendChild(el('p', 'usage', shown(a.name, a.provider) + ': ' + a.reason)); });
     var advice = document.getElementById('forecastAdvice'); advice.replaceChildren();
     if (!(f.recommendations || []).length) advice.appendChild(el('p', '', coverage.adviceReason || 'No supported model alternatives yet.'));
     (f.recommendations || []).forEach(function (r) {
-      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + r.account + ' avoids ' + r.avoidedConstraints.map(function (b) { return forecastWindowLabel(b); }).join(', ') + '.'));
+      advice.appendChild(el('p', '', r.from + ' to ' + r.to + ' on ' + shown(r.account) + ' avoids ' + r.avoidedConstraints.map(function (b) { return forecastWindowLabel(b); }).join(', ') + '.'));
       advice.appendChild(el('p', 'usage', r.evidence + '. ' + r.gainReason + '. ' + r.tradeoff));
     });
   }
@@ -2398,7 +2460,7 @@ ${SHARED_HELPERS}
     var help = !connected ? 'The proxy is disconnected. Wait for a fresh status before selecting an account.'
       : !a ? 'Choose an account to review it before applying.'
       : a.disabled || a.unavailable || a.status === 'error' ? 'The router may skip this account: ' + (a.disabled ? 'disabled' : UNAVAILABLE_TEXT[a.unavailable] || a.unavailable || 'sign-in needed')
-      : 'Recorded starting account: ' + (currentFor(lastStatus, a.provider) || 'not reported') + '. Model routes and availability can override this choice.';
+      : 'Recorded starting account: ' + (shown(currentFor(lastStatus, a.provider), a.provider) || 'not reported') + '. Model routes and availability can override this choice.';
     if (a && connected) {
       var exhausted = accountQuotaGroups(a).models.filter(function (q) { return q.ratio >= 1; });
       if (exhausted.length) help += ' ' + exhausted.map(function (q) { return q.label; }).join(', ') + ' exhausted. Selecting this account does not restore those limits.';
@@ -2413,7 +2475,7 @@ ${SHARED_HELPERS}
     var select = document.getElementById('switchAccount'); select.textContent = '';
     var placeholder = el('option', '', 'Choose an account'); placeholder.value = ''; select.appendChild(placeholder);
     ((lastStatus || {}).accounts || []).forEach(function (a) {
-      var option = el('option', '', providerLabel(a.provider) + ' · ' + a.name + skipSuffix(a)); option.value = a.name;
+      var option = el('option', '', providerLabel(a.provider) + ' · ' + (a.label || a.name) + skipSuffix(a)); option.value = a.name;
       option.setAttribute('data-provider', a.provider || ''); select.appendChild(option);
     });
     select.value = name || ''; document.getElementById('switchResult').textContent = '';
@@ -2433,7 +2495,7 @@ ${SHARED_HELPERS}
       if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       var json = await res.json();
       if (generation !== authGeneration) return;
-      var out = switchOutcome(json);
+      var out = switchOutcome(json, lastStatus);
       result.className = 'dialog-result ' + out.kind;
       result.textContent = out.text;
       note(out.kind, result.textContent);
@@ -2457,7 +2519,7 @@ ${SHARED_HELPERS}
     var q = a.quota || {};
     var used = quotaDisplay(q.unified7d, 'spent');
     var reset = parseTs(q.unified7dReset);
-    var option = el('option', '', providerLabel(a.provider) + ' · ' + name + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
+    var option = el('option', '', providerLabel(a.provider) + ' · ' + (a.label || name) + ' · weekly ' + (used == null ? 'not reported' : used + '% spent') + ' · '
       + (isNaN(reset) ? 'reset time not reported'
         : reset > Date.now() ? 'resets in ' + fmtIn((reset - Date.now()) / 1000) : 'reset time passed') + skipSuffix(a));
     option.value = name;
@@ -2530,7 +2592,7 @@ ${SHARED_HELPERS}
       if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       var json = await res.json();
       if (generation !== authGeneration) return;
-      var out = overrideOutcome(json);
+      var out = overrideOutcome(json, lastStatus);
       var text = out.text;
       if (out.conflict) {
         forceConflictRow = out.row || null;
@@ -2705,8 +2767,10 @@ ${SHARED_HELPERS}
   document.querySelectorAll('[data-close]').forEach(function (button) { button.addEventListener('click', function () { document.getElementById(button.getAttribute('data-close')).close(); }); });
   document.getElementById('manualSelection').addEventListener('click', function () { showSwitch(); });
   document.getElementById('routingManualSelection').addEventListener('click', function () { showSwitch(); });
-  document.getElementById('accountManual').addEventListener('click', function () { document.getElementById('accountDialog').close(); showSwitch(detailAccount); });
+  document.getElementById('accountManual').addEventListener('click', function () { var a = detailRow(); document.getElementById('accountDialog').close(); showSwitch(a && a.name); });
   document.getElementById('switchAccount').addEventListener('change', updateSwitchHelp);
+  document.getElementById('saveLabel').addEventListener('click', saveLabel);
+  document.getElementById('accountLabel').addEventListener('keydown', function (e) { if (e.key === 'Enter') saveLabel(); });
   document.getElementById('applySwitch').addEventListener('click', doSwitch);
   document.getElementById('forceAccount').addEventListener('change', updateForceHelp);
   document.getElementById('applyForce').addEventListener('click', applyForce);

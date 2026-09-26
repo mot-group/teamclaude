@@ -217,6 +217,9 @@ function makeAccount(acct, index) {
     // entries and is therefore a different shape — see account-pairing.js.
     id: acct.id || null,
     name: acct.name,
+    // Display-only name the dashboard shows in place of `name`. `name` stays
+    // the identity key (routes, pins and name-matched pairing all read it).
+    label: acct.label || null,
     type: acct.type,
     // Which backend this account talks to. Absent means Anthropic, so configs
     // written before providers existed keep working untouched.
@@ -4527,7 +4530,11 @@ export class AccountManager {
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
       accounts: this.accounts.map(a => ({
+        // The config entry's id: the one handle that tells apart two accounts
+        // sharing a name, which the dashboard's rename needs.
+        id: a.id || null,
         name: a.name,
+        label: a.label || null,
         provider: providerOf(a),
         type: a.type,
         orgName: a.orgName || null,
