@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AccountManager } from '../src/account-manager.js';
+import { createControlQueue } from '../src/control-queue.js';
 import { createToolSet } from '../src/mcp-tools.js';
 
 // The write tools drive a real AccountManager against a throwaway config file,
@@ -32,8 +33,13 @@ async function fixture({ mode = 'full', hooks = {}, fleet = accounts, options = 
   await writeFile(configPath, JSON.stringify(config));
   const am = new AccountManager(fleet(), 0.98);
   const calls = [];
+  // The settings tools reach the reload through applyChange, which the server
+  // builds from the same queue; this one is built over whatever `reload` the
+  // test supplies.
+  const queue = createControlQueue(() => spies.reload());
   const spies = {
     reload: async () => { calls.push('reload'); },
+    applyChange: queue.applyChange,
     persistAccounts: async () => { calls.push('persist'); },
     probeQuota: async () => { calls.push('probe'); },
     ...hooks,
@@ -276,6 +282,12 @@ test('a setting that was written but failed to reload says both', async () => {
   assert.match(text, /reload failed/);
   assert.doesNotMatch(text, /etc\/private/);
   assert.equal((await disk()).quotaProbeSeconds, 120);
+});
+
+test('a settings tool on a server without applyChange refuses and writes nothing', async () => {
+  const { tools, disk } = await fixture({ hooks: { applyChange: undefined } });
+  assert.match(await refused(tools, 'set_threshold', { percent: 70 }), /cannot apply a settings change/);
+  assert.equal((await disk()).switchThreshold, 0.98);
 });
 
 test('a tool that blows up reports a generic failure, never the exception', async () => {

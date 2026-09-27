@@ -195,6 +195,87 @@ export function setBucketThresholds(config, pairs) {
   config.switchThreshold = overrides.length ? table : table.default;
 }
 
+// The per-account fields that hold a percentage per bucket: the account's own
+// switch threshold, and its hard usage cap.
+const ACCOUNT_BUCKET_FIELDS = ['switchThreshold', 'maxUsage'];
+
+/**
+ * @param {unknown} field
+ * @returns {string}
+ */
+function accountBucketField(field) {
+  if (typeof field !== 'string' || !ACCOUNT_BUCKET_FIELDS.includes(field)) {
+    throw new ConfigOpError(`An account limit is one of: ${ACCOUNT_BUCKET_FIELDS.join(', ')}`);
+  }
+  return field;
+}
+
+/**
+ * Per-bucket percentages on one account entry, `switchThreshold` or `maxUsage`.
+ * Unlike the fleet op it starts from what the entry holds, not the fleet's
+ * 0.98, and `default` may be dropped: an account with no value of its own
+ * falls back to the fleet. A null percentage drops that key; keys a pair does
+ * not name are kept. Every pair is checked before any is written.
+ * @param {Record<string, any>} entry an account from config.accounts
+ * @param {unknown} field
+ * @param {Array<[string, unknown]>} pairs
+ */
+export function setAccountBuckets(entry, field, pairs) {
+  const name = accountBucketField(field);
+  /** @type {Array<[string, number|null]>} */
+  const changes = [];
+  for (const [bucket, percent] of pairs) {
+    if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket)) {
+      throw new ConfigOpError(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}`);
+    }
+    const ratio = percent === null ? null : thresholdRatio(percent);
+    if (percent !== null && ratio === null) throw new ConfigOpError(BAD_PERCENT);
+    changes.push([bucket, ratio]);
+  }
+  const stored = entry[name];
+  /** @type {Record<string, any>} */
+  const table = typeof stored === 'number' ? { default: stored }
+    : stored && typeof stored === 'object' && !Array.isArray(stored) ? { ...stored }
+    : {};
+  for (const [bucket, ratio] of changes) {
+    if (ratio === null) delete table[bucket]; else table[bucket] = ratio;
+  }
+  const keys = Object.keys(table);
+  if (!keys.length) delete entry[name];
+  else entry[name] = keys.length === 1 && keys[0] === 'default' ? table.default : table;
+}
+
+/**
+ * Drop an account's own `switchThreshold` or `maxUsage`, so the fleet setting
+ * (or no cap) applies again.
+ * @param {Record<string, any>} entry
+ * @param {unknown} field
+ */
+export function resetAccountBuckets(entry, field) {
+  delete entry[accountBucketField(field)];
+}
+
+// What strictPercent() accepts as a string, and what a number must print as.
+const CANONICAL_PERCENT = /^\d{1,3}(\.\d)?$/;
+
+/**
+ * The stricter percentage the dashboard endpoints take. thresholdRatio()
+ * rounds 98.55 and reads "1e2" and " 98"; here those are refused, so a value
+ * is stored exactly as the operator wrote it or not at all. Nothing rounds.
+ * @param {unknown} value a finite number or a decimal string, 1 to 100, at most
+ *   one fractional digit
+ * @returns {number|null} the ratio thresholdRatio() stores, or null
+ */
+export function strictPercent(value) {
+  // A number is held to the same text a string must be: String(98.55) keeps
+  // both digits, String(1e2) is "100".
+  if (typeof value === 'number' ? !Number.isFinite(value) : typeof value !== 'string') return null;
+  const text = String(value);
+  if (!CANONICAL_PERCENT.test(text)) return null;
+  const pct = Number(text);
+  return pct >= 1 && pct <= 100 ? thresholdRatio(pct) : null;
+}
+
 /**
  * @param {Config} config
  * @param {unknown} mode a DISTRIBUTE_MODES key

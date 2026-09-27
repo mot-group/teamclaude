@@ -47,8 +47,17 @@ test('a Claude family route never previews Codex subscription accounts', () => {
   const route = byName(am.getRoutes(), 'fable');
   assert.equal(route.provider, 'anthropic');
   assert.equal(route.target, 'claude');
-  assert.deepEqual(route.accounts, [{ name: 'claude', eligible: true }]);
+  assert.deepEqual(route.accounts, [{ id: null, name: 'claude', eligible: true }]);
   assert.equal(am.getStatus().defaultTarget, 'claude');
+});
+
+test('a preview names the admitted account by id when two share a name', () => {
+  const am = new AccountManager([oauth('alex', { id: 'a1' }), oauth('alex', { id: 'a2' })], 0.98, {
+    routes: [{ name: 'bulk', match: ['*opus*'], accounts: [1] }],
+  });
+  const previews = byName(am.getRoutes(), 'bulk').previews;
+  assert.ok(previews.length > 0);
+  for (const p of previews) assert.deepEqual(p.accounts.map(a => a.id), ['a2']);
 });
 
 test('target is null when no account can serve the route', () => {

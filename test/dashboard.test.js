@@ -13,6 +13,7 @@ import {
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows, RESET_WINDOW_BUCKETS,
   currentFor, accountLabel, gatingUtilization, quotaGate,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder, forecastWindowLabel, bucketLabel,
+  offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, limitsOutcome,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -2270,4 +2271,443 @@ test('T6: a failed poll marks the page stale, disables the write controls but no
   await page.refresh({}, 500);
   const confirm = clearCell().querySelectorAll('.route-actions button');
   assert.deepEqual(confirm.map(b => [b.textContent, b.disabled]), [['Clear', true], ['Keep', false]]);
+});
+
+// ---- dashboard-thresholds T6: the account dialog's Rotation limits editor ----
+
+const oauth = (id, name, extra = {}) => ({ id, name, provider: 'anthropic', type: 'oauth', backend: false, ...extra });
+const codexAcct = (id, name) => ({ id, name, provider: 'codex', type: 'oauth', backend: false });
+// A configured route row as status sends it: one preview per provider its globs
+// reach, each naming the route that actually resolves its sample model.
+const routeRow = (name, bucket, previews, extra = {}) => ({ name, bucket, autocreated: false, match: previews.map(p => p.label), previews, ...extra });
+const preview = (provider, label, route, accounts) => ({ provider, label, model: label.replace(/\*/g, ''), route, accounts: accounts.map(a => ({ id: a.id, name: a.name, eligible: true })) });
+const keysOf = offered => offered.map(o => o.key);
+
+test('limits: offeredBuckets gives each account kind its own buckets, in THRESHOLD_BUCKET_KEYS order', () => {
+  assert.deepEqual(keysOf(offeredBuckets(oauth('a', 'alex'), [])), ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable']);
+  assert.deepEqual(keysOf(offeredBuckets(codexAcct('c', 'cx'), null)), ['unified5h', 'unified7d']);
+  assert.deepEqual(keysOf(offeredBuckets({ id: 'k', name: 'key', provider: 'anthropic', type: 'apikey' }, [])), ['tokens', 'requests']);
+  // The key type decides before the provider: a Codex API-key account meters tokens and requests.
+  assert.deepEqual(keysOf(offeredBuckets({ id: 'k2', name: 'cx-key', provider: 'codex', type: 'apikey', backend: false }, [])), ['tokens', 'requests']);
+  assert.deepEqual(offeredBuckets(oauth('d', 'deepseek', { backend: true }), []), []);
+  assert.deepEqual(offeredBuckets(null, []), []);
+  assert.ok(offeredBuckets(oauth('a', 'alex'), []).every(o => o.routes.length === 0), 'a kind bucket carries no route tag');
+});
+
+test('limits: a gpt-* route on Fable weekly offers the Codex account that bucket; the same route on claude-* does not', () => {
+  const cx = codexAcct('c1', 'codex-primary');
+  const claude = oauth('a1', 'alex');
+  const gpt = routeRow('gpt-fable', 'unified7dFable', [preview('codex', 'gpt-*', 'gpt-fable', [cx])]);
+  assert.deepEqual(offeredBuckets(cx, [gpt]), [{ key: 'unified5h', routes: [] }, { key: 'unified7d', routes: [] }, { key: 'unified7dFable', routes: ['gpt-fable'] }]);
+  const onClaude = routeRow('gpt-fable', 'unified7dFable', [preview('anthropic', 'claude-*', 'gpt-fable', [claude])]);
+  assert.deepEqual(keysOf(offeredBuckets(cx, [onClaude])), ['unified5h', 'unified7d']);
+  // The Claude account already has Fable weekly by kind, so the route adds no tag.
+  assert.deepEqual(offeredBuckets(claude, [onClaude]).find(o => o.key === 'unified7dFable').routes, []);
+});
+
+test('limits: of two same-name accounts, only the id the route admits is offered its bucket', () => {
+  const first = codexAcct('c1', 'shared'), second = codexAcct('c2', 'shared');
+  // The route lists `accounts: [1]`, so its preview admits the second entry only.
+  const route = routeRow('by-index', 'unified7dSonnet', [preview('codex', 'gpt-*', 'by-index', [second])], { accounts: [1] });
+  assert.deepEqual(keysOf(offeredBuckets(first, [route])), ['unified5h', 'unified7d']);
+  assert.deepEqual(keysOf(offeredBuckets(second, [route])), ['unified5h', 'unified7d', 'unified7dSonnet']);
+});
+
+test('limits: a route shadowed by an earlier one contributes only from the previews it still owns', () => {
+  const cx = codexAcct('c1', 'codex-primary');
+  const a = routeRow('A', 'unified7d', [preview('codex', 'gpt-5*', 'A', [cx])]);
+  // Fully shadowed: every sample B globs resolves to A.
+  const fullB = routeRow('B', 'unified7dFable', [preview('codex', 'gpt-5.1*', 'A', [cx]), preview('codex', 'gpt-5-mini*', 'A', [cx])]);
+  assert.deepEqual(keysOf(offeredBuckets(cx, [a, fullB])), ['unified5h', 'unified7d']);
+  // Partly shadowed: only the preview B still owns counts.
+  const partB = routeRow('B', 'unified7dFable', [preview('codex', 'gpt-5*', 'A', [cx]), preview('codex', 'o4*', 'B', [cx])]);
+  assert.deepEqual(offeredBuckets(cx, [a, partB]).find(o => o.key === 'unified7dFable'), { key: 'unified7dFable', routes: ['B'] });
+  const other = codexAcct('c2', 'codex-secondary');
+  const partForOther = routeRow('B', 'unified7dFable', [preview('codex', 'gpt-5*', 'A', [other]), preview('codex', 'o4*', 'B', [cx])]);
+  assert.deepEqual(keysOf(offeredBuckets(other, [a, partForOther])), ['unified5h', 'unified7d'], 'admitted only by the shadowed preview');
+});
+
+test('limits: autocreated rows, unknown buckets and an account with no id get no route set', () => {
+  const cx = codexAcct('c1', 'codex-primary');
+  const p = [preview('codex', 'gpt-*', 'r', [cx])];
+  assert.deepEqual(keysOf(offeredBuckets(cx, [{ ...routeRow('r', 'unified7dFable', p), autocreated: true }])), ['unified5h', 'unified7d']);
+  assert.deepEqual(keysOf(offeredBuckets(cx, [routeRow('r', 'opusWeekly', p)])), ['unified5h', 'unified7d']);
+  assert.deepEqual(keysOf(offeredBuckets(cx, [routeRow('r', null, p)])), ['unified5h', 'unified7d']);
+  const noId = { ...cx, id: null };
+  const nullPreview = [preview('codex', 'gpt-*', 'r', [noId])];
+  assert.deepEqual(keysOf(offeredBuckets(noId, [routeRow('r', 'unified7dFable', nullPreview)])), ['unified5h', 'unified7d']);
+});
+
+test('limits: thresholdSource reads account bucket, then account all-buckets, then fleet', () => {
+  assert.equal(thresholdSource({ unified7dFable: 0.995, default: 0.9 }, 'unified7dFable'), 'account bucket');
+  assert.equal(thresholdSource({ unified7dFable: 0.995, default: 0.9 }, 'unified7d'), 'account all-buckets');
+  assert.equal(thresholdSource({ unified7dFable: 0.995 }, 'unified7d'), 'fleet');
+  // A bare number is the all-buckets value, and it outranks the fleet's bucket entry.
+  assert.equal(thresholdSource(1, 'unified7dFable'), 'account all-buckets');
+  assert.equal(resolveSwitchThreshold(1, 'unified7dFable', fleetFor('unified7dFable', 0.98, { unified7dFable: 0.9 })), 1);
+  for (const none of [null, undefined, NaN, {}, []]) assert.equal(thresholdSource(none, 'unified7d'), 'fleet');
+});
+
+test('limits: parsePercent takes 1 to 100 with one decimal, forgiving whitespace and one %', () => {
+  for (const [text, n] of [['98%', 98], [' 98 ', 98], ['98', 98], ['99.5', 99.5], ['1', 1], ['100', 100], ['100.0', 100], [' 60 % ', 60]]) assert.equal(parsePercent(text), n, text);
+  for (const bad of ['98.55', '0', '101', '1e2', 'abc', '', '  ', '0.5', '-5', '98%%', '.5', '5.', '100.1', null]) assert.equal(parsePercent(bad), null, String(bad));
+});
+
+test('limits: storedPercent and limitText read what the account stores', () => {
+  assert.equal(storedPercent(1, 'default'), 100);
+  assert.equal(storedPercent(1, 'unified7d'), null, 'a bare number is the all-buckets value only');
+  assert.equal(storedPercent({ default: 0.9, unified7dFable: 0.995 }, 'unified7dFable'), 99.5);
+  assert.equal(storedPercent(1.5, 'default'), 150, 'a hand-edited cap shows as-is');
+  assert.equal(storedPercent(null, 'default'), null);
+  assert.equal(limitText(0.98, 'threshold'), '98% all buckets');
+  assert.equal(limitText({ unified7dFable: 0.995, default: 0.9 }, 'threshold'), '90% all buckets, Fable weekly 99.5%');
+  assert.equal(limitText(null, 'threshold'), 'inherited');
+  assert.equal(limitText(null, 'cap'), 'none');
+});
+
+test('limits: the request carries only changed buckets, as numbers, under the seeded expected', () => {
+  const base = { switchThreshold: { default: 0.9, unified7dFable: 0.995 }, maxUsage: null };
+  const keys = ['default', 'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable'];
+  assert.deepEqual(limitsRequest('a1', base, { 'maxUsage:unified7d': '60' }, keys).body,
+    { id: 'a1', expected: { switchThreshold: { default: 0.9, unified7dFable: 0.995 }, maxUsage: null }, maxUsage: { buckets: { unified7d: 60 } } });
+  // Clearing a stored key sends null; clearing an empty one, or retyping the stored value, sends nothing.
+  assert.deepEqual(limitsRequest('a1', base, { 'switchThreshold:unified7dFable': '', 'switchThreshold:default': '90%', 'maxUsage:default': '' }, keys).body.switchThreshold, { buckets: { unified7dFable: null } });
+  assert.equal(limitsRequest('a1', base, { 'switchThreshold:default': ' 90 ', 'maxUsage:unified5h': '' }, keys).body, null);
+  assert.equal(limitsRequest('a1', base, {}, keys).body, null);
+  // A draft for a row that is no longer shown is dropped.
+  assert.equal(limitsRequest('a1', base, { 'maxUsage:tokens': '50' }, keys).body, null);
+  const bad = limitsRequest('a1', base, { 'maxUsage:unified7d': '98.55', 'switchThreshold:unified7d': '1e2', 'switchThreshold:default': '95' }, keys);
+  assert.equal(bad.body, null);
+  assert.deepEqual(bad.invalid, [{ field: 'switchThreshold', bucket: 'unified7d' }, { field: 'maxUsage', bucket: 'unified7d' }]);
+});
+
+test('limits: each reply status reads distinctly', () => {
+  assert.deepEqual(limitsOutcome(200, { ok: true }), { kind: 'ok', text: 'Saved and applied.' });
+  assert.match(limitsOutcome(200, { ok: true }, true).text, /^Reset\. This account now inherits/);
+  const bad = limitsOutcome(400, { ok: false, errors: [{ field: 'maxUsage.unified7d', message: 'maxUsage.unified7d: at most one decimal' }] });
+  assert.equal(bad.kind, 'error'); assert.equal(bad.text, 'Not saved: maxUsage.unified7d: at most one decimal'); assert.equal(bad.errors.length, 1);
+  // The endpoint's bucket errors name the field by path; the line names it by row and column.
+  assert.equal(limitsOutcome(400, { ok: false, errors: [{ field: 'switchThreshold.buckets.default', message: 'a percentage from 1 to 100 with at most one decimal' }, { field: 'body', message: 'nothing to change' }] }).text,
+    'Not saved: All buckets Switch at: a percentage from 1 to 100 with at most one decimal. nothing to change');
+  assert.match(limitsOutcome(404, { ok: false }).text, /no longer in the config/);
+  const conflict = limitsOutcome(409, { ok: false, error: 'changed elsewhere', current: { switchThreshold: 0.98, maxUsage: null } });
+  assert.equal(conflict.conflict, true);
+  assert.equal(conflict.text, 'Not saved: changed elsewhere since you opened this. Now: switch 98% all buckets, cap none.');
+  assert.deepEqual(limitsOutcome(500, { ok: false, persisted: true, error: 'reload failed' }), { kind: 'warn', text: 'Saved, but not applied: reload failed. Use Reload config to apply it.' });
+  assert.deepEqual(limitsOutcome(500, { ok: false, persisted: false, error: 'disk full' }), { kind: 'error', text: 'Not saved: disk full' });
+  assert.deepEqual(limitsOutcome(413, { ok: false, error: 'body too large' }), { kind: 'error', text: 'Not saved: body too large' });
+  assert.match(limitsOutcome(501, { ok: false }).text, /Update TeamClaude/);
+});
+
+// fixtureStatus with config ids and the backend flag the editor reads, and a
+// fleet table with a Fable override, so "account all-buckets" has something to outrank.
+function limitsStatus() {
+  const s = fixtureStatus();
+  s.accounts.forEach((a, i) => { a.id = 'id-' + i; a.backend = false; });
+  s.switchThresholds = { default: 0.98, unified7dFable: 0.9 };
+  return s;
+}
+
+async function openLimits(s, name) {
+  const page = await renderPage(s);
+  page.rowFor(name).querySelector('button.act').click();
+  const { dom } = page;
+  const input = (field, bucket) => dom.querySelectorAll(`#limitsBody input[data-field="${field}"][data-bucket="${bucket}"]`)[0];
+  const rows = () => dom.getElementById('limitsBody').querySelectorAll('tr').map(tr => tr.getAttribute('data-bucket'));
+  const type = (field, bucket, text) => { const i = input(field, bucket); i.value = text; i.dispatch('input'); };
+  const force = bucket => dom.getElementById('limitsBody').querySelectorAll('tr').find(tr => tr.getAttribute('data-bucket') === bucket).querySelector('td.force');
+  const sent = () => page.requests.filter(r => r.url === '/teamclaude/accounts/limits').map(r => JSON.parse(r.init.body));
+  const save = () => dom.getElementById('saveLimits').click();
+  return { ...page, input, rows, type, force, sent, save, result: dom.getElementById('limitsResult') };
+}
+
+test('limits: the editor is static markup after the rename result, outside #accountDetails, with one script and no inline handlers', () => {
+  const html = renderDashboardHtml();
+  const start = html.indexOf('<dialog id="accountDialog"');
+  const dialog = html.slice(start, html.indexOf('</dialog>', start));
+  assert.ok(dialog.indexOf('<div id="accountDetails"></div>') !== -1, '#accountDetails stays empty markup');
+  assert.ok(dialog.indexOf('id="labelResult"') < dialog.indexOf('<section id="accountLimits"'));
+  assert.ok(dialog.indexOf('<section id="accountLimits"') < dialog.indexOf('class="dialog-actions"'));
+  assert.ok(dialog.indexOf('</section>') < dialog.indexOf('class="dialog-actions"'));
+  assert.match(dialog, /<button id="saveLimits" class="primary">Save limits<\/button>/);
+  assert.match(dialog, /<button id="resetLimits">Reset to inherited<\/button>/);
+  for (const id of ['limitsTable', 'limColSwitch', 'limColCap', 'limitsStored', 'limitsBlocked', 'limitsActions', 'resetLimits', 'saveLimits', 'limitsResult', 'limitsUseCurrent']) assert.ok(dialog.includes(`id="${id}"`), id);
+  assert.equal(html.split('<script').length, 2);
+  assert.doesNotMatch(html.slice(html.indexOf('<script>')), /innerHTML/);
+  assert.doesNotMatch(html, /\son[a-z]+="/);
+  for (const fn of [offeredBuckets, thresholdSource, parsePercent, limitText, storedPercent, limitsRequest, limitsOutcome]) assert.ok(html.includes(fn.toString()), fn.name);
+});
+
+test('limits: .limits rules use no identity tint and only --grade-at, on the invalid input', () => {
+  const html = renderDashboardHtml();
+  const css = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+  const rules = css.split('}').map(chunk => chunk.split('{').slice(-2)).filter(([sel]) => sel && /\.limits|#limitsTable|#accountLimits|#limitsUseCurrent/.test(sel));
+  assert.ok(rules.length > 5);
+  for (const [sel, body] of rules) {
+    assert.doesNotMatch(body, /--accent|--claude|--codex/, sel);
+    const grades = body.match(/--grade-[\w-]+/g) || [];
+    if (grades.length) { assert.deepEqual(grades, ['--grade-at']); assert.match(sel, /\.limits input\[aria-invalid="true"\]/); }
+  }
+});
+
+test('limits: rows follow the account kind; a route-only bucket says which route; same-name accounts are told apart', async () => {
+  const s = limitsStatus();
+  s.accounts.push({ ...s.accounts[0], id: 'id-key', name: 'api-key', type: 'apikey', quota: {} }, { ...s.accounts[0], id: 'id-ds', name: 'deepseek', backend: true, quota: {} });
+  let page = await openLimits(s, 'alex@personal.dev');
+  assert.deepEqual(page.rows(), ['default', 'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable']);
+  page = await openLimits(s, 'codex-primary');
+  assert.deepEqual(page.rows(), ['default', 'unified5h', 'unified7d']);
+  page = await openLimits(s, 'api-key');
+  assert.deepEqual(page.rows(), ['default', 'tokens', 'requests']);
+  assert.equal(page.rowFor('api-key').querySelectorAll('.account-meta')[0].textContent, 'API account');
+  page = await openLimits(s, 'deepseek');
+  assert.deepEqual(page.rows(), ['default']);
+  assert.match(page.dom.getElementById('limitsHelp').textContent, /reports no Anthropic quota buckets/);
+
+  const routed = limitsStatus();
+  // Two Codex accounts sharing a name; the route admits the second by index.
+  routed.accounts[3].name = 'codex-primary';
+  routed.routes = [routeRow('gpt-fable', 'unified7dFable', [preview('codex', 'gpt-*', 'gpt-fable', [routed.accounts[3]])])];
+  page = await renderPage(routed);
+  page.dom.querySelectorAll('tr.account-row').filter(r => r.getAttribute('data-provider') === 'codex')[1].querySelector('button.act').click();
+  const body = page.dom.getElementById('limitsBody');
+  assert.deepEqual(body.querySelectorAll('tr').map(tr => tr.getAttribute('data-bucket')), ['default', 'unified5h', 'unified7d', 'unified7dFable']);
+  const th = body.querySelectorAll('tr')[3].querySelector('th');
+  assert.equal(th.querySelector('.badge.meta').textContent, 'via route gpt-fable');
+  assert.equal(th.querySelector('.badge.meta').title, 'via route gpt-fable', 'a clipped name stays readable on hover');
+  page.dom.querySelectorAll('tr.account-row').filter(r => r.getAttribute('data-provider') === 'codex')[0].querySelector('button.act').click();
+  assert.deepEqual(body.querySelectorAll('tr').map(tr => tr.getAttribute('data-bucket')), ['default', 'unified5h', 'unified7d']);
+  const onClaude = limitsStatus();
+  onClaude.routes = [routeRow('gpt-fable', 'unified7dFable', [preview('anthropic', 'claude-*', 'gpt-fable', onClaude.accounts.slice(0, 2))])];
+  page = await openLimits(onClaude, 'codex-secondary');
+  assert.deepEqual(page.rows(), ['default', 'unified5h', 'unified7d']);
+});
+
+test('limits: inputs are named by row and column, seeded from status, with In force per bucket', async () => {
+  const s = limitsStatus();
+  s.accounts[0].switchThreshold = 1;
+  s.accounts[0].maxUsage = { unified7d: 0.6 };
+  s.accounts[1].switchThreshold = { default: 0.9, unified7dFable: 0.995 };
+  s.accounts[1].maxUsage = 0.6;
+  const page = await openLimits(s, 'alex@personal.dev');
+  const { input, force, dom } = page;
+  for (const tr of dom.getElementById('limitsBody').querySelectorAll('tr')) {
+    const bucket = tr.getAttribute('data-bucket');
+    const [sw, cap] = [tr.querySelectorAll('input[data-field="switchThreshold"]'), tr.querySelectorAll('input[data-field="maxUsage"]')];
+    assert.equal(sw.length, 1); assert.equal(cap.length, 1);
+    for (const [i, col, ph] of [[sw[0], 'limColSwitch', 'inherit'], [cap[0], 'limColCap', 'none']]) {
+      assert.equal(i.getAttribute('type'), 'text'); assert.equal(i.getAttribute('inputmode'), 'decimal');
+      assert.equal(i.getAttribute('placeholder'), ph);
+      assert.equal(i.getAttribute('aria-labelledby'), `lim-row-${bucket} ${col}`);
+    }
+    const label = tr.querySelector('th').querySelectorAll('span').find(n => n.getAttribute('id') === `lim-row-${bucket}`);
+    assert.equal(label.textContent, bucket === 'default' ? 'All buckets' : bucketLabel(bucket));
+  }
+  assert.equal(input('switchThreshold', 'default').value, '100');
+  assert.equal(input('switchThreshold', 'unified7dFable').value, '');
+  assert.equal(input('maxUsage', 'unified7d').value, '60');
+  // Account all-buckets outranks the fleet's Fable entry (0.9).
+  assert.equal(force('unified7dFable').children[0].textContent, 'switch 100% · account all-buckets');
+  assert.equal(force('unified7dFable').children[0].tagName, 'B');
+  assert.equal(force('unified7dFable').children[1].textContent, 'uncapped');
+  // The cap below the threshold binds, and the cap line is the bold one.
+  assert.equal(force('unified7d').children[1].textContent, 'cap 60% · binds');
+  assert.equal(force('unified7d').children[1].tagName, 'B');
+  assert.equal(force('unified7d').children[0].tagName, 'SPAN');
+  assert.equal(force('default').textContent, 'for buckets left empty');
+
+  const work = await openLimits(s, 'alex@work.co');
+  assert.equal(work.input('switchThreshold', 'default').value, '90');
+  assert.equal(work.input('switchThreshold', 'unified7dFable').value, '99.5');
+  assert.equal(work.input('maxUsage', 'default').value, '60');
+  assert.equal(work.force('unified7dFable').children[0].textContent, 'switch 99.5% · account bucket');
+  assert.equal(work.force('unified5h').children[0].textContent, 'switch 90% · account all-buckets');
+  const cx = await openLimits(s, 'codex-primary');
+  assert.equal(cx.force('unified7d').textContent, 'switch 98% · fleetuncapped');
+  assert.equal(cx.dom.getElementById('limitsStored').hidden, true);
+});
+
+test('limits: a stored key the dialog does not offer is shown read-only and never sent', async () => {
+  const s = limitsStatus();
+  s.accounts[0].switchThreshold = { default: 0.95, tokens: 0.9 };
+  s.accounts[0].maxUsage = { requests: 0.5 };
+  const page = await openLimits(s, 'alex@personal.dev');
+  const stored = page.dom.getElementById('limitsStored');
+  assert.equal(stored.hidden, false);
+  assert.equal(stored.textContent, 'Also stored, not editable here: Tokens switch 90%, Requests cap 50%.');
+  assert.equal(page.dom.querySelectorAll('#limitsBody input[data-bucket="tokens"]').length, 0);
+  page.type('switchThreshold', 'default', '');
+  page.save();
+  assert.deepEqual(page.sent()[0].switchThreshold, { buckets: { default: null } });
+});
+
+test('limits: bad input is refused before any request, marked, focused and named', async () => {
+  for (const bad of ['98.55', '0', '101', '1e2', 'abc']) {
+    const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+    page.type('maxUsage', 'unified7dFable', bad);
+    page.save();
+    assert.equal(page.sent().length, 0, bad);
+    const i = page.input('maxUsage', 'unified7dFable');
+    assert.equal(i.getAttribute('aria-invalid'), 'true');
+    assert.equal(page.dom.focused, i);
+    assert.equal(page.result.className, 'dialog-result error');
+    assert.match(page.result.textContent, /Fable weekly Cap: enter a percent from 1 to 100/);
+    // Editing the field clears its own mark.
+    page.type('maxUsage', 'unified7dFable', '9');
+    assert.equal(i.getAttribute('aria-invalid'), null);
+  }
+  for (const ok of ['98%', ' 98 ']) {
+    const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+    page.type('switchThreshold', 'unified7d', ok);
+    page.save();
+    assert.deepEqual(page.sent()[0].switchThreshold, { buckets: { unified7d: 98 } });
+  }
+});
+
+test('limits: a save sends only the changed field, nothing when clean, and renders each reply', async () => {
+  const s = limitsStatus();
+  s.accounts[0].switchThreshold = { default: 0.9 };
+  const page = await openLimits(s, 'alex@personal.dev');
+  page.save();
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.result.className, 'dialog-result');
+  assert.equal(page.result.textContent, 'No changes to save.');
+
+  page.type('maxUsage', 'unified7d', '60');
+  page.save();
+  assert.equal(page.requests[0].url, '/teamclaude/accounts/limits');
+  assert.equal(page.requests[0].init.method, 'POST');
+  assert.deepEqual(page.sent()[0], { id: 'id-0', expected: { switchThreshold: { default: 0.9 }, maxUsage: null }, maxUsage: { buckets: { unified7d: 60 } } });
+  assert.equal(page.result.textContent, 'Saving...');
+  assert.ok(page.dom.querySelectorAll('#limitsBody input').every(i => i.disabled), 'inputs disabled while pending');
+  assert.equal(page.dom.getElementById('saveLimits').disabled, true);
+  assert.equal(page.dom.getElementById('resetLimits').disabled, true);
+  await page.answer(200, { ok: true, switchThreshold: { default: 0.9 }, maxUsage: 0.6 });
+  assert.equal(page.result.className, 'dialog-result ok');
+  assert.equal(page.result.textContent, 'Saved and applied.');
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the editor re-polls after a reply');
+  const next = limitsStatus(); next.accounts[0].switchThreshold = { default: 0.9 }; next.accounts[0].maxUsage = { unified7d: 0.6 };
+  await page.answer(200, next);
+  assert.equal(page.force('unified7d').children[1].textContent, 'cap 60% · binds');
+  assert.equal(page.dom.getElementById('saveLimits').disabled, false);
+
+  // Clearing the stored field sends null for it. The expected is status's form,
+  // not the reply's raw values (the reply above said 0.6 for all buckets).
+  page.type('maxUsage', 'unified7d', '');
+  page.save();
+  assert.deepEqual(page.sent()[0].maxUsage, { buckets: { unified7d: null } });
+  assert.deepEqual(page.sent()[0].expected, { switchThreshold: { default: 0.9 }, maxUsage: { unified7d: 0.6 } });
+  assert.equal(page.sent()[0].switchThreshold, undefined);
+
+  const replies = [
+    [400, { ok: false, errors: [{ field: 'maxUsage.buckets.unified7d', message: 'a percentage from 1 to 100 with at most one decimal' }] }, 'error', /^Not saved: Weekly Cap: a percentage from 1 to 100 with at most one decimal$/],
+    [404, { ok: false, error: 'no such account' }, 'error', /no longer in the config/],
+    [500, { ok: false, persisted: true, error: 'reload failed' }, 'warn', /Reload config/],
+    [500, { ok: false, persisted: false, error: 'disk full' }, 'error', /^Not saved: disk full$/],
+    [413, { ok: false, error: 'body too large' }, 'error', /^Not saved: body too large$/],
+    [501, { ok: false, error: 'not supported' }, 'error', /Update TeamClaude/],
+  ];
+  for (const [status, reply, kind, text] of replies) {
+    await page.answer(status, reply);
+    assert.equal(page.result.className, 'dialog-result ' + kind, String(status));
+    assert.match(page.result.textContent, text);
+    if (status === 400) assert.equal(page.input('maxUsage', 'unified7d').getAttribute('aria-invalid'), 'true');
+    await page.answer(200, next);
+    page.save();
+  }
+  // Network failure keeps the existing wording.
+  page.requests.shift().resolve(Promise.reject(new Error('timed out')));
+  await new Promise(r => setImmediate(r));
+  assert.equal(page.result.textContent, 'Could not confirm the change. Refresh status before retrying. timed out');
+});
+
+test('limits: a 409 shows the value now and Use current adopts it while keeping typed fields', async () => {
+  const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+  page.type('maxUsage', 'unified7d', '60');
+  page.save();
+  await page.answer(409, { ok: false, error: 'changed elsewhere', current: { switchThreshold: 0.95, maxUsage: null } });
+  assert.equal(page.result.className, 'dialog-result error');
+  assert.match(page.result.textContent, /changed elsewhere.*Now: switch 95% all buckets, cap none\./);
+  const useCurrent = page.dom.getElementById('limitsUseCurrent');
+  assert.equal(useCurrent.hidden, false);
+  await page.answer(200, limitsStatus());
+  assert.equal(page.dom.focused, useCurrent);
+  useCurrent.click();
+  assert.equal(useCurrent.hidden, true);
+  assert.equal(page.dom.focused, page.dom.getElementById('saveLimits'));
+  assert.equal(page.input('maxUsage', 'unified7d').value, '60', 'typed value kept');
+  page.save();
+  assert.deepEqual(page.sent()[0].expected, { switchThreshold: 0.95, maxUsage: null });
+});
+
+test('limits: a poll re-seeds untouched fields and moves their baseline; a touched field keeps its draft and baseline', async () => {
+  const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+  const capInput = page.input('maxUsage', 'unified7d');
+  page.type('maxUsage', 'unified7d', '70');
+  const next = limitsStatus();
+  next.accounts[0].switchThreshold = 0.9;
+  next.accounts[0].maxUsage = 0.5;
+  await page.refresh(next);
+  assert.equal(page.input('maxUsage', 'unified7d'), capInput, 'the poll did not rebuild the inputs');
+  assert.equal(capInput.value, '70');
+  assert.equal(page.input('switchThreshold', 'default').value, '90', 'untouched field follows status');
+  assert.equal(page.input('maxUsage', 'default').value, '', 'a touched field keeps its baseline, so its other inputs do too');
+  assert.equal(page.force('unified7d').children[0].textContent, 'switch 90% · account all-buckets');
+  page.save();
+  assert.deepEqual(page.sent()[0], { id: 'id-0', expected: { switchThreshold: 0.9, maxUsage: null }, maxUsage: { buckets: { unified7d: 70 } } });
+});
+
+test('limits: editors are disabled while disconnected and for an account with no config id', async () => {
+  const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+  const controls = () => page.dom.querySelectorAll('#limitsBody input').concat([page.dom.getElementById('saveLimits'), page.dom.getElementById('resetLimits')]);
+  assert.ok(page.dom.querySelectorAll('#limitsBody input').every(i => !i.disabled));
+  assert.equal(page.dom.getElementById('limitsBlocked').hidden, true);
+  await page.refresh({}, 500);
+  assert.ok(controls().every(c => c.disabled));
+  const s = limitsStatus(); s.accounts[0].id = null;
+  const noId = await openLimits(s, 'alex@personal.dev');
+  assert.ok(noId.dom.querySelectorAll('#limitsBody input').every(i => i.disabled));
+  assert.equal(noId.dom.getElementById('saveLimits').disabled, true);
+  assert.equal(noId.dom.getElementById('limitsBlocked').hidden, false);
+  assert.match(noId.dom.getElementById('limitsBlocked').textContent, /Reload config/);
+  // The account leaving the status hides the editor with the rest of the body.
+  await page.refresh({ ...limitsStatus(), accounts: [] });
+  assert.equal(page.dom.getElementById('accountLimits').hidden, true);
+});
+
+test('limits: Reset to inherited confirms inline, then sends reset on both fields in one request', async () => {
+  const bare = await openLimits(limitsStatus(), 'alex@personal.dev');
+  assert.equal(bare.dom.getElementById('resetLimits').disabled, true, 'nothing to reset');
+  const s = limitsStatus(); s.accounts[0].switchThreshold = 1; s.accounts[0].maxUsage = 0.6;
+  const page = await openLimits(s, 'alex@personal.dev');
+  const { dom } = page;
+  const reset = dom.getElementById('resetLimits');
+  assert.equal(reset.disabled, false);
+  reset.click();
+  const actions = dom.getElementById('limitsActions');
+  assert.equal(actions.textContent, 'Reset to the fleet threshold and no cap?ResetKeep');
+  const confirm = actions.querySelector('#confirmResetLimits');
+  assert.equal(dom.focused, confirm);
+  actions.querySelector('#keepLimits').click();
+  assert.deepEqual(actions.children.map(c => c.getAttribute('id')), ['resetLimits', 'saveLimits']);
+  assert.equal(dom.focused, reset);
+  reset.click();
+  actions.querySelector('#confirmResetLimits').click();
+  assert.equal(page.sent().length, 1);
+  assert.deepEqual(page.sent()[0], { id: 'id-0', expected: { switchThreshold: 1, maxUsage: 0.6 }, switchThreshold: { reset: true }, maxUsage: { reset: true } });
+  await page.answer(200, { ok: true, switchThreshold: null, maxUsage: null });
+  assert.match(page.result.textContent, /^Reset\. This account now inherits the fleet threshold and has no cap\.$/);
+  await page.answer(200, limitsStatus());
+  assert.equal(page.input('switchThreshold', 'default').value, '');
+  assert.equal(page.dom.getElementById('resetLimits').disabled, true);
+});
+
+test('limits: a reply that lands after sign-out renders nothing', async () => {
+  const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+  page.type('maxUsage', 'unified7d', '60');
+  page.save();
+  page.dom.getElementById('logout').click();
+  await page.answer(200, { ok: true, switchThreshold: null, maxUsage: { unified7d: 0.6 } });
+  assert.doesNotMatch(page.result.textContent, /Saved|Not saved/);
+  assert.equal(page.requests.filter(r => r.url === '/teamclaude/status').length, 0, 'no re-poll into the new session');
 });

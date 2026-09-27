@@ -5,6 +5,8 @@ import {
   ConfigOpError,
   MAX_PROBE_SECONDS,
   removeRoute,
+  resetAccountBuckets,
+  setAccountBuckets,
   setBlockedModels,
   setBucketThresholds,
   setDefaultClientMode,
@@ -13,6 +15,7 @@ import {
   setThreshold,
   setWarmupSchedule,
   setWarmupSeconds,
+  strictPercent,
   thresholdRatio,
   thresholdTable,
   upsertRoute,
@@ -234,4 +237,73 @@ test('an array switchThreshold is the default table, not numeric bucket keys', (
   }
   assert.equal(said.length, 1);
   assert.match(said[0], /switchThreshold is an array/);
+});
+
+test('an account limit patches its own table, starting from a bare number', () => {
+  const entry = { switchThreshold: 0.98 };
+  setAccountBuckets(entry, 'switchThreshold', [['unified7d', 100]]);
+  assert.deepEqual(entry.switchThreshold, { default: 0.98, unified7d: 1 });
+
+  // A missing value starts empty: the fleet 0.98 is not filled in.
+  const fresh = {};
+  setAccountBuckets(fresh, 'maxUsage', [['unified7dFable', 60]]);
+  assert.deepEqual(fresh.maxUsage, { unified7dFable: 0.6 });
+});
+
+test('an account limit may drop default, collapses to a number, and goes when empty', () => {
+  const noDefault = { switchThreshold: { default: 1, unified7dFable: 0.995 } };
+  setAccountBuckets(noDefault, 'switchThreshold', [['default', null]]);
+  assert.deepEqual(noDefault.switchThreshold, { unified7dFable: 0.995 });
+
+  const onlyDefault = { switchThreshold: { default: 1, unified7d: 0.9 } };
+  setAccountBuckets(onlyDefault, 'switchThreshold', [['unified7d', null]]);
+  assert.equal(onlyDefault.switchThreshold, 1);
+
+  const empty = { name: 'a', maxUsage: { unified7d: 0.9 } };
+  setAccountBuckets(empty, 'maxUsage', [['unified7d', null]]);
+  assert.deepEqual(empty, { name: 'a' });
+});
+
+test('an account limit leaves the keys a pair does not name', () => {
+  const entry = { maxUsage: { tokens: 0.5, unified7d: 0.8 } };
+  setAccountBuckets(entry, 'maxUsage', [['unified7d', 70]]);
+  assert.deepEqual(entry.maxUsage, { tokens: 0.5, unified7d: 0.7 });
+});
+
+test('an account limit is refused as a whole on a bad field, bucket or percent', () => {
+  const entry = { switchThreshold: { default: 0.9 } };
+  const before = JSON.parse(JSON.stringify(entry));
+  refused(() => setAccountBuckets(entry, 'priority', [['default', 90]]), /account limit is one of/);
+  refused(() => setAccountBuckets(entry, 'switchThreshold', [['unified7d', 90], ['foo', 80]]), /Unknown quota bucket "foo"/);
+  refused(() => setAccountBuckets(entry, 'switchThreshold', [['unified7d', 90], ['default', 0]]), /percentage from 1 to 100/);
+  refused(() => resetAccountBuckets(entry, 'priority'), /account limit is one of/);
+  assert.deepEqual(entry, before);
+});
+
+test('resetting both account limits leaves neither key', () => {
+  const entry = { name: 'a', switchThreshold: 1, maxUsage: { unified7d: 0.6 } };
+  resetAccountBuckets(entry, 'switchThreshold');
+  resetAccountBuckets(entry, 'maxUsage');
+  assert.deepEqual(entry, { name: 'a' });
+});
+
+test('an account limit reads back as the percentage it was set to', () => {
+  const entry = {};
+  setAccountBuckets(entry, 'switchThreshold', [['default', 100], ['unified7d', 99.5], ['unified5h', 60]]);
+  assert.deepEqual(entry.switchThreshold, { default: 1, unified7d: 0.995, unified5h: 0.6 });
+  for (const [bucket, pct] of [['default', 100], ['unified7d', 99.5], ['unified5h', 60]]) {
+    assert.equal(Math.round(entry.switchThreshold[bucket] * 1000) / 10, pct);
+  }
+});
+
+test('the strict percent takes canonical 1 to 100 and refuses rather than rounds', () => {
+  assert.equal(strictPercent(100), 1);
+  assert.equal(strictPercent(99.5), 0.995);
+  assert.equal(strictPercent('60'), 0.6);
+  assert.equal(strictPercent('99.5'), 0.995);
+  assert.equal(strictPercent(1), 0.01);
+  for (const bad of ['1e2', '98.55', 98.55, ' 98', '98 ', '', 0, '0', 101, '101', '100.1', -5, NaN, Infinity,
+    true, false, [95], {}, null, undefined]) {
+    assert.equal(strictPercent(bad), null, JSON.stringify(bad) ?? String(bad));
+  }
 });

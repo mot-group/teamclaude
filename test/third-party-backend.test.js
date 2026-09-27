@@ -37,6 +37,14 @@ test('constructor carries upstream/modelMap/models onto the account (and default
   assert.equal(cl.models, null);
 });
 
+test('status flags a third-party backend without sending its upstream URL', () => {
+  const am = new AccountManager([deepseek(), oauth('claude')], 0.98);
+  const [ds, cl] = am.getStatus().accounts;
+  assert.equal(ds.backend, true);
+  assert.equal(cl.backend, false);
+  assert.ok(!JSON.stringify(am.getStatus()).includes('api.deepseek.com'));
+});
+
 // ── model-ownership routing ──────────────────────────────────────────────────
 
 test('ownership is inert when no account declares a models list', () => {
