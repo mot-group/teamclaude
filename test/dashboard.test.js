@@ -14,6 +14,7 @@ import {
   currentFor, accountLabel, gatingUtilization, quotaGate,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder, forecastWindowLabel, bucketLabel,
   offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, limitsOutcome,
+  fleetInForce, fleetRequest, fleetOutcome,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -2710,4 +2711,268 @@ test('limits: a reply that lands after sign-out renders nothing', async () => {
   await page.answer(200, { ok: true, switchThreshold: null, maxUsage: { unified7d: 0.6 } });
   assert.doesNotMatch(page.result.textContent, /Saved|Not saved/);
   assert.equal(page.requests.filter(r => r.url === '/teamclaude/status').length, 0, 'no re-poll into the new session');
+});
+
+// ---- Fleet switch thresholds (Routing, T7) ----
+
+test('fleet: In force reads the value in force and whether the table overrides it', () => {
+  const table = { default: 0.98, unified7dFable: 1 };
+  assert.equal(fleetInForce('default', 0.98, table), '98%');
+  assert.equal(fleetInForce('unified7dFable', 0.98, table), '100% · override');
+  assert.equal(fleetInForce('unified7d', 0.98, table), '98% · default');
+  assert.equal(fleetInForce('tokens', 0.95, null), '95% · default');
+  assert.equal(fleetInForce('default', 0.995, null), '99.5%');
+});
+
+test('fleet: the request sends only changed rows under the table shown; Default cannot be cleared', () => {
+  const base = { default: 0.98, unified7dFable: 1 };
+  assert.deepEqual(fleetRequest(base, {}), { body: null, invalid: [], emptyDefault: false });
+  assert.deepEqual(fleetRequest(base, { default: '98', unified7d: '' }).body, null, 'unchanged rows send nothing');
+  assert.deepEqual(fleetRequest(base, { default: '95%' }).body, { expected: base, buckets: { default: 95 } });
+  assert.deepEqual(fleetRequest(base, { unified7dFable: '' }).body, { expected: base, buckets: { unified7dFable: null } });
+  assert.deepEqual(fleetRequest(base, { unified5h: ' 99.5 ', tokens: '90' }).body.buckets, { unified5h: 99.5, tokens: 90 });
+  assert.deepEqual(fleetRequest(base, { default: ' ' }), { body: null, invalid: ['default'], emptyDefault: true });
+  assert.deepEqual(fleetRequest(base, { default: '', unified7d: '98.55', tokens: '0' }), { body: null, invalid: ['default', 'unified7d', 'tokens'], emptyDefault: true });
+  assert.deepEqual(fleetRequest(base, { default: '1e2' }), { body: null, invalid: ['default'], emptyDefault: false });
+});
+
+test('fleet: each reply status reads distinctly, rows named as the table names them', () => {
+  assert.deepEqual(fleetOutcome(200, { ok: true, switchThreshold: 0.95 }), { kind: 'ok', text: 'Saved and applied.' });
+  const conflict = fleetOutcome(409, { ok: false, error: 'changed elsewhere', current: { default: 0.9, unified7dFable: 1 } });
+  assert.equal(conflict.conflict, true);
+  assert.deepEqual(conflict.current, { default: 0.9, unified7dFable: 1 });
+  assert.equal(conflict.text, 'Not saved: changed elsewhere since you opened this. Now: Default 90%, Fable weekly 100%.');
+  assert.equal(fleetOutcome(400, { ok: false, errors: [{ field: 'buckets.default', message: 'the fleet default cannot be cleared; set a percentage' }] }).text,
+    'Not saved: Default: the fleet default cannot be cleared; set a percentage');
+  assert.equal(fleetOutcome(400, { ok: false, errors: [{ field: 'expected', message: 'bad' }] }).text, 'Not saved: bad');
+  assert.match(fleetOutcome(501, {}).text, /Update TeamClaude/);
+  assert.match(fleetOutcome(404, { error: 'unknown teamclaude control route' }).text, /Update TeamClaude/, 'an older proxy has no route');
+  assert.equal(fleetOutcome(500, { ok: false, persisted: true, error: 'reload failed' }).kind, 'warn');
+  assert.match(fleetOutcome(500, { ok: false, persisted: true, error: 'reload failed' }).text, /Reload config/);
+  assert.equal(fleetOutcome(500, { ok: false, persisted: false, error: 'disk full' }).text, 'Not saved: disk full');
+});
+
+async function openFleet(s = fixtureStatus()) {
+  const page = await renderPage(s);
+  const { dom } = page;
+  const input = bucket => dom.querySelectorAll(`#fleetBody input[data-bucket="${bucket}"]`)[0];
+  const force = bucket => dom.getElementById('fleetBody').querySelectorAll('tr').find(tr => tr.getAttribute('data-bucket') === bucket).querySelector('td.force');
+  const type = (bucket, text) => { const i = input(bucket); i.value = text; i.dispatch('input'); };
+  const sent = () => page.requests.filter(r => r.url === '/teamclaude/threshold').map(r => JSON.parse(r.init.body));
+  const save = () => dom.getElementById('saveFleet').click();
+  const controls = () => dom.querySelectorAll('#fleetBody input').concat([dom.getElementById('saveFleet')]);
+  return { ...page, input, force, type, sent, save, controls, result: dom.getElementById('fleetResult') };
+}
+
+test('fleet: the panel is static markup in Routing after #routesWrap, with a primary Save and the shared helpers', () => {
+  const html = renderDashboardHtml();
+  const start = html.indexOf('<section data-section="routing"');
+  const routing = html.slice(start, html.indexOf('<section data-section="resets"', start));
+  const panel = routing.indexOf('<section aria-labelledby="fleetThresholdTitle" id="fleetThreshold" class="route-panel">');
+  assert.ok(panel > routing.indexOf('id="routesWrap"'));
+  // A sibling of #routesWrap, not inside it, so hiding the routes table leaves it shown.
+  const wrap = routing.slice(routing.indexOf('<div id="routesWrap">'), panel);
+  assert.equal(wrap.split('<div').length, wrap.split('</div>').length);
+  assert.match(routing, /<button id="saveFleet" class="primary">Save thresholds<\/button>/);
+  for (const id of ['fleetTable', 'fleetBody', 'fleetColSwitch', 'fleetOverridden', 'fleetResult', 'fleetUseCurrent', 'fleetMissing', 'fleetEditor']) assert.ok(routing.includes(`id="${id}"`), id);
+  for (const fn of [fleetInForce, fleetRequest, fleetOutcome]) assert.ok(html.includes(fn.toString()), fn.name);
+});
+
+test('fleet: rows, names and seeding follow the status table; In force per row', async () => {
+  const page = await openFleet();
+  const rows = page.dom.getElementById('fleetBody').querySelectorAll('tr');
+  assert.deepEqual(rows.map(tr => tr.getAttribute('data-bucket')), ['default', 'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests']);
+  for (const tr of rows) {
+    const key = tr.getAttribute('data-bucket');
+    const i = tr.querySelectorAll('input');
+    assert.equal(i.length, 1);
+    assert.equal(i[0].getAttribute('type'), 'text'); assert.equal(i[0].getAttribute('inputmode'), 'decimal');
+    assert.equal(i[0].getAttribute('aria-labelledby'), `fleet-row-${key} fleetColSwitch`);
+    assert.equal(i[0].getAttribute('placeholder'), key === 'default' ? null : 'default');
+    assert.equal(i[0].getAttribute('aria-required'), key === 'default' ? 'true' : null);
+    assert.equal(tr.querySelector('td[data-label]').getAttribute('data-label'), 'Switch at');
+  }
+  assert.equal(page.input('default').value, '98');
+  assert.equal(page.input('unified7dFable').value, '100');
+  for (const k of ['unified5h', 'unified7d', 'unified7dSonnet', 'tokens', 'requests']) {
+    assert.equal(page.input(k).value, '', k);
+    assert.equal(page.force(k).textContent, '98% · default', k);
+  }
+  assert.equal(page.force('default').textContent, '98%');
+  assert.equal(page.force('unified7dFable').textContent, '100% · override');
+  assert.equal(page.dom.getElementById('fleetEditor').hidden, false);
+  assert.equal(page.dom.getElementById('fleetMissing').hidden, true);
+});
+
+test('fleet: the panel renders with no configured routes, while #routesWrap is hidden', async () => {
+  const page = await openFleet();
+  assert.equal(page.dom.getElementById('routesWrap').style.display, 'none');
+  assert.equal(page.dom.getElementById('fleetBody').querySelectorAll('tr').length, 7);
+});
+
+test('fleet: an older proxy with no switchThreshold shows one line and no table', async () => {
+  const s = fixtureStatus(); delete s.switchThreshold; delete s.switchThresholds;
+  const page = await openFleet(s);
+  assert.equal(page.dom.getElementById('fleetEditor').hidden, true);
+  assert.equal(page.dom.getElementById('fleetMissing').hidden, false);
+  assert.ok(renderDashboardHtml().includes('<p class="usage" id="fleetMissing" hidden>This proxy does not report its switch threshold.</p>'));
+  assert.equal(page.dom.getElementById('fleetBody').querySelectorAll('tr').length, 0);
+});
+
+test('fleet: #fleetOverridden lists every account with its own threshold, by label or name', async () => {
+  let page = await openFleet();
+  assert.equal(page.dom.getElementById('fleetOverridden').hidden, true);
+  const s = fixtureStatus();
+  s.accounts[0].switchThreshold = 1;
+  s.accounts[1].switchThreshold = { unified7dFable: 0.995 };
+  s.accounts[1].label = 'Work';
+  s.accounts[2].switchThreshold = { default: 0.9, unified7d: 0.95 };
+  page = await openFleet(s);
+  const line = page.dom.getElementById('fleetOverridden');
+  assert.equal(line.hidden, false);
+  assert.equal(line.textContent, 'Accounts with their own threshold ignore the buckets they set: alex@personal.dev (all buckets), Work (Fable weekly), codex-primary (all buckets).');
+  await page.refresh(fixtureStatus());
+  assert.equal(line.hidden, true);
+});
+
+test('fleet: bad input and a cleared Default are refused before any request, named and focused', async () => {
+  const page = await openFleet();
+  page.type('default', '');
+  page.save();
+  assert.equal(page.sent().length, 0);
+  assert.equal(page.result.className, 'dialog-result error');
+  assert.equal(page.result.textContent, "Not saved. Default: enter a percent. The default can't be empty.");
+  assert.equal(page.input('default').getAttribute('aria-invalid'), 'true');
+  assert.equal(page.dom.focused, page.input('default'));
+  for (const bad of ['98.55', '0', '101', '1e2', 'abc']) {
+    const p = await openFleet();
+    p.type('unified7d', bad);
+    p.save();
+    assert.equal(p.sent().length, 0, bad);
+    assert.equal(p.input('unified7d').getAttribute('aria-invalid'), 'true');
+    assert.equal(p.input('unified7d').getAttribute('aria-describedby'), 'fleetResult');
+    assert.match(p.result.textContent, /Weekly: enter a percent from 1 to 100, at most one decimal/);
+    p.type('unified7d', '9');
+    assert.equal(p.input('unified7d').getAttribute('aria-invalid'), null);
+  }
+});
+
+test('fleet: a save sends only changed rows under the status table, re-polls, and renders each reply', async () => {
+  const page = await openFleet();
+  page.save();
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.result.textContent, 'No changes to save.');
+
+  page.type('default', '95');
+  page.save();
+  assert.equal(page.requests[0].url, '/teamclaude/threshold');
+  assert.equal(page.requests[0].init.method, 'POST');
+  assert.deepEqual(page.sent()[0], { expected: { default: 0.98, unified7dFable: 1 }, buckets: { default: 95 } });
+  assert.equal(page.result.textContent, 'Saving...');
+  assert.ok(page.controls().every(c => c.disabled), 'disabled while pending');
+  await page.answer(200, { ok: true, switchThreshold: { default: 0.95, unified7dFable: 1 } });
+  assert.equal(page.result.className, 'dialog-result ok');
+  assert.equal(page.result.textContent, 'Saved and applied.');
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the editor re-polls after a reply');
+  const next = fixtureStatus(); next.switchThreshold = 0.95; next.switchThresholds = { default: 0.95, unified7dFable: 1 };
+  await page.answer(200, next);
+  assert.equal(page.input('default').value, '95');
+  assert.equal(page.force('unified7d').textContent, '95% · default');
+  assert.ok(page.controls().every(c => !c.disabled));
+
+  page.type('unified7dFable', '');
+  page.save();
+  assert.deepEqual(page.sent()[0], { expected: { default: 0.95, unified7dFable: 1 }, buckets: { unified7dFable: null } });
+  const replies = [
+    [400, { ok: false, errors: [{ field: 'buckets.unified7dFable', message: 'a percentage from 1 to 100 with at most one decimal' }] }, 'error', /^Not saved: Fable weekly: a percentage/],
+    [500, { ok: false, persisted: true, error: 'reload failed' }, 'warn', /Reload config/],
+    [500, { ok: false, persisted: false, error: 'disk full' }, 'error', /^Not saved: disk full$/],
+    [501, { ok: false, error: 'not supported' }, 'error', /Update TeamClaude/],
+  ];
+  for (const [status, reply, kind, text] of replies) {
+    await page.answer(status, reply);
+    assert.equal(page.result.className, 'dialog-result ' + kind, String(status));
+    assert.match(page.result.textContent, text);
+    if (status === 400) assert.equal(page.input('unified7dFable').getAttribute('aria-invalid'), 'true');
+    assert.equal(page.requests[0].url, '/teamclaude/status', String(status));
+    await page.answer(200, next);
+    page.save();
+  }
+  page.requests.shift().resolve(Promise.reject(new Error('timed out')));
+  await new Promise(r => setImmediate(r));
+  assert.equal(page.result.textContent, 'Could not confirm the change. Refresh status before retrying. timed out');
+});
+
+test('fleet: a 409 shows the table now, focuses Use current, which adopts it and keeps typed fields', async () => {
+  const page = await openFleet();
+  page.type('unified7d', '97');
+  page.save();
+  await page.answer(409, { ok: false, error: 'changed elsewhere', current: { default: 0.9, unified7dFable: 1, unified5h: 0.95 } });
+  assert.equal(page.result.className, 'dialog-result error');
+  assert.match(page.result.textContent, /changed elsewhere.*Now: Default 90%, 5-hour 95%, Fable weekly 100%\./);
+  const useCurrent = page.dom.getElementById('fleetUseCurrent');
+  assert.equal(useCurrent.hidden, false);
+  await page.answer(200, fixtureStatus());
+  assert.equal(page.dom.focused, useCurrent);
+  useCurrent.click();
+  assert.equal(useCurrent.hidden, true);
+  assert.equal(page.dom.focused, page.dom.getElementById('saveFleet'));
+  assert.equal(page.input('unified7d').value, '97', 'typed value kept');
+  assert.equal(page.input('default').value, '90', 'untouched rows re-seed from the adopted table');
+  assert.equal(page.input('unified5h').value, '95');
+  page.save();
+  assert.deepEqual(page.sent()[0], { expected: { default: 0.9, unified7dFable: 1, unified5h: 0.95 }, buckets: { unified7d: 97 } });
+});
+
+test('fleet: a poll re-seeds untouched rows; once a row is touched the baseline stays', async () => {
+  const page = await openFleet();
+  const next = fixtureStatus(); next.switchThreshold = 0.9; next.switchThresholds = { default: 0.9 };
+  await page.refresh(next);
+  assert.equal(page.input('default').value, '90');
+  assert.equal(page.input('unified7dFable').value, '');
+  page.type('tokens', '80');
+  await page.refresh(fixtureStatus());
+  assert.equal(page.input('tokens').value, '80');
+  assert.equal(page.input('default').value, '90', 'the baseline it was typed against');
+  assert.equal(page.force('default').textContent, '98%', 'In force follows status');
+  page.save();
+  assert.deepEqual(page.sent()[0], { expected: { default: 0.9 }, buckets: { tokens: 80 } });
+});
+
+test('fleet: controls are disabled while disconnected; a reply after sign-out renders nothing', async () => {
+  const page = await openFleet();
+  assert.ok(page.controls().every(c => !c.disabled));
+  await page.refresh({}, 500);
+  assert.ok(page.controls().every(c => c.disabled));
+  page.dom.getElementById('saveFleet').click();
+  assert.equal(page.sent().length, 0);
+
+  const other = await openFleet();
+  other.type('default', '95');
+  other.save();
+  other.dom.getElementById('logout').click();
+  await other.answer(200, { ok: true, switchThreshold: 0.95 });
+  assert.doesNotMatch(other.result.textContent, /Saved|Not saved/);
+  assert.equal(other.requests.filter(r => r.url === '/teamclaude/status').length, 0, 'no re-poll into the new session');
+});
+
+test('fleet: the panel CSS adds no identity tint or grade token, and the mobile rules cover its Save and Use current', () => {
+  const html = renderDashboardHtml();
+  const css = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+  const rules = css.split('}').map(chunk => chunk.split('{').slice(-2)).filter(([sel]) => sel && /#fleet/.test(sel));
+  assert.ok(rules.length >= 3);
+  for (const [sel, body] of rules) assert.doesNotMatch(body, /--accent|--claude|--codex|--grade-/, sel);
+  assert.match(css, /#limitsUseCurrent,#fleetUseCurrent \{ width:100%; min-height:44px; \}/);
+});
+
+test('fleet: Save starts disabled and stays so when the first status poll fails', async () => {
+  const dom = fakeDom();
+  const page = bootPage({ dom });
+  assert.equal(dom.getElementById('saveFleet').disabled, true, 'before any status');
+  await page.answer(500, {});
+  assert.equal(dom.getElementById('err').style.display, 'block');
+  assert.equal(dom.getElementById('saveFleet').disabled, true);
+  assert.equal(dom.getElementById('fleetUseCurrent').disabled, true);
+  dom.getElementById('saveFleet').click();
+  assert.equal(page.requests.filter(r => r.url === '/teamclaude/threshold').length, 0);
 });

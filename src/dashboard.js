@@ -1252,6 +1252,75 @@ export function limitsOutcome(status, res, reset) {
   return { kind: 'error', text: 'Not saved: ' + detail };
 }
 
+// ---- Fleet switch thresholds (Routing section, FR 9-15) ----
+
+/**
+ * The In force cell of one fleet row (FR 9): the value the router uses for
+ * that bucket (fleetFor), and for a bucket whether the fleet table overrides
+ * it or it falls back to the default. The Default row reads the bare value.
+ * @param {string} bucket  'default' or a THRESHOLD_BUCKET_KEYS key
+ * @param {number|null|undefined} fleetThreshold  status.switchThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds  status.switchThresholds
+ * @returns {string}
+ */
+export function fleetInForce(bucket, fleetThreshold, fleetThresholds) {
+  var text = Math.round(fleetFor(bucket, fleetThreshold, fleetThresholds) * 1000) / 10 + '%';
+  if (bucket === 'default') return text;
+  return text + (storedPercent(fleetThresholds, bucket) != null ? ' · override' : ' · default');
+}
+
+/**
+ * The body a fleet threshold save sends (FR 10-12): only the changed rows, as
+ * numbers, under the table the page was showing. `drafts` maps 'default' or a
+ * bucket to the text of each touched input. A cleared bucket sends null, which
+ * drops its override; a cleared Default is refused (`emptyDefault`), because
+ * the fleet always has one. Same parse and no-change rules as limitsRequest.
+ * @param {Record<string, number>} baseline  { default: status.switchThreshold, ...status.switchThresholds }
+ * @param {Record<string, string>} drafts
+ * @returns {{ body: { expected: Record<string, number>, buckets: Record<string, number|null> }|null, invalid: string[], emptyDefault: boolean }}
+ */
+export function fleetRequest(baseline, drafts) {
+  var d = drafts || {};
+  /** @type {Record<string, string>} */
+  var named = {};
+  Object.keys(d).forEach(function (k) { named['switchThreshold:' + k] = d[k]; });
+  var r = limitsRequest('', { switchThreshold: baseline, maxUsage: null }, named, ['default'].concat(THRESHOLD_BUCKET_KEYS));
+  var emptyDefault = d.default != null && String(d.default).trim() === '';
+  var invalid = (emptyDefault ? ['default'] : []).concat(r.invalid.map(function (b) { return b.bucket; }));
+  var body = invalid.length || !r.body ? null : { expected: baseline, buckets: r.body.switchThreshold.buckets };
+  return { body: body, invalid: invalid, emptyDefault: emptyDefault };
+}
+
+/**
+ * What to tell the operator after a fleet save (FR 14). 409 and 400 name rows
+ * the way the fleet table does; a proxy without the endpoint (404 from an
+ * older one, 501) says to update; the rest read as the account editor's.
+ * @param {number} status
+ * @param {any} res  the parsed reply body
+ * @returns {{ kind: 'ok'|'warn'|'error', text: string, conflict?: boolean, current?: any, errors?: Array<{ field?: string, message?: string }> }}
+ */
+export function fleetOutcome(status, res) {
+  var r = res || {};
+  /** @param {string} k */
+  var rowLabel = function (k) { return k === 'default' ? 'Default' : bucketLabel(k); };
+  if (status === 409) {
+    var now = ['default'].concat(THRESHOLD_BUCKET_KEYS).map(function (k) {
+      var p = storedPercent(r.current, k);
+      return p == null ? '' : rowLabel(k) + ' ' + p + '%';
+    }).filter(function (t) { return !!t; }).join(', ');
+    return { kind: 'error', conflict: true, current: r.current || null, text: 'Not saved: changed elsewhere since you opened this. Now: ' + (now || 'unknown') + '.' };
+  }
+  if (status === 400) {
+    var named = (r.errors || []).map(/** @param {{ field?: string, message?: string }} e */ function (e) {
+      var m = /^buckets\.(\w+)$/.exec(String(e.field || ''));
+      return (m ? rowLabel(m[1]) + ': ' : '') + e.message;
+    });
+    return { kind: 'error', errors: r.errors || [], text: 'Not saved: ' + (named.join('. ') || r.error || 'status 400') };
+  }
+  if (status === 404 || status === 501) return { kind: 'error', text: 'Not saved: this proxy cannot edit the fleet threshold. Update TeamClaude and restart it.' };
+  return limitsOutcome(status, res);
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
@@ -1259,6 +1328,7 @@ const SHARED_HELPERS = [
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
   currentFor, accountLabel, gatingUtilization, quotaGate, latestReset,
   offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, limitsOutcome,
+  fleetInForce, fleetRequest, fleetOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1589,6 +1659,9 @@ const PAGE = `<!doctype html>
   .limits .force { font-family:var(--mono); font-variant-numeric:tabular-nums; font-size:11.5px; line-height:1.55; color:var(--dim); overflow-wrap:anywhere; }
   .limits .force b,.limits .force span { display:block; }
   .limits .force b { color:var(--text); font-weight:600; }
+  #fleetThreshold { margin-top:26px; }
+  #fleetThreshold .limits-body { padding:6px 20px 12px; max-width:680px; }
+  #fleetTable thead th:nth-child(1) { width:150px; } #fleetTable thead th:nth-child(2) { width:130px; }
   .limits-actions { display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:14px; }
   #accountDetails .quota { margin:18px 0; }
   #accountDetails .quota-reset { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
@@ -1599,7 +1672,7 @@ const PAGE = `<!doctype html>
   @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); grid-template-rows:auto 1fr; } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; flex-wrap:wrap; gap:6px; margin-top:16px; } nav a { padding:10px 12px; border:1px solid var(--line); border-left-width:3px; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; }
     #routes thead { display:none; } #routes,#routes tbody,#routes tr,#routes td { display:block; width:100%; } #routes tr { padding:12px 0; border-bottom:1px solid var(--line); } #routes tr:last-child { border-bottom:0; } #routes tr[data-provider] { border-left:3px solid var(--other); } #routes tr[data-provider="anthropic"] { border-left-color:var(--claude); } #routes tr[data-provider="codex"] { border-left-color:var(--codex); } #routes tr[data-provider] td:first-child { border-left:0; padding-left:16px; } #routes td { border:0; padding:3px 16px; } #routes td[data-label]::before { content:attr(data-label) ": "; color:var(--dim); } #routes .route-actions { padding-top:4px; gap:0 8px; } #routes .route-actions .chip { flex-basis:100%; } #routes .route-actions .act { min-height:44px; } }
   @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:40px; padding:6px 13px; } .route-panel .section-head,.route-strip .section-head { flex-direction:row; flex-wrap:wrap; } .strip-line { grid-template-columns:1fr; gap:4px; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .route-actions .act { width:auto; border-top:0; padding:2px 0; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } #keybox { margin:10vh 16px; padding:24px; } }
-  @media(max-width:650px) { .limits thead { display:none; } .limits,.limits tbody { display:block; width:100%; } .limits tr { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px 12px; padding:12px 0; border-bottom:1px solid var(--line); } .limits tr:last-child { border-bottom:0; } .limits th,.limits td { display:block; padding:0; border:0; } .limits th[scope="row"],.limits td.force { grid-column:1 / -1; } .limits th .badge { margin-left:6px; } .limits td[data-label] { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; } .limits td[data-label]::before { content:attr(data-label); grid-column:1 / -1; color:var(--dim); font-size:12px; margin-bottom:4px; } .limits input { width:100%; min-height:44px; } .limits-actions button,#limitsUseCurrent { width:100%; min-height:44px; } }
+  @media(max-width:650px) { .limits thead { display:none; } .limits,.limits tbody { display:block; width:100%; } .limits tr { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px 12px; padding:12px 0; border-bottom:1px solid var(--line); } .limits tr:last-child { border-bottom:0; } .limits th,.limits td { display:block; padding:0; border:0; } .limits th[scope="row"],.limits td.force { grid-column:1 / -1; } .limits th .badge { margin-left:6px; } .limits td[data-label] { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; } .limits td[data-label]::before { content:attr(data-label); grid-column:1 / -1; color:var(--dim); font-size:12px; margin-bottom:4px; } .limits input { width:100%; min-height:44px; } .limits-actions button,#limitsUseCurrent,#fleetUseCurrent { width:100%; min-height:44px; } #fleetTable tr { grid-template-columns:minmax(0,1fr); } }
   @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } .reset-table tr[data-provider] { border-left:3px solid var(--other); } .reset-table tr[data-provider="anthropic"] { border-left-color:var(--claude); } .reset-table tr[data-provider="codex"] { border-left-color:var(--codex); } .reset-table tr[data-provider] td:first-child { border-left:0; padding-left:16px; } .mini { grid-template-columns:90px minmax(0,1fr) 96px; } .reveal { width:100%; min-height:44px; } }
 </style>
 </head>
@@ -1638,7 +1711,12 @@ const PAGE = `<!doctype html>
         <div class="section-head"><div><h2 id="modelRoutingTitle">Expected routing per model</h2><p class="sub">Representative models, based on the latest router status</p></div><button id="routingManualSelection">Manual selection</button></div>
         <div class="provider-routing" id="providerRouting"></div><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
       </section>
-      <div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
+      <div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div>
+      <section aria-labelledby="fleetThresholdTitle" id="fleetThreshold" class="route-panel">
+        <div class="section-head"><div><h2 id="fleetThresholdTitle">Switch thresholds</h2><p class="sub">Rotation leaves an account when a bucket reaches this share. An account's own threshold (in Details) outranks every value here.</p></div></div>
+        <div class="limits-body"><p class="usage" id="fleetMissing" hidden>This proxy does not report its switch threshold.</p><div id="fleetEditor"><table class="limits" id="fleetTable"><thead><tr><th scope="col">Bucket</th><th scope="col" id="fleetColSwitch">Switch at</th><th scope="col">In force</th></tr></thead><tbody id="fleetBody"></tbody></table><p class="usage" id="fleetOverridden" hidden></p><div class="limits-actions"><span></span><button id="saveFleet" class="primary">Save thresholds</button></div><div id="fleetResult" class="dialog-result" role="status"></div><button id="fleetUseCurrent" hidden>Use current</button></div></div>
+        <p class="routing-help">Tokens and requests apply to API-key accounts. Changes apply to new requests at once, no restart.</p>
+      </section></section>
     <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table><div id="resetReveal"></div></div><p class="usage" id="resetHistoryNote"></p></section>
     <section data-section="forecast" hidden class="section-body" id="forecastSection">
       <div class="section-head"><div><h2>Subscription forecasts</h2><p class="sub">Account usage includes every machine using that subscription.</p></div><label>Work horizon <select id="forecastHorizon"><option value="2">2 hours</option><option value="8" selected>8 hours</option><option value="24">1 day</option><option value="72">3 days</option><option value="168">7 days</option></select></label></div>
@@ -2215,6 +2293,163 @@ ${SHARED_HELPERS}
     var result = document.getElementById('limitsResult'); result.className = 'dialog-result';
     result.textContent = 'Using the values as they are now. Check your edits, then save again.';
     saveLimitsButton.focus();
+  }
+
+  // ---- Fleet switch thresholds (Routing, FR 9-15) ----
+  // Same model as the limits editor: rows are built once and refreshed in
+  // place. Untouched inputs follow status and move the baseline; once any
+  // input is touched the baseline stays the table it was typed against.
+  var FLEET_KEYS = ['default'].concat(THRESHOLD_BUCKET_KEYS);
+  var fleetInputs = {};      // row key -> its input
+  var fleetForce = {};       // row key -> its In force cell
+  var fleetBaseline = null;  // { default, ...overrides } a save is checked against
+  var fleetDrafts = {};      // row key -> text of a touched input
+  var fleetPending = false;
+  var fleetConflict = null;  // the 409's current table until Use current adopts it
+  var saveFleetButton = document.getElementById('saveFleet');
+  updateFleetDisabled(); // disconnected until the first status arrives; renderFleet enables it
+
+  function fleetRowLabel(key) { return key === 'default' ? 'Default' : bucketLabel(key); }
+
+  function buildFleetRows() {
+    var body = document.getElementById('fleetBody'); body.replaceChildren();
+    FLEET_KEYS.forEach(function (key) {
+      var tr = el('tr'); tr.setAttribute('data-bucket', key);
+      var th = el('th'); th.scope = 'row';
+      var name = el('span', '', fleetRowLabel(key)); name.setAttribute('id', 'fleet-row-' + key); th.appendChild(name);
+      tr.appendChild(th);
+      var td = el('td'); td.setAttribute('data-label', 'Switch at');
+      var input = el('input');
+      input.setAttribute('type', 'text'); input.setAttribute('inputmode', 'decimal');
+      input.setAttribute('autocomplete', 'off'); input.setAttribute('spellcheck', 'false');
+      input.setAttribute('data-bucket', key);
+      input.setAttribute('aria-labelledby', 'fleet-row-' + key + ' fleetColSwitch');
+      if (key === 'default') input.setAttribute('aria-required', 'true');
+      else input.setAttribute('placeholder', 'default');
+      input.addEventListener('input', function () { fleetDrafts[key] = input.value; input.removeAttribute('aria-invalid'); });
+      input.addEventListener('keydown', function (e) { if (e.key === 'Enter') saveFleet(); });
+      td.appendChild(input);
+      var pct = el('span', 'pct', '%'); pct.setAttribute('aria-hidden', 'true'); td.appendChild(pct);
+      tr.appendChild(td);
+      var force = el('td', 'force'); tr.appendChild(force);
+      fleetInputs[key] = input; fleetForce[key] = force;
+      body.appendChild(tr);
+    });
+  }
+
+  function seedFleetInputs() {
+    FLEET_KEYS.forEach(function (key) {
+      if (Object.prototype.hasOwnProperty.call(fleetDrafts, key)) return;
+      var p = storedPercent(fleetBaseline, key);
+      fleetInputs[key].value = p == null ? '' : String(p);
+    });
+  }
+
+  // Why a fleet edit may not move an account: its own threshold outranks the
+  // fleet for every bucket it sets, and a bare number or a default sets all.
+  function ownThresholdScope(t) {
+    if (typeof t === 'number' || t.default != null) return 'all buckets';
+    return Object.keys(t).map(bucketLabel).join(', ') || 'all buckets';
+  }
+
+  function renderFleet(s) {
+    var reported = typeof s.switchThreshold === 'number';
+    document.getElementById('fleetEditor').hidden = !reported;
+    document.getElementById('fleetMissing').hidden = reported;
+    if (!reported) return;
+    if (!fleetForce.default) buildFleetRows();
+    if (!Object.keys(fleetDrafts).length) fleetBaseline = Object.assign({ default: s.switchThreshold }, s.switchThresholds || {});
+    seedFleetInputs();
+    FLEET_KEYS.forEach(function (key) { fleetForce[key].textContent = fleetInForce(key, s.switchThreshold, s.switchThresholds); });
+    var own = (s.accounts || []).filter(function (a) { return a.switchThreshold != null; });
+    var line = document.getElementById('fleetOverridden');
+    line.hidden = !own.length;
+    line.textContent = own.length ? 'Accounts with their own threshold ignore the buckets they set: '
+      + own.map(function (a) { return (a.label || a.name) + ' (' + ownThresholdScope(a.switchThreshold) + ')'; }).join(', ') + '.' : '';
+    updateFleetDisabled();
+  }
+
+  function updateFleetDisabled() {
+    var off = !connected || fleetPending;
+    FLEET_KEYS.forEach(function (key) { if (fleetInputs[key]) fleetInputs[key].disabled = off; });
+    saveFleetButton.disabled = off;
+    document.getElementById('fleetUseCurrent').disabled = off;
+  }
+
+  function markFleetInputs(bad) {
+    var first = null;
+    FLEET_KEYS.forEach(function (key) {
+      var input = fleetInputs[key];
+      if (bad.indexOf(key) === -1) { input.removeAttribute('aria-invalid'); return; }
+      input.setAttribute('aria-invalid', 'true'); input.setAttribute('aria-describedby', 'fleetResult');
+      if (!first) first = input;
+    });
+    if (first) first.focus();
+  }
+
+  function saveFleet() {
+    if (!fleetBaseline || !connected || fleetPending) return;
+    var result = document.getElementById('fleetResult');
+    var req = fleetRequest(fleetBaseline, fleetDrafts);
+    markFleetInputs(req.invalid);
+    if (req.invalid.length) {
+      result.className = 'dialog-result error';
+      result.textContent = 'Not saved. ' + req.invalid.map(function (key) {
+        return key === 'default' && req.emptyDefault ? 'Default: enter a percent. The default can\\'t be empty.'
+          : fleetRowLabel(key) + ': enter a percent from 1 to 100, at most one decimal.';
+      }).join(' ');
+      return;
+    }
+    if (!req.body) { result.className = 'dialog-result'; result.textContent = 'No changes to save.'; return; }
+    sendFleet(req.body);
+  }
+
+  async function sendFleet(body) {
+    fleetPending = true; updateFleetDisabled();
+    var generation = authGeneration;
+    var result = document.getElementById('fleetResult'); result.className = 'dialog-result'; result.textContent = 'Saving...';
+    document.getElementById('fleetUseCurrent').hidden = true; fleetConflict = null;
+    var focusUseCurrent = false;
+    try {
+      var res = await fetch('/teamclaude/threshold', {
+        method: 'POST',
+        headers: { 'x-api-key': SESSION_AUTH ? '' : localStorage.getItem(KEY) || '', 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      if (generation !== authGeneration) return;
+      var out = fleetOutcome(res.status, json);
+      result.className = 'dialog-result ' + out.kind; result.textContent = out.text;
+      // The next baseline comes from the poll below, as in the limits editor.
+      if (out.kind === 'ok') { fleetDrafts = {}; markFleetInputs([]); }
+      if (out.conflict && out.current) { fleetConflict = out.current; document.getElementById('fleetUseCurrent').hidden = false; focusUseCurrent = true; }
+      if (out.errors) markFleetInputs(out.errors.map(function (e) { return String((e || {}).field || '').replace(/^buckets\\./, ''); }));
+      await poll(true);
+    } catch (e) {
+      if (generation === authGeneration) { result.className = 'dialog-result error'; result.textContent = 'Could not confirm the change. Refresh status before retrying. ' + e.message; }
+    } finally {
+      fleetPending = false;
+      if (generation === authGeneration) {
+        updateFleetDisabled();
+        if (focusUseCurrent) document.getElementById('fleetUseCurrent').focus();
+        else if (document.activeElement === document.body) saveFleetButton.focus();
+      }
+    }
+  }
+
+  // Adopt the 409's table as the baseline; typed fields stay as typed.
+  function useCurrentFleet() {
+    if (!fleetConflict) return;
+    fleetBaseline = typeof fleetConflict === 'number' ? { default: fleetConflict } : fleetConflict;
+    fleetConflict = null;
+    document.getElementById('fleetUseCurrent').hidden = true;
+    seedFleetInputs();
+    var result = document.getElementById('fleetResult'); result.className = 'dialog-result';
+    result.textContent = 'Using the values as they are now. Check your edits, then save again.';
+    saveFleetButton.focus();
   }
 
   function emptyTable(id, text) {
@@ -2875,6 +3110,7 @@ ${SHARED_HELPERS}
     renderForecast(s.forecast);
     renderProblems(s);
     renderRoutes(s);
+    renderFleet(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
     renderSessions(s.sessions);
@@ -3147,7 +3383,7 @@ ${SHARED_HELPERS}
       document.getElementById('probe').disabled = true;
       document.getElementById('accountManual').disabled = true; updateSwitchHelp(); updateForceHelp();
       if (document.getElementById('accountDialog').open) renderAccountDetails();
-      if (lastStatus) renderRoutes(lastStatus);
+      if (lastStatus) { renderRoutes(lastStatus); renderFleet(lastStatus); }
       document.getElementById('connection').textContent = 'Disconnected';
       document.getElementById('connection').className = 'live';
       var err = document.getElementById('err'); err.style.display = 'block';
@@ -3209,6 +3445,8 @@ ${SHARED_HELPERS}
   saveLimitsButton.addEventListener('click', saveLimits);
   resetLimitsButton.addEventListener('click', function () { limitsConfirming = true; renderLimitActions(true); });
   document.getElementById('limitsUseCurrent').addEventListener('click', useCurrentLimits);
+  saveFleetButton.addEventListener('click', saveFleet);
+  document.getElementById('fleetUseCurrent').addEventListener('click', useCurrentFleet);
   document.getElementById('applySwitch').addEventListener('click', doSwitch);
   document.getElementById('forceAccount').addEventListener('change', updateForceHelp);
   document.getElementById('applyForce').addEventListener('click', applyForce);
