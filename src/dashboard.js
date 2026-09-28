@@ -1221,15 +1221,27 @@ export function limitsRequest(id, baseline, drafts, keys) {
 }
 
 /**
+ * How to reload the config from this page. The LAN dashboard hides Reload
+ * config and does not forward /teamclaude/reload, so there the step names the
+ * places that can.
+ * @param {boolean} [canReload]  false on the LAN dashboard
+ * @returns {string}
+ */
+export function reloadStep(canReload) {
+  return canReload === false ? "Reload the config from the proxy's own dashboard or the TUI" : 'Use Reload config';
+}
+
+/**
  * What to tell the operator after a limits save (FR 14), by HTTP status, since
  * each refusal needs a different next step. `errors` are the 400's field
  * errors, `current` the 409's value on disk.
  * @param {number} status
  * @param {any} res  the parsed reply body
  * @param {boolean} [reset]
+ * @param {boolean} [canReload]  false where the page has no Reload config (reloadStep)
  * @returns {{ kind: 'ok'|'warn'|'error', text: string, conflict?: boolean, current?: any, errors?: Array<{ field?: string, message?: string }> }}
  */
-export function limitsOutcome(status, res, reset) {
+export function limitsOutcome(status, res, reset, canReload) {
   var r = res || {};
   var detail = r.error || (r.errors || []).map(/** @param {{ message?: string }} e */ function (e) { return e.message; }).join(' ') || 'status ' + status;
   if (status === 200 && r.ok) return { kind: 'ok', text: reset ? 'Reset. This account now inherits the fleet threshold and has no cap.' : 'Saved and applied.' };
@@ -1248,7 +1260,7 @@ export function limitsOutcome(status, res, reset) {
   }
   if (status === 404) return { kind: 'error', text: 'Not saved: this account is no longer in the config. Close and reopen from the refreshed list.' };
   if (status === 501) return { kind: 'error', text: 'Not saved: this proxy cannot edit limits. Update TeamClaude and restart it.' };
-  if (r.persisted === true) return { kind: 'warn', text: 'Saved, but not applied: ' + detail + '. Use Reload config to apply it.' };
+  if (r.persisted === true) return { kind: 'warn', text: 'Saved, but not applied: ' + detail + '. ' + reloadStep(canReload) + ' to apply it.' };
   return { kind: 'error', text: 'Not saved: ' + detail };
 }
 
@@ -1297,9 +1309,10 @@ export function fleetRequest(baseline, drafts) {
  * older one, 501) says to update; the rest read as the account editor's.
  * @param {number} status
  * @param {any} res  the parsed reply body
+ * @param {boolean} [canReload]  as limitsOutcome's
  * @returns {{ kind: 'ok'|'warn'|'error', text: string, conflict?: boolean, current?: any, errors?: Array<{ field?: string, message?: string }> }}
  */
-export function fleetOutcome(status, res) {
+export function fleetOutcome(status, res, canReload) {
   var r = res || {};
   /** @param {string} k */
   var rowLabel = function (k) { return k === 'default' ? 'Default' : bucketLabel(k); };
@@ -1318,7 +1331,7 @@ export function fleetOutcome(status, res) {
     return { kind: 'error', errors: r.errors || [], text: 'Not saved: ' + (named.join('. ') || r.error || 'status 400') };
   }
   if (status === 404 || status === 501) return { kind: 'error', text: 'Not saved: this proxy cannot edit the fleet threshold. Update TeamClaude and restart it.' };
-  return limitsOutcome(status, res);
+  return limitsOutcome(status, res, false, canReload);
 }
 
 const SHARED_HELPERS = [
@@ -1327,7 +1340,7 @@ const SHARED_HELPERS = [
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
   currentFor, accountLabel, gatingUtilization, quotaGate, latestReset,
-  offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, limitsOutcome,
+  offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, reloadStep, limitsOutcome,
   fleetInForce, fleetRequest, fleetOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -2165,7 +2178,7 @@ ${SHARED_HELPERS}
       + (a.backend === true ? ' This backend reports no Anthropic quota buckets.' : '');
     var blocked = document.getElementById('limitsBlocked');
     blocked.hidden = !!a.id;
-    blocked.textContent = a.id ? '' : 'This account has no config id yet. Use Reload config, then reopen Details.';
+    blocked.textContent = a.id ? '' : 'This account has no config id yet. ' + reloadStep(!SESSION_AUTH) + ', then reopen Details.';
     updateLimitsDisabled(a);
   }
 
@@ -2260,7 +2273,7 @@ ${SHARED_HELPERS}
       if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
       if (generation !== authGeneration) return;
-      var out = limitsOutcome(res.status, json, reset);
+      var out = limitsOutcome(res.status, json, reset, !SESSION_AUTH);
       result.className = 'dialog-result ' + out.kind; result.textContent = out.text;
       // The reply carries the stored values, not the sanitised form status
       // shows, so the next baseline comes from the poll below: with no drafts
@@ -2421,7 +2434,7 @@ ${SHARED_HELPERS}
       if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
       var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
       if (generation !== authGeneration) return;
-      var out = fleetOutcome(res.status, json);
+      var out = fleetOutcome(res.status, json, !SESSION_AUTH);
       result.className = 'dialog-result ' + out.kind; result.textContent = out.text;
       // The next baseline comes from the poll below, as in the limits editor.
       if (out.kind === 'ok') { fleetDrafts = {}; markFleetInputs([]); }

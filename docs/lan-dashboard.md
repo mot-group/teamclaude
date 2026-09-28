@@ -4,7 +4,16 @@ The dashboard runs alongside the proxy as a separate Node process. It shows acco
 
 The password gate applies to every data request, including localhost. The dashboard stores a salted scrypt password hash on disk and uses random, HttpOnly, SameSite=Strict session cookies. Sessions expire after 12 hours, on logout, or when the dashboard restarts. It rate-limits sign-in attempts. Passwords and proxy keys are not stored in browser storage in this mode.
 
-The LAN listener accepts only status, quota, and account switching after login. It does not forward inference traffic or arbitrary proxy controls. The existing proxy dashboard and API-key authentication remain available separately.
+After sign-in, the LAN listener forwards only these requests to the proxy:
+
+- `GET /teamclaude/status`, `/teamclaude/quota` and `/teamclaude/forecast`, which fill the page.
+- `POST /teamclaude/switch`, from **Manual selection**.
+- `POST /teamclaude/routes/override`, from **Force** and **Clear force** on a route row.
+- `POST /teamclaude/accounts/label`, from **Save name** in an account's Details dialog.
+- `POST /teamclaude/accounts/limits`, from **Save limits** and **Reset to inherited** in the same dialog's Rotation limits table.
+- `POST /teamclaude/threshold`, from **Save thresholds** under Routing > Switch thresholds.
+
+Anything else gets a 404. The listener checks each write's shape and rebuilds the body from the fields it names before forwarding it, so an unknown field never reaches the proxy. The two limit routes also refuse any percent that isn't 1 to 100 with at most one decimal. See [editing limits from the dashboard](quota.md#editing-limits-from-the-dashboard) for what those saves do. The listener does not forward inference traffic or any other proxy control. **Reload config** and **Probe quotas** work only on the proxy's own dashboard. The existing proxy dashboard and API-key authentication remain available separately.
 
 ## Start
 

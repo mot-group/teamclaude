@@ -13,7 +13,7 @@ import {
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows, RESET_WINDOW_BUCKETS,
   currentFor, accountLabel, gatingUtilization, quotaGate,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder, forecastWindowLabel, bucketLabel,
-  offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, limitsOutcome,
+  offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, reloadStep, limitsOutcome,
   fleetInForce, fleetRequest, fleetOutcome,
 } from '../src/dashboard.js';
 
@@ -788,7 +788,7 @@ test('the page ships the same helper implementations it is tested against', () =
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null, dom = null } = {}) {
+function bootPage({ storedKey = null, dom = null, sessionAuth = false } = {}) {
   const els = new Map();
   const stubEl = () => {
     const target = { style: {}, value: '', textContent: '', className: '', disabled: false };
@@ -813,7 +813,7 @@ function bootPage({ storedKey = null, dom = null } = {}) {
   const window = { addEventListener() {} };
   const location = { hash: '' };
   const history = {};
-  const html = renderDashboardHtml();
+  const html = renderDashboardHtml({ sessionAuth });
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
   new Function('window', 'document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', 'AbortSignal', 'Intl', 'history', 'location', script)(
     window, document, localStorage, fetch, () => 1, () => {}, AbortSignal, Intl, history, location);
@@ -1405,9 +1405,9 @@ function fixtureStatus() {
 
 // Boot the page against the fake DOM and answer its first poll. A render error
 // lands in #err (poll's catch), so it is asserted away here rather than hidden.
-async function renderPage(status = fixtureStatus()) {
+async function renderPage(status = fixtureStatus(), { sessionAuth = false } = {}) {
   const dom = fakeDom();
-  const page = bootPage({ dom });
+  const page = bootPage({ dom, sessionAuth });
   await page.answer(200, status);
   assert.notEqual(dom.getElementById('err').style.display, 'block', dom.getElementById('err').textContent);
   const rowFor = name => dom.querySelectorAll('tr.account-row').find(r => r.querySelector('.account-name').textContent === name);
@@ -2400,6 +2400,40 @@ test('limits: each reply status reads distinctly', () => {
   assert.match(limitsOutcome(501, { ok: false }).text, /Update TeamClaude/);
 });
 
+test('limits: the reload step names Reload config only where the page has it', () => {
+  const lan = "Reload the config from the proxy's own dashboard or the TUI";
+  assert.equal(reloadStep(), 'Use Reload config');
+  assert.equal(reloadStep(true), 'Use Reload config');
+  assert.equal(reloadStep(false), lan);
+  const half = { ok: false, persisted: true, error: 'reload failed' };
+  assert.equal(limitsOutcome(500, half, false, true).text, 'Saved, but not applied: reload failed. Use Reload config to apply it.');
+  assert.deepEqual(limitsOutcome(500, half, false, false), { kind: 'warn', text: 'Saved, but not applied: reload failed. ' + lan + ' to apply it.' });
+  assert.equal(fleetOutcome(500, half, true).text, 'Saved, but not applied: reload failed. Use Reload config to apply it.');
+  assert.equal(fleetOutcome(500, half, false).text, 'Saved, but not applied: reload failed. ' + lan + ' to apply it.');
+});
+
+test('limits: on the LAN dashboard, where Reload config is hidden, the page points at the proxy dashboard or the TUI', async () => {
+  const s = limitsStatus(); s.accounts[0].id = null;
+  const proxyPage = await openLimits(s, 'alex@personal.dev');
+  assert.equal(proxyPage.dom.getElementById('limitsBlocked').textContent, 'This account has no config id yet. Use Reload config, then reopen Details.');
+
+  const lan = await openLimits(s, 'alex@personal.dev', { sessionAuth: true });
+  assert.equal(lan.dom.getElementById('reload').hidden, true);
+  assert.equal(lan.dom.getElementById('limitsBlocked').textContent,
+    "This account has no config id yet. Reload the config from the proxy's own dashboard or the TUI, then reopen Details.");
+
+  // A save that lands but fails to reload, on each page.
+  const halfSaved = async opts => {
+    const page = await openLimits(limitsStatus(), 'alex@personal.dev', opts);
+    page.type('switchThreshold', 'default', '100');
+    page.save();
+    await page.answer(500, { ok: false, persisted: true, applied: false, error: 'reload failed' });
+    return page.result.textContent;
+  };
+  assert.equal(await halfSaved(), 'Saved, but not applied: reload failed. Use Reload config to apply it.');
+  assert.equal(await halfSaved({ sessionAuth: true }), "Saved, but not applied: reload failed. Reload the config from the proxy's own dashboard or the TUI to apply it.");
+});
+
 // fixtureStatus with config ids and the backend flag the editor reads, and a
 // fleet table with a Fable override, so "account all-buckets" has something to outrank.
 function limitsStatus() {
@@ -2409,8 +2443,8 @@ function limitsStatus() {
   return s;
 }
 
-async function openLimits(s, name) {
-  const page = await renderPage(s);
+async function openLimits(s, name, opts) {
+  const page = await renderPage(s, opts);
   page.rowFor(name).querySelector('button.act').click();
   const { dom } = page;
   const input = (field, bucket) => dom.querySelectorAll(`#limitsBody input[data-field="${field}"][data-bucket="${bucket}"]`)[0];
@@ -2603,7 +2637,7 @@ test('limits: a save sends only the changed field, nothing when clean, and rende
   const replies = [
     [400, { ok: false, errors: [{ field: 'maxUsage.buckets.unified7d', message: 'a percentage from 1 to 100 with at most one decimal' }] }, 'error', /^Not saved: Weekly Cap: a percentage from 1 to 100 with at most one decimal$/],
     [404, { ok: false, error: 'no such account' }, 'error', /no longer in the config/],
-    [500, { ok: false, persisted: true, error: 'reload failed' }, 'warn', /Reload config/],
+    [500, { ok: false, persisted: true, error: 'reload failed' }, 'warn', /Use Reload config to apply it\.$/],
     [500, { ok: false, persisted: false, error: 'disk full' }, 'error', /^Not saved: disk full$/],
     [413, { ok: false, error: 'body too large' }, 'error', /^Not saved: body too large$/],
     [501, { ok: false, error: 'not supported' }, 'error', /Update TeamClaude/],
@@ -2885,7 +2919,7 @@ test('fleet: a save sends only changed rows under the status table, re-polls, an
   assert.deepEqual(page.sent()[0], { expected: { default: 0.95, unified7dFable: 1 }, buckets: { unified7dFable: null } });
   const replies = [
     [400, { ok: false, errors: [{ field: 'buckets.unified7dFable', message: 'a percentage from 1 to 100 with at most one decimal' }] }, 'error', /^Not saved: Fable weekly: a percentage/],
-    [500, { ok: false, persisted: true, error: 'reload failed' }, 'warn', /Reload config/],
+    [500, { ok: false, persisted: true, error: 'reload failed' }, 'warn', /Use Reload config to apply it\.$/],
     [500, { ok: false, persisted: false, error: 'disk full' }, 'error', /^Not saved: disk full$/],
     [501, { ok: false, error: 'not supported' }, 'error', /Update TeamClaude/],
   ];
