@@ -1126,9 +1126,15 @@ export class TUI {
     // Tenths of a percent are kept; anything finer is quantised so the stored
     // value is the one the screen shows.
     const v = Math.round(pct * 10) / 1000;
-    this.config.switchThreshold = v;
-    this.am.switchThreshold = v; // apply to the running rotation immediately
-    try { await this.saveConfig(this.config); }
+    // Applied now, so the running rotation follows at once, and again by the
+    // save when its turn comes: a dashboard write queued ahead of it reloads
+    // `config`, and the save would otherwise persist that value as this one.
+    const apply = () => {
+      this.config.switchThreshold = v;
+      this.am.switchThreshold = v;
+    };
+    apply();
+    try { await this.saveConfig(this.config, apply); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
     this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';

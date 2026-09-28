@@ -319,3 +319,32 @@ test('after a 200 the next routing decision uses the new fleet threshold', async
     upstream.close();
   }
 });
+
+test('a named client key is refused on both limit endpoints; the shared key is not', async () => {
+  const { calls, hook } = recorder();
+  const limits = recorder(async () => ({ switchThreshold: 1, maxUsage: null }));
+  const config = { ...CONFIG, proxy: { apiKey: 'tc-test', clientKeys: [{ name: 'laptop', key: 'tc-laptop' }] } };
+  const am = new AccountManager(ACCTS, { default: 0.98, unified7dFable: 1 });
+  const proxy = createProxyServer(am, config, { saveFleetThreshold: hook, saveAccountLimits: limits.hook });
+  const port = await listen(proxy);
+  try {
+    const account = {
+      id: 'a1',
+      expected: { switchThreshold: null, maxUsage: null },
+      switchThreshold: { buckets: { default: 100 } },
+    };
+    const send = (url, body, key) => fetch(`http://127.0.0.1:${port}${url}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key }, body: JSON.stringify(body),
+    });
+    for (const [url, body] of [['/teamclaude/threshold', SAVE], ['/teamclaude/accounts/limits', account]]) {
+      const refused = await send(url, body, 'tc-laptop');
+      assert.equal(refused.status, 403, url);
+      assert.match((await refused.json()).error, /named client key/);
+    }
+    assert.equal(calls.length + limits.calls.length, 0);
+    assert.equal((await send('/teamclaude/threshold', SAVE, 'tc-test')).status, 200);
+    assert.equal((await send('/teamclaude/accounts/limits', account, 'tc-test')).status, 200);
+  } finally {
+    proxy.close();
+  }
+});

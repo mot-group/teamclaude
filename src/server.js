@@ -735,6 +735,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Thresholds and caps decide rotation for every client of the fleet, so
+      // they are the operator's to change: the shared key, or key-less
+      // loopback. A named client key is a consumer, and gets the same answer the
+      // MCP endpoint gives it (read-only there, see modeFor in mcp-tools.js).
+      if (req.method === 'POST' && req.tcClient
+        && (req.url === '/teamclaude/accounts/limits' || req.url === '/teamclaude/threshold')) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'a named client key cannot change thresholds or caps; use the proxy key' }));
+        return;
+      }
+
       // Limits endpoint: the account dialog's switch threshold and usage cap,
       // saved together so both land or neither does. By id, like the rename.
       // Body: {"id", "expected": {"switchThreshold", "maxUsage"} as status showed

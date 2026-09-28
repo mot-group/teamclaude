@@ -596,8 +596,11 @@ async function serverCommand() {
       accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
       // Queued so a save built from this process's settings cannot land between
       // another writer's write and its reload. Its follow-up reload is the
-      // separate syncAccounts unit below.
-      saveConfig: () => queued(() => atomicConfigUpdate(async diskConfig => {
+      // separate syncAccounts unit below. `reapply` is the edit being saved,
+      // run again at the unit's turn: a reload queued ahead of it has replaced
+      // `config`, which would otherwise drop that edit.
+      saveConfig: (/** @type {unknown} */ _config, /** @type {(() => void)|undefined} */ reapply) => queued(() => atomicConfigUpdate(async diskConfig => {
+        reapply?.();
         mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;

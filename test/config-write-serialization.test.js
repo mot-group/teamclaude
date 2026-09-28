@@ -225,3 +225,32 @@ test('no code inside a queued unit calls back into the queue', async () => {
     assert.doesNotMatch(body.slice('hooks.applyChange('.length), forbidden, `an MCP unit calls back into the queue:\n${body.slice(0, 200)}`);
   }
 });
+
+test('a TUI threshold save queued behind a dashboard write persists the TUI value, not the reloaded one', async () => {
+  // The file, the running config and the manager, with a reload that copies
+  // the file into the other two the way reloadAccounts does.
+  const disk = { switchThreshold: 0.98 };
+  const config = { proxy: { port: 1 }, switchThreshold: 0.98 };
+  const am = { accounts: [], currentIndex: 0, switchThreshold: 0.98, getRoutes() { return []; } };
+  const queue = createControlQueue(async () => {
+    config.switchThreshold = disk.switchThreshold;
+    am.switchThreshold = disk.switchThreshold;
+  });
+  const g = gate();
+  // Wired like index.js: the edit runs again at the unit's turn, then the write.
+  const saveConfig = (_config, reapply) => queue.queued(async () => {
+    reapply?.();
+    disk.switchThreshold = config.switchThreshold;
+  });
+  const tui = new TUI({ accountManager: am, config, sx: null, saveConfig, syncAccounts: async () => 0, onQuit: () => {} });
+  tui.render = () => {};
+
+  const dash = queue.applyChange(async () => { await g.promise; disk.switchThreshold = 1; });
+  const edit = tui._doSetThreshold('90');
+  await drain();
+  g.release();
+  await Promise.all([dash, edit]);
+  assert.equal(disk.switchThreshold, 0.9);
+  assert.equal(config.switchThreshold, 0.9);
+  assert.equal(am.switchThreshold, 0.9);
+});
