@@ -531,6 +531,10 @@ export class TUI {
     // itself rather than the in-memory table, so it needs the serialised
     // updater; injectable so a test can drive the editor without a real config.
     updateConfig = atomicConfigUpdate,
+    // Runs the route editor's disk update and its live publication as one unit.
+    // The server passes its settings queue so no other write or reload lands
+    // between the two; standalone, it just runs the function.
+    serialize = (/** @type {() => Promise<any>} */ fn) => fn(),
     // How the header names this build, and whether a newer release is known.
     // In attach mode the account manager carries the server's own answer and
     // these are unused; the empty defaults keep the label hidden until it does.
@@ -541,6 +545,7 @@ export class TUI {
     this.config = config;
     this.saveConfig = saveConfig;
     this.updateConfig = updateConfig;
+    this.serialize = serialize;
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
     this.sx = sx;            // sx.org proxy manager (may be null)
@@ -1121,9 +1126,15 @@ export class TUI {
     // Tenths of a percent are kept; anything finer is quantised so the stored
     // value is the one the screen shows.
     const v = Math.round(pct * 10) / 1000;
-    this.config.switchThreshold = v;
-    this.am.switchThreshold = v; // apply to the running rotation immediately
-    try { await this.saveConfig(this.config); }
+    // Applied now, so the running rotation follows at once, and again by the
+    // save when its turn comes: a dashboard write queued ahead of it reloads
+    // `config`, and the save would otherwise persist that value as this one.
+    const apply = () => {
+      this.config.switchThreshold = v;
+      this.am.switchThreshold = v;
+    };
+    apply();
+    try { await this.saveConfig(this.config, apply); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
     this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
@@ -2578,18 +2589,20 @@ export class TUI {
 
     let at = -1;
     try {
-      const committed = await this.updateConfig(async disk => {
-        disk.routes = Array.isArray(disk.routes) ? disk.routes : [];
-        at = disk.routes.findIndex(r => r.name === (origName ?? name));
-        const route = { ...(at >= 0 ? disk.routes[at] : {}), name, match };
-        if (accounts.length) route.accounts = accounts; else delete route.accounts;
-        if (draft.bucket) route.bucket = draft.bucket; else delete route.bucket;
-        if (color) route.color = color; else delete route.color;
-        if (at >= 0) disk.routes[at] = route;
-        else { disk.routes.push(route); at = disk.routes.length - 1; }
+      await this.serialize(async () => {
+        const committed = await this.updateConfig(async disk => {
+          disk.routes = Array.isArray(disk.routes) ? disk.routes : [];
+          at = disk.routes.findIndex(r => r.name === (origName ?? name));
+          const route = { ...(at >= 0 ? disk.routes[at] : {}), name, match };
+          if (accounts.length) route.accounts = accounts; else delete route.accounts;
+          if (draft.bucket) route.bucket = draft.bucket; else delete route.bucket;
+          if (color) route.color = color; else delete route.color;
+          if (at >= 0) disk.routes[at] = route;
+          else { disk.routes.push(route); at = disk.routes.length - 1; }
+        });
+        this.config.routes = committed.routes || [];
+        this._publishRoutes();
       });
-      this.config.routes = committed.routes || [];
-      this._publishRoutes();
       this._addLog(`Route "${name}" saved`);
     } catch (e) {
       this._addLog(`Failed to save route: ${e.message}`);
@@ -2603,11 +2616,13 @@ export class TUI {
     const r = (this.config.routes || [])[idx];
     if (!r) return;
     try {
-      const committed = await this.updateConfig(async disk => {
-        disk.routes = (Array.isArray(disk.routes) ? disk.routes : []).filter(x => x.name !== r.name);
+      await this.serialize(async () => {
+        const committed = await this.updateConfig(async disk => {
+          disk.routes = (Array.isArray(disk.routes) ? disk.routes : []).filter(x => x.name !== r.name);
+        });
+        this.config.routes = committed.routes || [];
+        this._publishRoutes();
       });
-      this.config.routes = committed.routes || [];
-      this._publishRoutes();
       this._addLog(`Route "${r.name}" deleted`);
     } catch (e) {
       this._addLog(`Failed to save: ${e.message}`);

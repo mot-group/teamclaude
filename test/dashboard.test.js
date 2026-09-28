@@ -13,6 +13,8 @@ import {
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome, resetHistoryRows, RESET_WINDOW_BUCKETS,
   currentFor, accountLabel, gatingUtilization, quotaGate,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder, forecastWindowLabel, bucketLabel,
+  offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, reloadStep, limitsOutcome,
+  fleetInForce, fleetRequest, fleetOutcome,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -786,7 +788,7 @@ test('the page ships the same helper implementations it is tested against', () =
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null, dom = null } = {}) {
+function bootPage({ storedKey = null, dom = null, sessionAuth = false } = {}) {
   const els = new Map();
   const stubEl = () => {
     const target = { style: {}, value: '', textContent: '', className: '', disabled: false };
@@ -811,7 +813,7 @@ function bootPage({ storedKey = null, dom = null } = {}) {
   const window = { addEventListener() {} };
   const location = { hash: '' };
   const history = {};
-  const html = renderDashboardHtml();
+  const html = renderDashboardHtml({ sessionAuth });
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
   new Function('window', 'document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', 'AbortSignal', 'Intl', 'history', 'location', script)(
     window, document, localStorage, fetch, () => 1, () => {}, AbortSignal, Intl, history, location);
@@ -1403,9 +1405,9 @@ function fixtureStatus() {
 
 // Boot the page against the fake DOM and answer its first poll. A render error
 // lands in #err (poll's catch), so it is asserted away here rather than hidden.
-async function renderPage(status = fixtureStatus()) {
+async function renderPage(status = fixtureStatus(), { sessionAuth = false } = {}) {
   const dom = fakeDom();
-  const page = bootPage({ dom });
+  const page = bootPage({ dom, sessionAuth });
   await page.answer(200, status);
   assert.notEqual(dom.getElementById('err').style.display, 'block', dom.getElementById('err').textContent);
   const rowFor = name => dom.querySelectorAll('tr.account-row').find(r => r.querySelector('.account-name').textContent === name);
@@ -2270,4 +2272,741 @@ test('T6: a failed poll marks the page stale, disables the write controls but no
   await page.refresh({}, 500);
   const confirm = clearCell().querySelectorAll('.route-actions button');
   assert.deepEqual(confirm.map(b => [b.textContent, b.disabled]), [['Clear', true], ['Keep', false]]);
+});
+
+// ---- dashboard-thresholds T6: the account dialog's Rotation limits editor ----
+
+const oauth = (id, name, extra = {}) => ({ id, name, provider: 'anthropic', type: 'oauth', backend: false, ...extra });
+const codexAcct = (id, name) => ({ id, name, provider: 'codex', type: 'oauth', backend: false });
+// A configured route row as status sends it: one preview per provider its globs
+// reach, each naming the route that actually resolves its sample model.
+const routeRow = (name, bucket, previews, extra = {}) => ({ name, bucket, autocreated: false, match: previews.map(p => p.label), previews, ...extra });
+const preview = (provider, label, route, accounts) => ({ provider, label, model: label.replace(/\*/g, ''), route, accounts: accounts.map(a => ({ id: a.id, name: a.name, eligible: true })) });
+const keysOf = offered => offered.map(o => o.key);
+
+test('limits: offeredBuckets gives each account kind its own buckets, in THRESHOLD_BUCKET_KEYS order', () => {
+  assert.deepEqual(keysOf(offeredBuckets(oauth('a', 'alex'), [])), ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable']);
+  assert.deepEqual(keysOf(offeredBuckets(codexAcct('c', 'cx'), null)), ['unified5h', 'unified7d']);
+  assert.deepEqual(keysOf(offeredBuckets({ id: 'k', name: 'key', provider: 'anthropic', type: 'apikey' }, [])), ['tokens', 'requests']);
+  // The key type decides before the provider: a Codex API-key account meters tokens and requests.
+  assert.deepEqual(keysOf(offeredBuckets({ id: 'k2', name: 'cx-key', provider: 'codex', type: 'apikey', backend: false }, [])), ['tokens', 'requests']);
+  assert.deepEqual(offeredBuckets(oauth('d', 'deepseek', { backend: true }), []), []);
+  assert.deepEqual(offeredBuckets(null, []), []);
+  assert.ok(offeredBuckets(oauth('a', 'alex'), []).every(o => o.routes.length === 0), 'a kind bucket carries no route tag');
+});
+
+test('limits: a gpt-* route on Fable weekly offers the Codex account that bucket; the same route on claude-* does not', () => {
+  const cx = codexAcct('c1', 'codex-primary');
+  const claude = oauth('a1', 'alex');
+  const gpt = routeRow('gpt-fable', 'unified7dFable', [preview('codex', 'gpt-*', 'gpt-fable', [cx])]);
+  assert.deepEqual(offeredBuckets(cx, [gpt]), [{ key: 'unified5h', routes: [] }, { key: 'unified7d', routes: [] }, { key: 'unified7dFable', routes: ['gpt-fable'] }]);
+  const onClaude = routeRow('gpt-fable', 'unified7dFable', [preview('anthropic', 'claude-*', 'gpt-fable', [claude])]);
+  assert.deepEqual(keysOf(offeredBuckets(cx, [onClaude])), ['unified5h', 'unified7d']);
+  // The Claude account already has Fable weekly by kind, so the route adds no tag.
+  assert.deepEqual(offeredBuckets(claude, [onClaude]).find(o => o.key === 'unified7dFable').routes, []);
+});
+
+test('limits: of two same-name accounts, only the id the route admits is offered its bucket', () => {
+  const first = codexAcct('c1', 'shared'), second = codexAcct('c2', 'shared');
+  // The route lists `accounts: [1]`, so its preview admits the second entry only.
+  const route = routeRow('by-index', 'unified7dSonnet', [preview('codex', 'gpt-*', 'by-index', [second])], { accounts: [1] });
+  assert.deepEqual(keysOf(offeredBuckets(first, [route])), ['unified5h', 'unified7d']);
+  assert.deepEqual(keysOf(offeredBuckets(second, [route])), ['unified5h', 'unified7d', 'unified7dSonnet']);
+});
+
+test('limits: a route shadowed by an earlier one contributes only from the previews it still owns', () => {
+  const cx = codexAcct('c1', 'codex-primary');
+  const a = routeRow('A', 'unified7d', [preview('codex', 'gpt-5*', 'A', [cx])]);
+  // Fully shadowed: every sample B globs resolves to A.
+  const fullB = routeRow('B', 'unified7dFable', [preview('codex', 'gpt-5.1*', 'A', [cx]), preview('codex', 'gpt-5-mini*', 'A', [cx])]);
+  assert.deepEqual(keysOf(offeredBuckets(cx, [a, fullB])), ['unified5h', 'unified7d']);
+  // Partly shadowed: only the preview B still owns counts.
+  const partB = routeRow('B', 'unified7dFable', [preview('codex', 'gpt-5*', 'A', [cx]), preview('codex', 'o4*', 'B', [cx])]);
+  assert.deepEqual(offeredBuckets(cx, [a, partB]).find(o => o.key === 'unified7dFable'), { key: 'unified7dFable', routes: ['B'] });
+  const other = codexAcct('c2', 'codex-secondary');
+  const partForOther = routeRow('B', 'unified7dFable', [preview('codex', 'gpt-5*', 'A', [other]), preview('codex', 'o4*', 'B', [cx])]);
+  assert.deepEqual(keysOf(offeredBuckets(other, [a, partForOther])), ['unified5h', 'unified7d'], 'admitted only by the shadowed preview');
+});
+
+test('limits: autocreated rows, unknown buckets and an account with no id get no route set', () => {
+  const cx = codexAcct('c1', 'codex-primary');
+  const p = [preview('codex', 'gpt-*', 'r', [cx])];
+  assert.deepEqual(keysOf(offeredBuckets(cx, [{ ...routeRow('r', 'unified7dFable', p), autocreated: true }])), ['unified5h', 'unified7d']);
+  assert.deepEqual(keysOf(offeredBuckets(cx, [routeRow('r', 'opusWeekly', p)])), ['unified5h', 'unified7d']);
+  assert.deepEqual(keysOf(offeredBuckets(cx, [routeRow('r', null, p)])), ['unified5h', 'unified7d']);
+  const noId = { ...cx, id: null };
+  const nullPreview = [preview('codex', 'gpt-*', 'r', [noId])];
+  assert.deepEqual(keysOf(offeredBuckets(noId, [routeRow('r', 'unified7dFable', nullPreview)])), ['unified5h', 'unified7d']);
+});
+
+test('limits: thresholdSource reads account bucket, then account all-buckets, then fleet', () => {
+  assert.equal(thresholdSource({ unified7dFable: 0.995, default: 0.9 }, 'unified7dFable'), 'account bucket');
+  assert.equal(thresholdSource({ unified7dFable: 0.995, default: 0.9 }, 'unified7d'), 'account all-buckets');
+  assert.equal(thresholdSource({ unified7dFable: 0.995 }, 'unified7d'), 'fleet');
+  // A bare number is the all-buckets value, and it outranks the fleet's bucket entry.
+  assert.equal(thresholdSource(1, 'unified7dFable'), 'account all-buckets');
+  assert.equal(resolveSwitchThreshold(1, 'unified7dFable', fleetFor('unified7dFable', 0.98, { unified7dFable: 0.9 })), 1);
+  for (const none of [null, undefined, NaN, {}, []]) assert.equal(thresholdSource(none, 'unified7d'), 'fleet');
+});
+
+test('limits: parsePercent takes 1 to 100 with one decimal, forgiving whitespace and one %', () => {
+  for (const [text, n] of [['98%', 98], [' 98 ', 98], ['98', 98], ['99.5', 99.5], ['1', 1], ['100', 100], ['100.0', 100], [' 60 % ', 60]]) assert.equal(parsePercent(text), n, text);
+  for (const bad of ['98.55', '0', '101', '1e2', 'abc', '', '  ', '0.5', '-5', '98%%', '.5', '5.', '100.1', null]) assert.equal(parsePercent(bad), null, String(bad));
+});
+
+test('limits: storedPercent and limitText read what the account stores', () => {
+  assert.equal(storedPercent(1, 'default'), 100);
+  assert.equal(storedPercent(1, 'unified7d'), null, 'a bare number is the all-buckets value only');
+  assert.equal(storedPercent({ default: 0.9, unified7dFable: 0.995 }, 'unified7dFable'), 99.5);
+  assert.equal(storedPercent(1.5, 'default'), 150, 'a hand-edited cap shows as-is');
+  assert.equal(storedPercent(null, 'default'), null);
+  assert.equal(limitText(0.98, 'threshold'), '98% all buckets');
+  assert.equal(limitText({ unified7dFable: 0.995, default: 0.9 }, 'threshold'), '90% all buckets, Fable weekly 99.5%');
+  assert.equal(limitText(null, 'threshold'), 'inherited');
+  assert.equal(limitText(null, 'cap'), 'none');
+});
+
+test('limits: the request carries only changed buckets, as numbers, under the seeded expected', () => {
+  const base = { switchThreshold: { default: 0.9, unified7dFable: 0.995 }, maxUsage: null };
+  const keys = ['default', 'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable'];
+  assert.deepEqual(limitsRequest('a1', base, { 'maxUsage:unified7d': '60' }, keys).body,
+    { id: 'a1', expected: { switchThreshold: { default: 0.9, unified7dFable: 0.995 }, maxUsage: null }, maxUsage: { buckets: { unified7d: 60 } } });
+  // Clearing a stored key sends null; clearing an empty one, or retyping the stored value, sends nothing.
+  assert.deepEqual(limitsRequest('a1', base, { 'switchThreshold:unified7dFable': '', 'switchThreshold:default': '90%', 'maxUsage:default': '' }, keys).body.switchThreshold, { buckets: { unified7dFable: null } });
+  assert.equal(limitsRequest('a1', base, { 'switchThreshold:default': ' 90 ', 'maxUsage:unified5h': '' }, keys).body, null);
+  assert.equal(limitsRequest('a1', base, {}, keys).body, null);
+  // A draft for a row that is no longer shown is dropped.
+  assert.equal(limitsRequest('a1', base, { 'maxUsage:tokens': '50' }, keys).body, null);
+  const bad = limitsRequest('a1', base, { 'maxUsage:unified7d': '98.55', 'switchThreshold:unified7d': '1e2', 'switchThreshold:default': '95' }, keys);
+  assert.equal(bad.body, null);
+  assert.deepEqual(bad.invalid, [{ field: 'switchThreshold', bucket: 'unified7d' }, { field: 'maxUsage', bucket: 'unified7d' }]);
+});
+
+test('limits: each reply status reads distinctly', () => {
+  assert.deepEqual(limitsOutcome(200, { ok: true }), { kind: 'ok', text: 'Saved and applied.' });
+  assert.match(limitsOutcome(200, { ok: true }, true).text, /^Reset\. This account now inherits/);
+  const bad = limitsOutcome(400, { ok: false, errors: [{ field: 'maxUsage.unified7d', message: 'maxUsage.unified7d: at most one decimal' }] });
+  assert.equal(bad.kind, 'error'); assert.equal(bad.text, 'Not saved: maxUsage.unified7d: at most one decimal'); assert.equal(bad.errors.length, 1);
+  // The endpoint's bucket errors name the field by path; the line names it by row and column.
+  assert.equal(limitsOutcome(400, { ok: false, errors: [{ field: 'switchThreshold.buckets.default', message: 'a percentage from 1 to 100 with at most one decimal' }, { field: 'body', message: 'nothing to change' }] }).text,
+    'Not saved: All buckets Switch at: a percentage from 1 to 100 with at most one decimal. nothing to change');
+  assert.match(limitsOutcome(404, { ok: false }).text, /no longer in the config/);
+  const conflict = limitsOutcome(409, { ok: false, error: 'changed elsewhere', current: { switchThreshold: 0.98, maxUsage: null } });
+  assert.equal(conflict.conflict, true);
+  assert.equal(conflict.text, 'Not saved: changed elsewhere since you opened this. Now: switch 98% all buckets, cap none.');
+  assert.deepEqual(limitsOutcome(500, { ok: false, persisted: true, error: 'reload failed' }), { kind: 'warn', text: 'Saved, but not applied: reload failed. Use Reload config to apply it.' });
+  assert.deepEqual(limitsOutcome(500, { ok: false, persisted: false, error: 'disk full' }), { kind: 'error', text: 'Not saved: disk full' });
+  assert.deepEqual(limitsOutcome(413, { ok: false, error: 'body too large' }), { kind: 'error', text: 'Not saved: body too large' });
+  assert.match(limitsOutcome(501, { ok: false }).text, /Update TeamClaude/);
+});
+
+test('limits: the reload step names Reload config only where the page has it', () => {
+  const lan = "Reload the config from the proxy's own dashboard or the TUI";
+  assert.equal(reloadStep(), 'Use Reload config');
+  assert.equal(reloadStep(true), 'Use Reload config');
+  assert.equal(reloadStep(false), lan);
+  const half = { ok: false, persisted: true, error: 'reload failed' };
+  assert.equal(limitsOutcome(500, half, false, true).text, 'Saved, but not applied: reload failed. Use Reload config to apply it.');
+  assert.deepEqual(limitsOutcome(500, half, false, false), { kind: 'warn', text: 'Saved, but not applied: reload failed. ' + lan + ' to apply it.' });
+  assert.equal(fleetOutcome(500, half, true).text, 'Saved, but not applied: reload failed. Use Reload config to apply it.');
+  assert.equal(fleetOutcome(500, half, false).text, 'Saved, but not applied: reload failed. ' + lan + ' to apply it.');
+});
+
+test('limits: on the LAN dashboard, where Reload config is hidden, the page points at the proxy dashboard or the TUI', async () => {
+  const s = limitsStatus(); s.accounts[0].id = null;
+  const proxyPage = await openLimits(s, 'alex@personal.dev');
+  assert.equal(proxyPage.dom.getElementById('limitsBlocked').textContent, 'This account has no config id yet. Use Reload config, then reopen Details.');
+
+  const lan = await openLimits(s, 'alex@personal.dev', { sessionAuth: true });
+  assert.equal(lan.dom.getElementById('reload').hidden, true);
+  assert.equal(lan.dom.getElementById('limitsBlocked').textContent,
+    "This account has no config id yet. Reload the config from the proxy's own dashboard or the TUI, then reopen Details.");
+
+  // A save that lands but fails to reload, on each page.
+  const halfSaved = async opts => {
+    const page = await openLimits(limitsStatus(), 'alex@personal.dev', opts);
+    page.type('switchThreshold', 'default', '100');
+    page.save();
+    await page.answer(500, { ok: false, persisted: true, applied: false, error: 'reload failed' });
+    return page.result.textContent;
+  };
+  assert.equal(await halfSaved(), 'Saved, but not applied: reload failed. Use Reload config to apply it.');
+  assert.equal(await halfSaved({ sessionAuth: true }), "Saved, but not applied: reload failed. Reload the config from the proxy's own dashboard or the TUI to apply it.");
+});
+
+// fixtureStatus with config ids and the backend flag the editor reads, and a
+// fleet table with a Fable override, so "account all-buckets" has something to outrank.
+function limitsStatus() {
+  const s = fixtureStatus();
+  s.accounts.forEach((a, i) => { a.id = 'id-' + i; a.backend = false; });
+  s.switchThresholds = { default: 0.98, unified7dFable: 0.9 };
+  return s;
+}
+
+async function openLimits(s, name, opts) {
+  const page = await renderPage(s, opts);
+  page.rowFor(name).querySelector('button.act').click();
+  const { dom } = page;
+  const input = (field, bucket) => dom.querySelectorAll(`#limitsBody input[data-field="${field}"][data-bucket="${bucket}"]`)[0];
+  const rows = () => dom.getElementById('limitsBody').querySelectorAll('tr').map(tr => tr.getAttribute('data-bucket'));
+  const type = (field, bucket, text) => { const i = input(field, bucket); i.value = text; i.dispatch('input'); };
+  const force = bucket => dom.getElementById('limitsBody').querySelectorAll('tr').find(tr => tr.getAttribute('data-bucket') === bucket).querySelector('td.force');
+  const sent = () => page.requests.filter(r => r.url === '/teamclaude/accounts/limits').map(r => JSON.parse(r.init.body));
+  const save = () => dom.getElementById('saveLimits').click();
+  return { ...page, input, rows, type, force, sent, save, result: dom.getElementById('limitsResult') };
+}
+
+test('limits: the editor is static markup after the rename result, outside #accountDetails, with one script and no inline handlers', () => {
+  const html = renderDashboardHtml();
+  const start = html.indexOf('<dialog id="accountDialog"');
+  const dialog = html.slice(start, html.indexOf('</dialog>', start));
+  assert.ok(dialog.indexOf('<div id="accountDetails"></div>') !== -1, '#accountDetails stays empty markup');
+  assert.ok(dialog.indexOf('id="labelResult"') < dialog.indexOf('<section id="accountLimits"'));
+  assert.ok(dialog.indexOf('<section id="accountLimits"') < dialog.indexOf('class="dialog-actions"'));
+  assert.ok(dialog.indexOf('</section>') < dialog.indexOf('class="dialog-actions"'));
+  assert.match(dialog, /<button id="saveLimits" class="primary">Save limits<\/button>/);
+  assert.match(dialog, /<button id="resetLimits">Reset to inherited<\/button>/);
+  for (const id of ['limitsTable', 'limColSwitch', 'limColCap', 'limitsStored', 'limitsBlocked', 'limitsActions', 'resetLimits', 'saveLimits', 'limitsResult', 'limitsUseCurrent']) assert.ok(dialog.includes(`id="${id}"`), id);
+  assert.equal(html.split('<script').length, 2);
+  assert.doesNotMatch(html.slice(html.indexOf('<script>')), /innerHTML/);
+  assert.doesNotMatch(html, /\son[a-z]+="/);
+  for (const fn of [offeredBuckets, thresholdSource, parsePercent, limitText, storedPercent, limitsRequest, limitsOutcome]) assert.ok(html.includes(fn.toString()), fn.name);
+});
+
+test('limits: .limits rules use no identity tint and only --grade-at, on the invalid input', () => {
+  const html = renderDashboardHtml();
+  const css = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+  const rules = css.split('}').map(chunk => chunk.split('{').slice(-2)).filter(([sel]) => sel && /\.limits|#limitsTable|#accountLimits|#limitsUseCurrent/.test(sel));
+  assert.ok(rules.length > 5);
+  for (const [sel, body] of rules) {
+    assert.doesNotMatch(body, /--accent|--claude|--codex/, sel);
+    const grades = body.match(/--grade-[\w-]+/g) || [];
+    if (grades.length) { assert.deepEqual(grades, ['--grade-at']); assert.match(sel, /\.limits input\[aria-invalid="true"\]/); }
+  }
+});
+
+test('limits: rows follow the account kind; a route-only bucket says which route; same-name accounts are told apart', async () => {
+  const s = limitsStatus();
+  s.accounts.push({ ...s.accounts[0], id: 'id-key', name: 'api-key', type: 'apikey', quota: {} }, { ...s.accounts[0], id: 'id-ds', name: 'deepseek', backend: true, quota: {} });
+  let page = await openLimits(s, 'alex@personal.dev');
+  assert.deepEqual(page.rows(), ['default', 'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable']);
+  page = await openLimits(s, 'codex-primary');
+  assert.deepEqual(page.rows(), ['default', 'unified5h', 'unified7d']);
+  page = await openLimits(s, 'api-key');
+  assert.deepEqual(page.rows(), ['default', 'tokens', 'requests']);
+  assert.equal(page.rowFor('api-key').querySelectorAll('.account-meta')[0].textContent, 'API account');
+  page = await openLimits(s, 'deepseek');
+  assert.deepEqual(page.rows(), ['default']);
+  assert.match(page.dom.getElementById('limitsHelp').textContent, /reports no Anthropic quota buckets/);
+
+  const routed = limitsStatus();
+  // Two Codex accounts sharing a name; the route admits the second by index.
+  routed.accounts[3].name = 'codex-primary';
+  routed.routes = [routeRow('gpt-fable', 'unified7dFable', [preview('codex', 'gpt-*', 'gpt-fable', [routed.accounts[3]])])];
+  page = await renderPage(routed);
+  page.dom.querySelectorAll('tr.account-row').filter(r => r.getAttribute('data-provider') === 'codex')[1].querySelector('button.act').click();
+  const body = page.dom.getElementById('limitsBody');
+  assert.deepEqual(body.querySelectorAll('tr').map(tr => tr.getAttribute('data-bucket')), ['default', 'unified5h', 'unified7d', 'unified7dFable']);
+  const th = body.querySelectorAll('tr')[3].querySelector('th');
+  assert.equal(th.querySelector('.badge.meta').textContent, 'via route gpt-fable');
+  assert.equal(th.querySelector('.badge.meta').title, 'via route gpt-fable', 'a clipped name stays readable on hover');
+  page.dom.querySelectorAll('tr.account-row').filter(r => r.getAttribute('data-provider') === 'codex')[0].querySelector('button.act').click();
+  assert.deepEqual(body.querySelectorAll('tr').map(tr => tr.getAttribute('data-bucket')), ['default', 'unified5h', 'unified7d']);
+  const onClaude = limitsStatus();
+  onClaude.routes = [routeRow('gpt-fable', 'unified7dFable', [preview('anthropic', 'claude-*', 'gpt-fable', onClaude.accounts.slice(0, 2))])];
+  page = await openLimits(onClaude, 'codex-secondary');
+  assert.deepEqual(page.rows(), ['default', 'unified5h', 'unified7d']);
+});
+
+test('limits: inputs are named by row and column, seeded from status, with In force per bucket', async () => {
+  const s = limitsStatus();
+  s.accounts[0].switchThreshold = 1;
+  s.accounts[0].maxUsage = { unified7d: 0.6 };
+  s.accounts[1].switchThreshold = { default: 0.9, unified7dFable: 0.995 };
+  s.accounts[1].maxUsage = 0.6;
+  const page = await openLimits(s, 'alex@personal.dev');
+  const { input, force, dom } = page;
+  for (const tr of dom.getElementById('limitsBody').querySelectorAll('tr')) {
+    const bucket = tr.getAttribute('data-bucket');
+    const [sw, cap] = [tr.querySelectorAll('input[data-field="switchThreshold"]'), tr.querySelectorAll('input[data-field="maxUsage"]')];
+    assert.equal(sw.length, 1); assert.equal(cap.length, 1);
+    for (const [i, col, ph] of [[sw[0], 'limColSwitch', 'inherit'], [cap[0], 'limColCap', 'none']]) {
+      assert.equal(i.getAttribute('type'), 'text'); assert.equal(i.getAttribute('inputmode'), 'decimal');
+      assert.equal(i.getAttribute('placeholder'), ph);
+      assert.equal(i.getAttribute('aria-labelledby'), `lim-row-${bucket} ${col}`);
+    }
+    const label = tr.querySelector('th').querySelectorAll('span').find(n => n.getAttribute('id') === `lim-row-${bucket}`);
+    assert.equal(label.textContent, bucket === 'default' ? 'All buckets' : bucketLabel(bucket));
+  }
+  assert.equal(input('switchThreshold', 'default').value, '100');
+  assert.equal(input('switchThreshold', 'unified7dFable').value, '');
+  assert.equal(input('maxUsage', 'unified7d').value, '60');
+  // Account all-buckets outranks the fleet's Fable entry (0.9).
+  assert.equal(force('unified7dFable').children[0].textContent, 'switch 100% · account all-buckets');
+  assert.equal(force('unified7dFable').children[0].tagName, 'B');
+  assert.equal(force('unified7dFable').children[1].textContent, 'uncapped');
+  // The cap below the threshold binds, and the cap line is the bold one.
+  assert.equal(force('unified7d').children[1].textContent, 'cap 60% · binds');
+  assert.equal(force('unified7d').children[1].tagName, 'B');
+  assert.equal(force('unified7d').children[0].tagName, 'SPAN');
+  assert.equal(force('default').textContent, 'for buckets left empty');
+
+  const work = await openLimits(s, 'alex@work.co');
+  assert.equal(work.input('switchThreshold', 'default').value, '90');
+  assert.equal(work.input('switchThreshold', 'unified7dFable').value, '99.5');
+  assert.equal(work.input('maxUsage', 'default').value, '60');
+  assert.equal(work.force('unified7dFable').children[0].textContent, 'switch 99.5% · account bucket');
+  assert.equal(work.force('unified5h').children[0].textContent, 'switch 90% · account all-buckets');
+  const cx = await openLimits(s, 'codex-primary');
+  assert.equal(cx.force('unified7d').textContent, 'switch 98% · fleetuncapped');
+  assert.equal(cx.dom.getElementById('limitsStored').hidden, true);
+});
+
+test('limits: a stored key the dialog does not offer is shown read-only and never sent', async () => {
+  const s = limitsStatus();
+  s.accounts[0].switchThreshold = { default: 0.95, tokens: 0.9 };
+  s.accounts[0].maxUsage = { requests: 0.5 };
+  const page = await openLimits(s, 'alex@personal.dev');
+  const stored = page.dom.getElementById('limitsStored');
+  assert.equal(stored.hidden, false);
+  assert.equal(stored.textContent, 'Also stored, not editable here: Tokens switch 90%, Requests cap 50%.');
+  assert.equal(page.dom.querySelectorAll('#limitsBody input[data-bucket="tokens"]').length, 0);
+  page.type('switchThreshold', 'default', '');
+  page.save();
+  assert.deepEqual(page.sent()[0].switchThreshold, { buckets: { default: null } });
+});
+
+test('limits: bad input is refused before any request, marked, focused and named', async () => {
+  for (const bad of ['98.55', '0', '101', '1e2', 'abc']) {
+    const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+    page.type('maxUsage', 'unified7dFable', bad);
+    page.save();
+    assert.equal(page.sent().length, 0, bad);
+    const i = page.input('maxUsage', 'unified7dFable');
+    assert.equal(i.getAttribute('aria-invalid'), 'true');
+    assert.equal(page.dom.focused, i);
+    assert.equal(page.result.className, 'dialog-result error');
+    assert.match(page.result.textContent, /Fable weekly Cap: enter a percent from 1 to 100/);
+    // Editing the field clears its own mark.
+    page.type('maxUsage', 'unified7dFable', '9');
+    assert.equal(i.getAttribute('aria-invalid'), null);
+  }
+  for (const ok of ['98%', ' 98 ']) {
+    const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+    page.type('switchThreshold', 'unified7d', ok);
+    page.save();
+    assert.deepEqual(page.sent()[0].switchThreshold, { buckets: { unified7d: 98 } });
+  }
+});
+
+test('limits: a save sends only the changed field, nothing when clean, and renders each reply', async () => {
+  const s = limitsStatus();
+  s.accounts[0].switchThreshold = { default: 0.9 };
+  const page = await openLimits(s, 'alex@personal.dev');
+  page.save();
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.result.className, 'dialog-result');
+  assert.equal(page.result.textContent, 'No changes to save.');
+
+  page.type('maxUsage', 'unified7d', '60');
+  page.save();
+  assert.equal(page.requests[0].url, '/teamclaude/accounts/limits');
+  assert.equal(page.requests[0].init.method, 'POST');
+  assert.deepEqual(page.sent()[0], { id: 'id-0', expected: { switchThreshold: { default: 0.9 }, maxUsage: null }, maxUsage: { buckets: { unified7d: 60 } } });
+  assert.equal(page.result.textContent, 'Saving...');
+  assert.ok(page.dom.querySelectorAll('#limitsBody input').every(i => i.disabled), 'inputs disabled while pending');
+  assert.equal(page.dom.getElementById('saveLimits').disabled, true);
+  assert.equal(page.dom.getElementById('resetLimits').disabled, true);
+  await page.answer(200, { ok: true, switchThreshold: { default: 0.9 }, maxUsage: 0.6 });
+  assert.equal(page.result.className, 'dialog-result ok');
+  assert.equal(page.result.textContent, 'Saved and applied.');
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the editor re-polls after a reply');
+  const next = limitsStatus(); next.accounts[0].switchThreshold = { default: 0.9 }; next.accounts[0].maxUsage = { unified7d: 0.6 };
+  await page.answer(200, next);
+  assert.equal(page.force('unified7d').children[1].textContent, 'cap 60% · binds');
+  assert.equal(page.dom.getElementById('saveLimits').disabled, false);
+
+  // Clearing the stored field sends null for it. The expected is status's form,
+  // not the reply's raw values (the reply above said 0.6 for all buckets).
+  page.type('maxUsage', 'unified7d', '');
+  page.save();
+  assert.deepEqual(page.sent()[0].maxUsage, { buckets: { unified7d: null } });
+  assert.deepEqual(page.sent()[0].expected, { switchThreshold: { default: 0.9 }, maxUsage: { unified7d: 0.6 } });
+  assert.equal(page.sent()[0].switchThreshold, undefined);
+
+  const replies = [
+    [400, { ok: false, errors: [{ field: 'maxUsage.buckets.unified7d', message: 'a percentage from 1 to 100 with at most one decimal' }] }, 'error', /^Not saved: Weekly Cap: a percentage from 1 to 100 with at most one decimal$/],
+    [404, { ok: false, error: 'no such account' }, 'error', /no longer in the config/],
+    [500, { ok: false, persisted: true, error: 'reload failed' }, 'warn', /Use Reload config to apply it\.$/],
+    [500, { ok: false, persisted: false, error: 'disk full' }, 'error', /^Not saved: disk full$/],
+    [413, { ok: false, error: 'body too large' }, 'error', /^Not saved: body too large$/],
+    [501, { ok: false, error: 'not supported' }, 'error', /Update TeamClaude/],
+  ];
+  for (const [status, reply, kind, text] of replies) {
+    await page.answer(status, reply);
+    assert.equal(page.result.className, 'dialog-result ' + kind, String(status));
+    assert.match(page.result.textContent, text);
+    if (status === 400) assert.equal(page.input('maxUsage', 'unified7d').getAttribute('aria-invalid'), 'true');
+    await page.answer(200, next);
+    page.save();
+  }
+  // Network failure keeps the existing wording.
+  page.requests.shift().resolve(Promise.reject(new Error('timed out')));
+  await new Promise(r => setImmediate(r));
+  assert.equal(page.result.textContent, 'Could not confirm the change. Refresh status before retrying. timed out');
+});
+
+test('limits: a 409 shows the value now and Use current adopts it while keeping typed fields', async () => {
+  const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+  page.type('maxUsage', 'unified7d', '60');
+  page.save();
+  await page.answer(409, { ok: false, error: 'changed elsewhere', current: { switchThreshold: 0.95, maxUsage: null } });
+  assert.equal(page.result.className, 'dialog-result error');
+  assert.match(page.result.textContent, /changed elsewhere.*Now: switch 95% all buckets, cap none\./);
+  const useCurrent = page.dom.getElementById('limitsUseCurrent');
+  assert.equal(useCurrent.hidden, false);
+  await page.answer(200, limitsStatus());
+  assert.equal(page.dom.focused, useCurrent);
+  useCurrent.click();
+  assert.equal(useCurrent.hidden, true);
+  assert.equal(page.dom.focused, page.dom.getElementById('saveLimits'));
+  assert.equal(page.input('maxUsage', 'unified7d').value, '60', 'typed value kept');
+  page.save();
+  assert.deepEqual(page.sent()[0].expected, { switchThreshold: 0.95, maxUsage: null });
+});
+
+test('limits: a poll re-seeds untouched fields and moves their baseline; a touched field keeps its draft and baseline', async () => {
+  const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+  const capInput = page.input('maxUsage', 'unified7d');
+  page.type('maxUsage', 'unified7d', '70');
+  const next = limitsStatus();
+  next.accounts[0].switchThreshold = 0.9;
+  next.accounts[0].maxUsage = 0.5;
+  await page.refresh(next);
+  assert.equal(page.input('maxUsage', 'unified7d'), capInput, 'the poll did not rebuild the inputs');
+  assert.equal(capInput.value, '70');
+  assert.equal(page.input('switchThreshold', 'default').value, '90', 'untouched field follows status');
+  assert.equal(page.input('maxUsage', 'default').value, '', 'a touched field keeps its baseline, so its other inputs do too');
+  assert.equal(page.force('unified7d').children[0].textContent, 'switch 90% · account all-buckets');
+  page.save();
+  assert.deepEqual(page.sent()[0], { id: 'id-0', expected: { switchThreshold: 0.9, maxUsage: null }, maxUsage: { buckets: { unified7d: 70 } } });
+});
+
+test('limits: editors are disabled while disconnected and for an account with no config id', async () => {
+  const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+  const controls = () => page.dom.querySelectorAll('#limitsBody input').concat([page.dom.getElementById('saveLimits'), page.dom.getElementById('resetLimits')]);
+  assert.ok(page.dom.querySelectorAll('#limitsBody input').every(i => !i.disabled));
+  assert.equal(page.dom.getElementById('limitsBlocked').hidden, true);
+  await page.refresh({}, 500);
+  assert.ok(controls().every(c => c.disabled));
+  const s = limitsStatus(); s.accounts[0].id = null;
+  const noId = await openLimits(s, 'alex@personal.dev');
+  assert.ok(noId.dom.querySelectorAll('#limitsBody input').every(i => i.disabled));
+  assert.equal(noId.dom.getElementById('saveLimits').disabled, true);
+  assert.equal(noId.dom.getElementById('limitsBlocked').hidden, false);
+  assert.match(noId.dom.getElementById('limitsBlocked').textContent, /Reload config/);
+  // The account leaving the status hides the editor with the rest of the body.
+  await page.refresh({ ...limitsStatus(), accounts: [] });
+  assert.equal(page.dom.getElementById('accountLimits').hidden, true);
+});
+
+test('limits: Reset to inherited confirms inline, then sends reset on both fields in one request', async () => {
+  const bare = await openLimits(limitsStatus(), 'alex@personal.dev');
+  assert.equal(bare.dom.getElementById('resetLimits').disabled, true, 'nothing to reset');
+  const s = limitsStatus(); s.accounts[0].switchThreshold = 1; s.accounts[0].maxUsage = 0.6;
+  const page = await openLimits(s, 'alex@personal.dev');
+  const { dom } = page;
+  const reset = dom.getElementById('resetLimits');
+  assert.equal(reset.disabled, false);
+  reset.click();
+  const actions = dom.getElementById('limitsActions');
+  assert.equal(actions.textContent, 'Reset to the fleet threshold and no cap?ResetKeep');
+  const confirm = actions.querySelector('#confirmResetLimits');
+  assert.equal(dom.focused, confirm);
+  actions.querySelector('#keepLimits').click();
+  assert.deepEqual(actions.children.map(c => c.getAttribute('id')), ['resetLimits', 'saveLimits']);
+  assert.equal(dom.focused, reset);
+  reset.click();
+  actions.querySelector('#confirmResetLimits').click();
+  assert.equal(page.sent().length, 1);
+  assert.deepEqual(page.sent()[0], { id: 'id-0', expected: { switchThreshold: 1, maxUsage: 0.6 }, switchThreshold: { reset: true }, maxUsage: { reset: true } });
+  await page.answer(200, { ok: true, switchThreshold: null, maxUsage: null });
+  assert.match(page.result.textContent, /^Reset\. This account now inherits the fleet threshold and has no cap\.$/);
+  await page.answer(200, limitsStatus());
+  assert.equal(page.input('switchThreshold', 'default').value, '');
+  assert.equal(page.dom.getElementById('resetLimits').disabled, true);
+});
+
+test('limits: a reply that lands after sign-out renders nothing', async () => {
+  const page = await openLimits(limitsStatus(), 'alex@personal.dev');
+  page.type('maxUsage', 'unified7d', '60');
+  page.save();
+  page.dom.getElementById('logout').click();
+  await page.answer(200, { ok: true, switchThreshold: null, maxUsage: { unified7d: 0.6 } });
+  assert.doesNotMatch(page.result.textContent, /Saved|Not saved/);
+  assert.equal(page.requests.filter(r => r.url === '/teamclaude/status').length, 0, 'no re-poll into the new session');
+});
+
+// ---- Fleet switch thresholds (Routing, T7) ----
+
+test('fleet: In force reads the value in force and whether the table overrides it', () => {
+  const table = { default: 0.98, unified7dFable: 1 };
+  assert.equal(fleetInForce('default', 0.98, table), '98%');
+  assert.equal(fleetInForce('unified7dFable', 0.98, table), '100% · override');
+  assert.equal(fleetInForce('unified7d', 0.98, table), '98% · default');
+  assert.equal(fleetInForce('tokens', 0.95, null), '95% · default');
+  assert.equal(fleetInForce('default', 0.995, null), '99.5%');
+});
+
+test('fleet: the request sends only changed rows under the table shown; Default cannot be cleared', () => {
+  const base = { default: 0.98, unified7dFable: 1 };
+  assert.deepEqual(fleetRequest(base, {}), { body: null, invalid: [], emptyDefault: false });
+  assert.deepEqual(fleetRequest(base, { default: '98', unified7d: '' }).body, null, 'unchanged rows send nothing');
+  assert.deepEqual(fleetRequest(base, { default: '95%' }).body, { expected: base, buckets: { default: 95 } });
+  assert.deepEqual(fleetRequest(base, { unified7dFable: '' }).body, { expected: base, buckets: { unified7dFable: null } });
+  assert.deepEqual(fleetRequest(base, { unified5h: ' 99.5 ', tokens: '90' }).body.buckets, { unified5h: 99.5, tokens: 90 });
+  assert.deepEqual(fleetRequest(base, { default: ' ' }), { body: null, invalid: ['default'], emptyDefault: true });
+  assert.deepEqual(fleetRequest(base, { default: '', unified7d: '98.55', tokens: '0' }), { body: null, invalid: ['default', 'unified7d', 'tokens'], emptyDefault: true });
+  assert.deepEqual(fleetRequest(base, { default: '1e2' }), { body: null, invalid: ['default'], emptyDefault: false });
+});
+
+test('fleet: each reply status reads distinctly, rows named as the table names them', () => {
+  assert.deepEqual(fleetOutcome(200, { ok: true, switchThreshold: 0.95 }), { kind: 'ok', text: 'Saved and applied.' });
+  const conflict = fleetOutcome(409, { ok: false, error: 'changed elsewhere', current: { default: 0.9, unified7dFable: 1 } });
+  assert.equal(conflict.conflict, true);
+  assert.deepEqual(conflict.current, { default: 0.9, unified7dFable: 1 });
+  assert.equal(conflict.text, 'Not saved: changed elsewhere since you opened this. Now: Default 90%, Fable weekly 100%.');
+  assert.equal(fleetOutcome(400, { ok: false, errors: [{ field: 'buckets.default', message: 'the fleet default cannot be cleared; set a percentage' }] }).text,
+    'Not saved: Default: the fleet default cannot be cleared; set a percentage');
+  assert.equal(fleetOutcome(400, { ok: false, errors: [{ field: 'expected', message: 'bad' }] }).text, 'Not saved: bad');
+  assert.match(fleetOutcome(501, {}).text, /Update TeamClaude/);
+  assert.match(fleetOutcome(404, { error: 'unknown teamclaude control route' }).text, /Update TeamClaude/, 'an older proxy has no route');
+  assert.equal(fleetOutcome(500, { ok: false, persisted: true, error: 'reload failed' }).kind, 'warn');
+  assert.match(fleetOutcome(500, { ok: false, persisted: true, error: 'reload failed' }).text, /Reload config/);
+  assert.equal(fleetOutcome(500, { ok: false, persisted: false, error: 'disk full' }).text, 'Not saved: disk full');
+});
+
+async function openFleet(s = fixtureStatus()) {
+  const page = await renderPage(s);
+  const { dom } = page;
+  const input = bucket => dom.querySelectorAll(`#fleetBody input[data-bucket="${bucket}"]`)[0];
+  const force = bucket => dom.getElementById('fleetBody').querySelectorAll('tr').find(tr => tr.getAttribute('data-bucket') === bucket).querySelector('td.force');
+  const type = (bucket, text) => { const i = input(bucket); i.value = text; i.dispatch('input'); };
+  const sent = () => page.requests.filter(r => r.url === '/teamclaude/threshold').map(r => JSON.parse(r.init.body));
+  const save = () => dom.getElementById('saveFleet').click();
+  const controls = () => dom.querySelectorAll('#fleetBody input').concat([dom.getElementById('saveFleet')]);
+  return { ...page, input, force, type, sent, save, controls, result: dom.getElementById('fleetResult') };
+}
+
+test('fleet: the panel is static markup in Routing after #routesWrap, with a primary Save and the shared helpers', () => {
+  const html = renderDashboardHtml();
+  const start = html.indexOf('<section data-section="routing"');
+  const routing = html.slice(start, html.indexOf('<section data-section="resets"', start));
+  const panel = routing.indexOf('<section aria-labelledby="fleetThresholdTitle" id="fleetThreshold" class="route-panel">');
+  assert.ok(panel > routing.indexOf('id="routesWrap"'));
+  // A sibling of #routesWrap, not inside it, so hiding the routes table leaves it shown.
+  const wrap = routing.slice(routing.indexOf('<div id="routesWrap">'), panel);
+  assert.equal(wrap.split('<div').length, wrap.split('</div>').length);
+  assert.match(routing, /<button id="saveFleet" class="primary">Save thresholds<\/button>/);
+  for (const id of ['fleetTable', 'fleetBody', 'fleetColSwitch', 'fleetOverridden', 'fleetResult', 'fleetUseCurrent', 'fleetMissing', 'fleetEditor']) assert.ok(routing.includes(`id="${id}"`), id);
+  for (const fn of [fleetInForce, fleetRequest, fleetOutcome]) assert.ok(html.includes(fn.toString()), fn.name);
+});
+
+test('fleet: rows, names and seeding follow the status table; In force per row', async () => {
+  const page = await openFleet();
+  const rows = page.dom.getElementById('fleetBody').querySelectorAll('tr');
+  assert.deepEqual(rows.map(tr => tr.getAttribute('data-bucket')), ['default', 'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests']);
+  for (const tr of rows) {
+    const key = tr.getAttribute('data-bucket');
+    const i = tr.querySelectorAll('input');
+    assert.equal(i.length, 1);
+    assert.equal(i[0].getAttribute('type'), 'text'); assert.equal(i[0].getAttribute('inputmode'), 'decimal');
+    assert.equal(i[0].getAttribute('aria-labelledby'), `fleet-row-${key} fleetColSwitch`);
+    assert.equal(i[0].getAttribute('placeholder'), key === 'default' ? null : 'default');
+    assert.equal(i[0].getAttribute('aria-required'), key === 'default' ? 'true' : null);
+    assert.equal(tr.querySelector('td[data-label]').getAttribute('data-label'), 'Switch at');
+  }
+  assert.equal(page.input('default').value, '98');
+  assert.equal(page.input('unified7dFable').value, '100');
+  for (const k of ['unified5h', 'unified7d', 'unified7dSonnet', 'tokens', 'requests']) {
+    assert.equal(page.input(k).value, '', k);
+    assert.equal(page.force(k).textContent, '98% · default', k);
+  }
+  assert.equal(page.force('default').textContent, '98%');
+  assert.equal(page.force('unified7dFable').textContent, '100% · override');
+  assert.equal(page.dom.getElementById('fleetEditor').hidden, false);
+  assert.equal(page.dom.getElementById('fleetMissing').hidden, true);
+});
+
+test('fleet: the panel renders with no configured routes, while #routesWrap is hidden', async () => {
+  const page = await openFleet();
+  assert.equal(page.dom.getElementById('routesWrap').style.display, 'none');
+  assert.equal(page.dom.getElementById('fleetBody').querySelectorAll('tr').length, 7);
+});
+
+test('fleet: an older proxy with no switchThreshold shows one line and no table', async () => {
+  const s = fixtureStatus(); delete s.switchThreshold; delete s.switchThresholds;
+  const page = await openFleet(s);
+  assert.equal(page.dom.getElementById('fleetEditor').hidden, true);
+  assert.equal(page.dom.getElementById('fleetMissing').hidden, false);
+  assert.ok(renderDashboardHtml().includes('<p class="usage" id="fleetMissing" hidden>This proxy does not report its switch threshold.</p>'));
+  assert.equal(page.dom.getElementById('fleetBody').querySelectorAll('tr').length, 0);
+});
+
+test('fleet: #fleetOverridden lists every account with its own threshold, by label or name', async () => {
+  let page = await openFleet();
+  assert.equal(page.dom.getElementById('fleetOverridden').hidden, true);
+  const s = fixtureStatus();
+  s.accounts[0].switchThreshold = 1;
+  s.accounts[1].switchThreshold = { unified7dFable: 0.995 };
+  s.accounts[1].label = 'Work';
+  s.accounts[2].switchThreshold = { default: 0.9, unified7d: 0.95 };
+  page = await openFleet(s);
+  const line = page.dom.getElementById('fleetOverridden');
+  assert.equal(line.hidden, false);
+  assert.equal(line.textContent, 'Accounts with their own threshold ignore the buckets they set: alex@personal.dev (all buckets), Work (Fable weekly), codex-primary (all buckets).');
+  await page.refresh(fixtureStatus());
+  assert.equal(line.hidden, true);
+});
+
+test('fleet: bad input and a cleared Default are refused before any request, named and focused', async () => {
+  const page = await openFleet();
+  page.type('default', '');
+  page.save();
+  assert.equal(page.sent().length, 0);
+  assert.equal(page.result.className, 'dialog-result error');
+  assert.equal(page.result.textContent, "Not saved. Default: enter a percent. The default can't be empty.");
+  assert.equal(page.input('default').getAttribute('aria-invalid'), 'true');
+  assert.equal(page.dom.focused, page.input('default'));
+  for (const bad of ['98.55', '0', '101', '1e2', 'abc']) {
+    const p = await openFleet();
+    p.type('unified7d', bad);
+    p.save();
+    assert.equal(p.sent().length, 0, bad);
+    assert.equal(p.input('unified7d').getAttribute('aria-invalid'), 'true');
+    assert.equal(p.input('unified7d').getAttribute('aria-describedby'), 'fleetResult');
+    assert.match(p.result.textContent, /Weekly: enter a percent from 1 to 100, at most one decimal/);
+    p.type('unified7d', '9');
+    assert.equal(p.input('unified7d').getAttribute('aria-invalid'), null);
+  }
+});
+
+test('fleet: a save sends only changed rows under the status table, re-polls, and renders each reply', async () => {
+  const page = await openFleet();
+  page.save();
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.result.textContent, 'No changes to save.');
+
+  page.type('default', '95');
+  page.save();
+  assert.equal(page.requests[0].url, '/teamclaude/threshold');
+  assert.equal(page.requests[0].init.method, 'POST');
+  assert.deepEqual(page.sent()[0], { expected: { default: 0.98, unified7dFable: 1 }, buckets: { default: 95 } });
+  assert.equal(page.result.textContent, 'Saving...');
+  assert.ok(page.controls().every(c => c.disabled), 'disabled while pending');
+  await page.answer(200, { ok: true, switchThreshold: { default: 0.95, unified7dFable: 1 } });
+  assert.equal(page.result.className, 'dialog-result ok');
+  assert.equal(page.result.textContent, 'Saved and applied.');
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the editor re-polls after a reply');
+  const next = fixtureStatus(); next.switchThreshold = 0.95; next.switchThresholds = { default: 0.95, unified7dFable: 1 };
+  await page.answer(200, next);
+  assert.equal(page.input('default').value, '95');
+  assert.equal(page.force('unified7d').textContent, '95% · default');
+  assert.ok(page.controls().every(c => !c.disabled));
+
+  page.type('unified7dFable', '');
+  page.save();
+  assert.deepEqual(page.sent()[0], { expected: { default: 0.95, unified7dFable: 1 }, buckets: { unified7dFable: null } });
+  const replies = [
+    [400, { ok: false, errors: [{ field: 'buckets.unified7dFable', message: 'a percentage from 1 to 100 with at most one decimal' }] }, 'error', /^Not saved: Fable weekly: a percentage/],
+    [500, { ok: false, persisted: true, error: 'reload failed' }, 'warn', /Use Reload config to apply it\.$/],
+    [500, { ok: false, persisted: false, error: 'disk full' }, 'error', /^Not saved: disk full$/],
+    [501, { ok: false, error: 'not supported' }, 'error', /Update TeamClaude/],
+  ];
+  for (const [status, reply, kind, text] of replies) {
+    await page.answer(status, reply);
+    assert.equal(page.result.className, 'dialog-result ' + kind, String(status));
+    assert.match(page.result.textContent, text);
+    if (status === 400) assert.equal(page.input('unified7dFable').getAttribute('aria-invalid'), 'true');
+    assert.equal(page.requests[0].url, '/teamclaude/status', String(status));
+    await page.answer(200, next);
+    page.save();
+  }
+  page.requests.shift().resolve(Promise.reject(new Error('timed out')));
+  await new Promise(r => setImmediate(r));
+  assert.equal(page.result.textContent, 'Could not confirm the change. Refresh status before retrying. timed out');
+});
+
+test('fleet: a 409 shows the table now, focuses Use current, which adopts it and keeps typed fields', async () => {
+  const page = await openFleet();
+  page.type('unified7d', '97');
+  page.save();
+  await page.answer(409, { ok: false, error: 'changed elsewhere', current: { default: 0.9, unified7dFable: 1, unified5h: 0.95 } });
+  assert.equal(page.result.className, 'dialog-result error');
+  assert.match(page.result.textContent, /changed elsewhere.*Now: Default 90%, 5-hour 95%, Fable weekly 100%\./);
+  const useCurrent = page.dom.getElementById('fleetUseCurrent');
+  assert.equal(useCurrent.hidden, false);
+  await page.answer(200, fixtureStatus());
+  assert.equal(page.dom.focused, useCurrent);
+  useCurrent.click();
+  assert.equal(useCurrent.hidden, true);
+  assert.equal(page.dom.focused, page.dom.getElementById('saveFleet'));
+  assert.equal(page.input('unified7d').value, '97', 'typed value kept');
+  assert.equal(page.input('default').value, '90', 'untouched rows re-seed from the adopted table');
+  assert.equal(page.input('unified5h').value, '95');
+  page.save();
+  assert.deepEqual(page.sent()[0], { expected: { default: 0.9, unified7dFable: 1, unified5h: 0.95 }, buckets: { unified7d: 97 } });
+});
+
+test('fleet: a poll re-seeds untouched rows; once a row is touched the baseline stays', async () => {
+  const page = await openFleet();
+  const next = fixtureStatus(); next.switchThreshold = 0.9; next.switchThresholds = { default: 0.9 };
+  await page.refresh(next);
+  assert.equal(page.input('default').value, '90');
+  assert.equal(page.input('unified7dFable').value, '');
+  page.type('tokens', '80');
+  await page.refresh(fixtureStatus());
+  assert.equal(page.input('tokens').value, '80');
+  assert.equal(page.input('default').value, '90', 'the baseline it was typed against');
+  assert.equal(page.force('default').textContent, '98%', 'In force follows status');
+  page.save();
+  assert.deepEqual(page.sent()[0], { expected: { default: 0.9 }, buckets: { tokens: 80 } });
+});
+
+test('fleet: controls are disabled while disconnected; a reply after sign-out renders nothing', async () => {
+  const page = await openFleet();
+  assert.ok(page.controls().every(c => !c.disabled));
+  await page.refresh({}, 500);
+  assert.ok(page.controls().every(c => c.disabled));
+  page.dom.getElementById('saveFleet').click();
+  assert.equal(page.sent().length, 0);
+
+  const other = await openFleet();
+  other.type('default', '95');
+  other.save();
+  other.dom.getElementById('logout').click();
+  await other.answer(200, { ok: true, switchThreshold: 0.95 });
+  assert.doesNotMatch(other.result.textContent, /Saved|Not saved/);
+  assert.equal(other.requests.filter(r => r.url === '/teamclaude/status').length, 0, 'no re-poll into the new session');
+});
+
+test('fleet: the panel CSS adds no identity tint or grade token, and the mobile rules cover its Save and Use current', () => {
+  const html = renderDashboardHtml();
+  const css = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+  const rules = css.split('}').map(chunk => chunk.split('{').slice(-2)).filter(([sel]) => sel && /#fleet/.test(sel));
+  assert.ok(rules.length >= 3);
+  for (const [sel, body] of rules) assert.doesNotMatch(body, /--accent|--claude|--codex|--grade-/, sel);
+  assert.match(css, /#limitsUseCurrent,#fleetUseCurrent \{ width:100%; min-height:44px; \}/);
+});
+
+test('fleet: Save starts disabled and stays so when the first status poll fails', async () => {
+  const dom = fakeDom();
+  const page = bootPage({ dom });
+  assert.equal(dom.getElementById('saveFleet').disabled, true, 'before any status');
+  await page.answer(500, {});
+  assert.equal(dom.getElementById('err').style.display, 'block');
+  assert.equal(dom.getElementById('saveFleet').disabled, true);
+  assert.equal(dom.getElementById('fleetUseCurrent').disabled, true);
+  dom.getElementById('saveFleet').click();
+  assert.equal(page.requests.filter(r => r.url === '/teamclaude/threshold').length, 0);
 });

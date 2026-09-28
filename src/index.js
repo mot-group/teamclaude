@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
+import { createControlQueue, createLimitWriters, fail } from './control-queue.js';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode } from './account-manager.js';
@@ -506,24 +507,10 @@ async function serverCommand() {
     return added;
   };
 
-  // One in-process chain for everything that republishes the routing table.
-  // saveOverride writes the file and then reloads; a bare reload (the TUI's 'R'
-  // key, POST /teamclaude/reload, the CLI's notify after add/change) republishes
-  // the whole table on its own. Interleaved, a reload that read disk before a
-  // write can finish after it and publish a table the file no longer holds — so
-  // they take turns. Nothing here is cross-process: a CLI writing the config
-  // while this server writes it is still the two of them racing, and
-  // atomicConfigUpdate's re-read plus the endpoint's precondition are what make
-  // that race visible rather than silent.
-  let controlChain = Promise.resolve();
-  const queued = (fn) => {
-    const result = controlChain.then(fn, fn);
-    controlChain = result.then(() => {}, () => {});
-    return result;
-  };
-  const reloadQueued = () => queued(reloadAccounts);
-
-  const fail = (code, message) => Object.assign(new Error(message), { code });
+  // One queue for every in-process settings writer and every reload; see
+  // control-queue.js for why they take turns and what must never run inside a
+  // unit. `applyChange` is a write plus the reload that applies it.
+  const { queued, applyChange, reloadQueued } = createControlQueue(reloadAccounts);
 
   // Write one configured route's `override` to the config, then apply it.
   //
@@ -607,7 +594,13 @@ async function serverCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
-      saveConfig: () => atomicConfigUpdate(async diskConfig => {
+      // Queued so a save built from this process's settings cannot land between
+      // another writer's write and its reload. Its follow-up reload is the
+      // separate syncAccounts unit below. `reapply` is the edit being saved,
+      // run again at the unit's turn: a reload queued ahead of it has replaced
+      // `config`, which would otherwise drop that edit.
+      saveConfig: (/** @type {unknown} */ _config, /** @type {(() => void)|undefined} */ reapply) => queued(() => atomicConfigUpdate(async diskConfig => {
+        reapply?.();
         mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
@@ -626,7 +619,9 @@ async function serverCommand() {
         // itself (_routeSave / _routeDelete), so a whole-table stencil from this
         // hook would undo whatever another writer — the CLI, the force endpoint
         // — committed since the last reload.
-      }),
+      })),
+      // The route editor's disk update and its live publication, as one unit.
+      serialize: queued,
       syncAccounts: reloadQueued,
       // `p` key: on-demand fleet-wide quota refresh. The prober is constructed
       // after the TUI, so this is a thunk over the closure variable.
@@ -690,6 +685,8 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   // Queued, like every other republish of the routing table.
   hooks.reload = reloadQueued;
+  // A settings write and its reload in one unit; the MCP settings tools use it.
+  hooks.applyChange = applyChange;
   hooks.persistAccounts = () => queued(() => atomicConfigUpdate(mergeAccountsOnto));
   hooks.getForecast = hours => forecast?.getSnapshot(hours) || {
     version: 1, status: 'Forecast history is disabled', accounts: [], perModel: [], events: [], recommendations: [],
@@ -701,19 +698,22 @@ async function serverCommand() {
   hooks.saveOverride = saveOverride;
   // The dashboard's rename. Written by entry id, never by name: `name` is what
   // routes and name-matched pairing key on, so only the display label changes.
-  hooks.saveLabel = (/** @type {{ id: string, label: string }} */ { id, label }) => queued(async () => {
+  hooks.saveLabel = (/** @type {{ id: string, label: string }} */ { id, label }) => applyChange(async () => {
     if (!accountManager.accounts.some(a => a.id === id)) throw fail('no-such-account', `no account with id "${id}"`);
     await atomicConfigUpdate(async diskConfig => {
       const row = (diskConfig.accounts || []).find((/** @type {any} */ a) => a?.id === id);
       if (!row) throw fail('no-such-account', `no config entry with id "${id}"`);
       if (label) row.label = label; else delete row.label;
     });
-    try {
-      await reloadAccounts();
-    } catch (err) {
-      throw fail('reload-failed', /** @type {Error} */ (err).message);
-    }
   });
+  // The dashboard's limit editors: a preconditioned write plus its reload, by
+  // account id or for the fleet table. See control-queue.js.
+  Object.assign(hooks, createLimitWriters({
+    applyChange,
+    reload: reloadAccounts,
+    update: atomicConfigUpdate,
+    hasAccount: id => accountManager.accounts.some(a => a.id === id),
+  }));
   hooks.getStatusExtra = () => ({
     forecast: hooks.getForecast(),
     // Read live from the shared config (not a startup snapshot) so the TUI's

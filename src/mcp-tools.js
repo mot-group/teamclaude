@@ -215,25 +215,30 @@ async function changeAccount(ctx, args, mutate) {
 
 /**
  * Change a setting the way the CLI does: in the file, under the config lock,
- * then a reload applies it to the running server. A refusal from `apply`
- * writes nothing.
+ * then a reload applies it to the running server. The server runs both as one
+ * unit on the queue every in-process settings writer shares, so no other write
+ * or reload lands between them. A refusal from `apply` writes nothing.
  * @template T
  * @param {ToolContext} ctx
  * @param {(disk: Record<string, any>) => T} apply
  * @returns {Promise<T>}
  */
 async function changeSetting({ hooks }, apply) {
-  /** @type {T|undefined} */
-  let outcome;
-  await atomicConfigUpdate((/** @type {Record<string, any>} */ disk) => { outcome = apply(disk); });
+  if (!hooks.applyChange) {
+    throw new ToolFailure('this server cannot apply a settings change; edit the config file and reload_config instead');
+  }
   try {
-    if (!hooks.reload) throw new Error('this server has no reload hook');
-    await hooks.reload();
+    return await hooks.applyChange(async () => {
+      /** @type {T|undefined} */
+      let outcome;
+      await atomicConfigUpdate((/** @type {Record<string, any>} */ disk) => { outcome = apply(disk); });
+      return /** @type {T} */ (outcome);
+    });
   } catch (err) {
+    if (/** @type {any} */ (err)?.code !== 'reload-failed') throw err;
     console.error('[TeamClaude] MCP: reload after a settings change failed:', err instanceof Error ? err.message : err);
     throw new ToolFailure('saved to the config file, but the reload failed; see the proxy log');
   }
-  return /** @type {T} */ (outcome);
 }
 
 /** @type {Tool[]} */

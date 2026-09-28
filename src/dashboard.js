@@ -1077,12 +1077,271 @@ export function sessionActivityText(sessions) {
     : sessions.active + ' recent Claude session ' + (sessions.active === 1 ? 'ID' : 'IDs');
 }
 
+// ---- Rotation limits editor (account dialog, FR 1-8) ----
+
+/**
+ * The buckets the account dialog offers a threshold and cap for (FR 2), in
+ * THRESHOLD_BUCKET_KEYS order. The account's kind gives the buckets it can
+ * report: Codex the 5-hour and weekly, Anthropic OAuth those plus the two
+ * family weeklies, an API-key account tokens and requests, a third-party
+ * backend nothing. A configured route adds its bucket when a preview it owns
+ * (`preview.route` is that route, so a glob an earlier route shadows adds
+ * nothing) admits this account by config id, never by name: two accounts can
+ * share a name and a route can admit one by index. `routes` names the routes a
+ * bucket came from only when the kind did not already offer it.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {Array<Record<string, any>>|null|undefined} routes  status.routes
+ * @returns {Array<{ key: string, routes: string[] }>}
+ */
+export function offeredBuckets(account, routes) {
+  var a = account || {};
+  /** @type {string[]} */
+  var kind = a.backend === true ? []
+    : a.type === 'apikey' ? ['tokens', 'requests']
+      : a.provider === 'codex' ? ['unified5h', 'unified7d']
+        : a.provider === 'anthropic' && a.type === 'oauth' ? ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable'] : [];
+  /** @type {Object<string, string[]>} */
+  var viaRoute = {};
+  if (a.id != null) {
+    (routes || []).forEach(function (r) {
+      if (!r || r.autocreated !== false || THRESHOLD_BUCKET_KEYS.indexOf(r.bucket) === -1) return;
+      var admits = (r.previews || []).some(/** @param {Record<string, any>} p */ function (p) {
+        return p && p.route === r.name && (p.accounts || []).some(/** @param {Record<string, any>} x */ function (x) { return !!x && x.id === a.id; });
+      });
+      if (admits) (viaRoute[r.bucket] = viaRoute[r.bucket] || []).push(r.name);
+    });
+  }
+  return THRESHOLD_BUCKET_KEYS.filter(function (key) { return kind.indexOf(key) !== -1 || !!viaRoute[key]; })
+    .map(function (key) { return { key: key, routes: kind.indexOf(key) !== -1 ? [] : viaRoute[key] }; });
+}
+
+/**
+ * Where an account's switch threshold for one bucket comes from, read in the
+ * order resolveSwitchThreshold reads it, so the label names the value the
+ * router uses: an account's all-buckets value outranks a fleet bucket entry.
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {string} bucket
+ * @returns {'account bucket'|'account all-buckets'|'fleet'}
+ */
+export function thresholdSource(accountThreshold, bucket) {
+  /** @param {unknown} v */
+  var valid = function (v) { return typeof v === 'number' && isFinite(v); };
+  if (typeof accountThreshold === 'number') return valid(accountThreshold) ? 'account all-buckets' : 'fleet';
+  if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    var own = accountThreshold[bucket];
+    if (own != null) return valid(own) ? 'account bucket' : 'fleet';
+    if (valid(accountThreshold.default)) return 'account all-buckets';
+  }
+  return 'fleet';
+}
+
+/**
+ * A typed percent (FR 3): whitespace and one trailing `%` are forgiven, then
+ * it must be 1 to 100 with at most one decimal. The number, or null when the
+ * text is anything else (`98.55`, `0`, `1e2`, empty).
+ * @param {string} text
+ * @returns {number|null}
+ */
+export function parsePercent(text) {
+  var s = String(text == null ? '' : text).trim();
+  if (s.charAt(s.length - 1) === '%') s = s.slice(0, -1).trim();
+  if (!/^\d{1,3}(\.\d)?$/.test(s)) return null;
+  var n = Number(s);
+  return n >= 1 && n <= 100 ? n : null;
+}
+
+/**
+ * The percent an input for one bucket shows: the account's own entry for that
+ * key (a bare number is the all-buckets `default`), ratio x 100 without a
+ * trailing `.0`. Null when the account stores nothing under the key.
+ * @param {number|Object<string, number>|null|undefined} value
+ * @param {string} bucket  a THRESHOLD_BUCKET_KEYS key or 'default'
+ * @returns {number|null}
+ */
+export function storedPercent(value, bucket) {
+  var v = typeof value === 'number' ? (bucket === 'default' ? value : null)
+    : value && typeof value === 'object' && !Array.isArray(value) ? value[bucket] : null;
+  return typeof v === 'number' && isFinite(v) ? Math.round(v * 1000) / 10 : null;
+}
+
+/**
+ * A stored switchThreshold or maxUsage in words, for the conflict line's
+ * "Now:": "98% all buckets", "90% all buckets, Fable weekly 99.5%", or what an
+ * empty one means ("inherited" for a threshold, "none" for a cap).
+ * @param {number|Object<string, number>|null|undefined} value
+ * @param {'threshold'|'cap'} kind
+ * @returns {string}
+ */
+export function limitText(value, kind) {
+  var keys = ['default'].concat(THRESHOLD_BUCKET_KEYS);
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    Object.keys(value).forEach(function (k) { if (keys.indexOf(k) === -1) keys.push(k); });
+  }
+  var parts = keys.map(function (k) {
+    var p = storedPercent(value, k);
+    return p == null ? '' : k === 'default' ? p + '% all buckets' : bucketLabel(k) + ' ' + p + '%';
+  }).filter(function (t) { return !!t; });
+  return parts.length ? parts.join(', ') : kind === 'cap' ? 'none' : 'inherited';
+}
+
+/**
+ * The body a Rotation limits save sends (FR 3, 4, 6, 12): only the buckets the
+ * operator changed, as numbers, under one `expected` for both fields. `drafts`
+ * maps 'switchThreshold:<bucket>' / 'maxUsage:<bucket>' to the text of each
+ * touched input; `keys` are the rows on screen, so a draft for a row that has
+ * since gone is dropped. A cleared input sends null only when it had a value.
+ * `invalid` lists refused inputs in focus order; `body` is null when any input
+ * is refused or nothing changed.
+ * @param {string} id
+ * @param {{ switchThreshold?: any, maxUsage?: any }} baseline
+ * @param {Record<string, string>} drafts
+ * @param {string[]} keys
+ * @returns {{ body: Record<string, any>|null, invalid: Array<{ field: string, bucket: string }> }}
+ */
+export function limitsRequest(id, baseline, drafts, keys) {
+  var base = baseline || {};
+  /** @type {Record<string, any>} */
+  var body = { id: id, expected: { switchThreshold: base.switchThreshold == null ? null : base.switchThreshold, maxUsage: base.maxUsage == null ? null : base.maxUsage } };
+  /** @type {Array<{ field: string, bucket: string }>} */
+  var invalid = [];
+  var changed = false;
+  keys.forEach(function (bucket) {
+    ['switchThreshold', 'maxUsage'].forEach(function (field) {
+      var text = (drafts || {})[field + ':' + bucket];
+      if (text == null) return;
+      var empty = String(text).trim() === '';
+      var value = empty ? null : parsePercent(text);
+      if (!empty && value === null) { invalid.push({ field: field, bucket: bucket }); return; }
+      if (value === storedPercent(body.expected[field], bucket)) return;
+      (body[field] = body[field] || { buckets: {} }).buckets[bucket] = value;
+      changed = true;
+    });
+  });
+  return { body: invalid.length || !changed ? null : body, invalid: invalid };
+}
+
+/**
+ * How to reload the config from this page. The LAN dashboard hides Reload
+ * config and does not forward /teamclaude/reload, so there the step names the
+ * places that can.
+ * @param {boolean} [canReload]  false on the LAN dashboard
+ * @returns {string}
+ */
+export function reloadStep(canReload) {
+  return canReload === false ? "Reload the config from the proxy's own dashboard or the TUI" : 'Use Reload config';
+}
+
+/**
+ * What to tell the operator after a limits save (FR 14), by HTTP status, since
+ * each refusal needs a different next step. `errors` are the 400's field
+ * errors, `current` the 409's value on disk.
+ * @param {number} status
+ * @param {any} res  the parsed reply body
+ * @param {boolean} [reset]
+ * @param {boolean} [canReload]  false where the page has no Reload config (reloadStep)
+ * @returns {{ kind: 'ok'|'warn'|'error', text: string, conflict?: boolean, current?: any, errors?: Array<{ field?: string, message?: string }> }}
+ */
+export function limitsOutcome(status, res, reset, canReload) {
+  var r = res || {};
+  var detail = r.error || (r.errors || []).map(/** @param {{ message?: string }} e */ function (e) { return e.message; }).join(' ') || 'status ' + status;
+  if (status === 200 && r.ok) return { kind: 'ok', text: reset ? 'Reset. This account now inherits the fleet threshold and has no cap.' : 'Saved and applied.' };
+  if (status === 409) {
+    var cur = r.current || {};
+    return { kind: 'error', conflict: true, current: r.current || null,
+      text: 'Not saved: changed elsewhere since you opened this. Now: switch ' + limitText(cur.switchThreshold, 'threshold') + ', cap ' + limitText(cur.maxUsage, 'cap') + '.' };
+  }
+  if (status === 400) {
+    // A bucket error's field is a path ("maxUsage.buckets.unified7d"); name it the way the table does.
+    var named = (r.errors || []).map(/** @param {{ field?: string, message?: string }} e */ function (e) {
+      var m = /^(switchThreshold|maxUsage)\.buckets\.(\w+)$/.exec(String(e.field || ''));
+      return (m ? (m[2] === 'default' ? 'All buckets' : bucketLabel(m[2])) + (m[1] === 'maxUsage' ? ' Cap: ' : ' Switch at: ') : '') + e.message;
+    });
+    return { kind: 'error', errors: r.errors || [], text: 'Not saved: ' + (named.join('. ') || detail) };
+  }
+  if (status === 404) return { kind: 'error', text: 'Not saved: this account is no longer in the config. Close and reopen from the refreshed list.' };
+  if (status === 501) return { kind: 'error', text: 'Not saved: this proxy cannot edit limits. Update TeamClaude and restart it.' };
+  if (r.persisted === true) return { kind: 'warn', text: 'Saved, but not applied: ' + detail + '. ' + reloadStep(canReload) + ' to apply it.' };
+  return { kind: 'error', text: 'Not saved: ' + detail };
+}
+
+// ---- Fleet switch thresholds (Routing section, FR 9-15) ----
+
+/**
+ * The In force cell of one fleet row (FR 9): the value the router uses for
+ * that bucket (fleetFor), and for a bucket whether the fleet table overrides
+ * it or it falls back to the default. The Default row reads the bare value.
+ * @param {string} bucket  'default' or a THRESHOLD_BUCKET_KEYS key
+ * @param {number|null|undefined} fleetThreshold  status.switchThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds  status.switchThresholds
+ * @returns {string}
+ */
+export function fleetInForce(bucket, fleetThreshold, fleetThresholds) {
+  var text = Math.round(fleetFor(bucket, fleetThreshold, fleetThresholds) * 1000) / 10 + '%';
+  if (bucket === 'default') return text;
+  return text + (storedPercent(fleetThresholds, bucket) != null ? ' · override' : ' · default');
+}
+
+/**
+ * The body a fleet threshold save sends (FR 10-12): only the changed rows, as
+ * numbers, under the table the page was showing. `drafts` maps 'default' or a
+ * bucket to the text of each touched input. A cleared bucket sends null, which
+ * drops its override; a cleared Default is refused (`emptyDefault`), because
+ * the fleet always has one. Same parse and no-change rules as limitsRequest.
+ * @param {Record<string, number>} baseline  { default: status.switchThreshold, ...status.switchThresholds }
+ * @param {Record<string, string>} drafts
+ * @returns {{ body: { expected: Record<string, number>, buckets: Record<string, number|null> }|null, invalid: string[], emptyDefault: boolean }}
+ */
+export function fleetRequest(baseline, drafts) {
+  var d = drafts || {};
+  /** @type {Record<string, string>} */
+  var named = {};
+  Object.keys(d).forEach(function (k) { named['switchThreshold:' + k] = d[k]; });
+  var r = limitsRequest('', { switchThreshold: baseline, maxUsage: null }, named, ['default'].concat(THRESHOLD_BUCKET_KEYS));
+  var emptyDefault = d.default != null && String(d.default).trim() === '';
+  var invalid = (emptyDefault ? ['default'] : []).concat(r.invalid.map(function (b) { return b.bucket; }));
+  var body = invalid.length || !r.body ? null : { expected: baseline, buckets: r.body.switchThreshold.buckets };
+  return { body: body, invalid: invalid, emptyDefault: emptyDefault };
+}
+
+/**
+ * What to tell the operator after a fleet save (FR 14). 409 and 400 name rows
+ * the way the fleet table does; a proxy without the endpoint (404 from an
+ * older one, 501) says to update; the rest read as the account editor's.
+ * @param {number} status
+ * @param {any} res  the parsed reply body
+ * @param {boolean} [canReload]  as limitsOutcome's
+ * @returns {{ kind: 'ok'|'warn'|'error', text: string, conflict?: boolean, current?: any, errors?: Array<{ field?: string, message?: string }> }}
+ */
+export function fleetOutcome(status, res, canReload) {
+  var r = res || {};
+  /** @param {string} k */
+  var rowLabel = function (k) { return k === 'default' ? 'Default' : bucketLabel(k); };
+  if (status === 409) {
+    var now = ['default'].concat(THRESHOLD_BUCKET_KEYS).map(function (k) {
+      var p = storedPercent(r.current, k);
+      return p == null ? '' : rowLabel(k) + ' ' + p + '%';
+    }).filter(function (t) { return !!t; }).join(', ');
+    return { kind: 'error', conflict: true, current: r.current || null, text: 'Not saved: changed elsewhere since you opened this. Now: ' + (now || 'unknown') + '.' };
+  }
+  if (status === 400) {
+    var named = (r.errors || []).map(/** @param {{ field?: string, message?: string }} e */ function (e) {
+      var m = /^buckets\.(\w+)$/.exec(String(e.field || ''));
+      return (m ? rowLabel(m[1]) + ': ' : '') + e.message;
+    });
+    return { kind: 'error', errors: r.errors || [], text: 'Not saved: ' + (named.join('. ') || r.error || 'status 400') };
+  }
+  if (status === 404 || status === 501) return { kind: 'error', text: 'Not saved: this proxy cannot edit the fleet threshold. Update TeamClaude and restart it.' };
+  return limitsOutcome(status, res, false, canReload);
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
   currentFor, accountLabel, gatingUtilization, quotaGate, latestReset,
+  offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, reloadStep, limitsOutcome,
+  fleetInForce, fleetRequest, fleetOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1397,6 +1656,26 @@ const PAGE = `<!doctype html>
   .dialog-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:23px; }
   .dialog-result { font-size:13px; padding:13px 0; }
   .rename { display:flex; gap:8px; } .rename input { flex:1; min-width:0; }
+  /* Rotation limits: one row per bucket, percent inputs, the value in force. Neutral inks only; red marks an invalid input. */
+  #accountLimits { margin-top:10px; border-top:1px solid var(--line); padding-top:20px; }
+  #accountLimits .dialog-help { margin:6px 0 4px; }
+  .limits { table-layout:fixed; }
+  .limits th,.limits td { padding:8px 8px 8px 0; vertical-align:middle; }
+  #limitsTable thead th:nth-child(1) { width:130px; } #limitsTable thead th:nth-child(2),#limitsTable thead th:nth-child(3) { width:106px; }
+  .limits tr:last-child th { border-bottom:0; }
+  .limits th[scope="row"] { color:var(--text); font-size:13px; font-weight:500; overflow-wrap:anywhere; }
+  .limits th .badge { display:inline-block; max-width:100%; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:top; }
+  .limits input { width:5.5em; min-height:40px; padding:8px 10px; text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  .limits input::placeholder { color:var(--dim); font-family:ui-sans-serif,system-ui,sans-serif; }
+  .limits input[aria-invalid="true"] { border-color:var(--grade-at); }
+  .limits .pct { color:var(--dim); margin-left:4px; }
+  .limits .force { font-family:var(--mono); font-variant-numeric:tabular-nums; font-size:11.5px; line-height:1.55; color:var(--dim); overflow-wrap:anywhere; }
+  .limits .force b,.limits .force span { display:block; }
+  .limits .force b { color:var(--text); font-weight:600; }
+  #fleetThreshold { margin-top:26px; }
+  #fleetThreshold .limits-body { padding:6px 20px 12px; max-width:680px; }
+  #fleetTable thead th:nth-child(1) { width:150px; } #fleetTable thead th:nth-child(2) { width:130px; }
+  .limits-actions { display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:14px; }
   #accountDetails .quota { margin:18px 0; }
   #accountDetails .quota-reset { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   #accountDetails .quota .lbl { font-size:13px; }
@@ -1406,6 +1685,7 @@ const PAGE = `<!doctype html>
   @media(max-width:900px) { #app { grid-template-columns:minmax(0,1fr); grid-template-rows:auto 1fr; } .sidebar { border-right:0; border-bottom:1px solid var(--line); padding:20px 24px 12px; } .nav-label { display:none; } nav { flex-direction:row; flex-wrap:wrap; gap:6px; margin-top:16px; } nav a { padding:10px 12px; border:1px solid var(--line); border-left-width:3px; } .main-content { padding:24px; } .topline { flex-wrap:wrap; gap:16px; } .toolbar { width:100%; } .live { margin-right:auto; } .split { grid-template-columns:1fr; }
     #routes thead { display:none; } #routes,#routes tbody,#routes tr,#routes td { display:block; width:100%; } #routes tr { padding:12px 0; border-bottom:1px solid var(--line); } #routes tr:last-child { border-bottom:0; } #routes tr[data-provider] { border-left:3px solid var(--other); } #routes tr[data-provider="anthropic"] { border-left-color:var(--claude); } #routes tr[data-provider="codex"] { border-left-color:var(--codex); } #routes tr[data-provider] td:first-child { border-left:0; padding-left:16px; } #routes td { border:0; padding:3px 16px; } #routes td[data-label]::before { content:attr(data-label) ": "; color:var(--dim); } #routes .route-actions { padding-top:4px; gap:0 8px; } #routes .route-actions .chip { flex-basis:100%; } #routes .route-actions .act { min-height:44px; } }
   @media(max-width:650px) { .main-content { padding:23px 17px; } .sidebar { padding:20px 17px 10px; } .brand { padding:0; } h1 { font-size:27px; } .eyebrow { font-size:10px; } .section-head { flex-direction:column; align-items:stretch; } .account-tools { justify-content:space-between; } .search { flex:1; min-width:145px; width:auto; } .quota-toggle button { min-height:40px; padding:6px 13px; } .route-panel .section-head,.route-strip .section-head { flex-direction:row; flex-wrap:wrap; } .strip-line { grid-template-columns:1fr; gap:4px; } .provider-routing { grid-template-columns:1fr; } .provider-card { border-right:0; border-bottom:1px solid var(--line); } .provider-card:last-child { border-bottom:0; } .account-table-wrap { border:0; border-radius:0; background:none; overflow:visible; } .account-table,.account-table tbody,.account-table tr,.account-table td { display:block; width:100%; } .account-table thead { display:none; } .account-table .provider-heading th { display:block; width:100%; border-radius:8px; padding:10px 14px; margin-bottom:10px; } .account-table .account-row { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 16px 16px 0; margin-bottom:14px; border-left-width:3px; border-left-color:var(--other); } .account-table .account-row[data-provider="anthropic"] { border-left-color:var(--claude); } .account-table .account-row[data-provider="codex"] { border-left-color:var(--codex); } .account-table .account-row td:first-child { border-left:0; } .account-table td { border:0; padding:0 0 16px 14px; } .account-table td:last-child { padding:0 0 0 14px; } .account-table td[data-label]::before { content:attr(data-label); display:block; font-size:12px; color:var(--dim); margin-bottom:8px; } .account-table .quota-reset { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; } .account-name { font-size:14px; } .quota .lbl,.account-meta,.quota-reset { font-size:12px; } .quota .val { font-size:13px; } .act { width:100%; border-top:1px solid var(--line); padding-top:12px; text-align:left; } .route-actions .act { width:auto; border-top:0; padding:2px 0; } .account-foot { flex-direction:column; gap:7px; } .stats { grid-template-columns:1fr; } dialog { padding:22px; } .dialog-actions button { min-height:44px; } #keybox { margin:10vh 16px; padding:24px; } }
+  @media(max-width:650px) { .limits thead { display:none; } .limits,.limits tbody { display:block; width:100%; } .limits tr { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px 12px; padding:12px 0; border-bottom:1px solid var(--line); } .limits tr:last-child { border-bottom:0; } .limits th,.limits td { display:block; padding:0; border:0; } .limits th[scope="row"],.limits td.force { grid-column:1 / -1; } .limits th .badge { margin-left:6px; } .limits td[data-label] { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; } .limits td[data-label]::before { content:attr(data-label); grid-column:1 / -1; color:var(--dim); font-size:12px; margin-bottom:4px; } .limits input { width:100%; min-height:44px; } .limits-actions button,#limitsUseCurrent,#fleetUseCurrent { width:100%; min-height:44px; } #fleetTable tr { grid-template-columns:minmax(0,1fr); } }
   @media(max-width:650px) { .reset-table thead { display:none; } .reset-table,.reset-table tbody,.reset-table tr,.reset-table td { display:block; width:100%; } .reset-table tr { padding:10px 0; border-bottom:1px solid var(--line); } .reset-table td { border:0; padding:2px 16px; } .reset-table td[data-label]::before { content:attr(data-label) ': '; color:var(--dim); } .reset-table tr[data-provider] { border-left:3px solid var(--other); } .reset-table tr[data-provider="anthropic"] { border-left-color:var(--claude); } .reset-table tr[data-provider="codex"] { border-left-color:var(--codex); } .reset-table tr[data-provider] td:first-child { border-left:0; padding-left:16px; } .mini { grid-template-columns:90px minmax(0,1fr) 96px; } .reveal { width:100%; min-height:44px; } }
 </style>
 </head>
@@ -1444,7 +1724,12 @@ const PAGE = `<!doctype html>
         <div class="section-head"><div><h2 id="modelRoutingTitle">Expected routing per model</h2><p class="sub">Representative models, based on the latest router status</p></div><button id="routingManualSelection">Manual selection</button></div>
         <div class="provider-routing" id="providerRouting"></div><p class="routing-help">Routing forecast, not live traffic. Existing sessions, request pins, and retries can use another account.</p>
       </section>
-      <div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div></section>
+      <div id="routesWrap"><h2>Configured routes</h2><div class="card"><table id="routes"></table></div><p class="routing-help" id="forceBlocked" hidden></p></div>
+      <section aria-labelledby="fleetThresholdTitle" id="fleetThreshold" class="route-panel">
+        <div class="section-head"><div><h2 id="fleetThresholdTitle">Switch thresholds</h2><p class="sub">Rotation leaves an account when a bucket reaches this share. An account's own threshold (in Details) outranks every value here.</p></div></div>
+        <div class="limits-body"><p class="usage" id="fleetMissing" hidden>This proxy does not report its switch threshold.</p><div id="fleetEditor"><table class="limits" id="fleetTable"><thead><tr><th scope="col">Bucket</th><th scope="col" id="fleetColSwitch">Switch at</th><th scope="col">In force</th></tr></thead><tbody id="fleetBody"></tbody></table><p class="usage" id="fleetOverridden" hidden></p><div class="limits-actions"><span></span><button id="saveFleet" class="primary">Save thresholds</button></div><div id="fleetResult" class="dialog-result" role="status"></div><button id="fleetUseCurrent" hidden>Use current</button></div></div>
+        <p class="routing-help">Tokens and requests apply to API-key accounts. Changes apply to new requests at once, no restart.</p>
+      </section></section>
     <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table><div id="resetReveal"></div></div><p class="usage" id="resetHistoryNote"></p></section>
     <section data-section="forecast" hidden class="section-body" id="forecastSection">
       <div class="section-head"><div><h2>Subscription forecasts</h2><p class="sub">Account usage includes every machine using that subscription.</p></div><label>Work horizon <select id="forecastHorizon"><option value="2">2 hours</option><option value="8" selected>8 hours</option><option value="24">1 day</option><option value="72">3 days</option><option value="168">7 days</option></select></label></div>
@@ -1455,7 +1740,7 @@ const PAGE = `<!doctype html>
     <footer id="foot"></footer>
   </main>
 </div>
-<dialog id="accountDialog" aria-labelledby="accountDialogTitle"><div class="dialog-head"><h2 id="accountDialogTitle">Account details</h2><button data-close="accountDialog" aria-label="Close account details">×</button></div><div id="accountDetails"></div><label for="accountLabel">Display name</label><div class="rename"><input id="accountLabel" maxlength="64" placeholder="Leave empty to show the config name"><button id="saveLabel">Save name</button></div><p class="dialog-help">Changes only what this dashboard shows. The config name stays the key for routes, logs and the TUI.</p><div id="labelResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="accountDialog">Close</button><button id="accountManual">Manual selection</button></div></dialog>
+<dialog id="accountDialog" aria-labelledby="accountDialogTitle"><div class="dialog-head"><h2 id="accountDialogTitle">Account details</h2><button data-close="accountDialog" aria-label="Close account details">×</button></div><div id="accountDetails"></div><label for="accountLabel">Display name</label><div class="rename"><input id="accountLabel" maxlength="64" placeholder="Leave empty to show the config name"><button id="saveLabel">Save name</button></div><p class="dialog-help">Changes only what this dashboard shows. The config name stays the key for routes, logs and the TUI.</p><div id="labelResult" class="dialog-result" role="status"></div><section id="accountLimits" aria-labelledby="accountLimitsTitle"><h3 id="accountLimitsTitle">Rotation limits</h3><p class="dialog-help" id="limitsHelp">Percent of each quota window. Rotation leaves this account at Switch at and refuses it at Cap. An empty Switch at uses the All buckets value, then the fleet. An empty Cap means no cap.</p><table class="limits" id="limitsTable"><thead><tr><th scope="col">Bucket</th><th scope="col" id="limColSwitch">Switch at</th><th scope="col" id="limColCap">Cap</th><th scope="col">In force</th></tr></thead><tbody id="limitsBody"></tbody></table><p class="usage" id="limitsStored" hidden></p><p class="warnt" id="limitsBlocked" hidden></p><div class="limits-actions" id="limitsActions"><button id="resetLimits">Reset to inherited</button><button id="saveLimits" class="primary">Save limits</button></div><div id="limitsResult" class="dialog-result" role="status"></div><button id="limitsUseCurrent" hidden>Use current</button></section><div class="dialog-actions"><button data-close="accountDialog">Close</button><button id="accountManual">Manual selection</button></div></dialog>
 <dialog id="switchDialog" aria-labelledby="switchTitle"><div class="dialog-head"><div><div class="eyebrow">Routing control</div><h2 id="switchTitle">Select starting account</h2></div><button data-close="switchDialog" aria-label="Close manual selection">×</button></div><p class="dialog-help">Rotation continues from the selected account. Eligibility and model routes can select another account immediately.</p><label for="switchAccount">Account</label><select id="switchAccount"></select><div class="explain"><strong>What changes</strong><ul><li>The router records this starting account for rotation.</li><li>It does not pin a model or change account priority.</li><li>Existing sessions, model routes, and request pins still apply.</li></ul></div><p id="switchHelp" class="dialog-help"></p><div id="switchResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="switchDialog">Close</button><button id="applySwitch" class="primary" disabled>Set starting account</button></div></dialog>
 <dialog id="forceDialog" aria-labelledby="forceTitle"><div class="dialog-head"><div><div class="eyebrow">Routing control</div><h2 id="forceTitle">Force a route to one account</h2></div><button data-close="forceDialog" aria-label="Close force route">×</button></div><p class="dialog-help" id="forceRouteHelp"></p><label for="forceAccount">Account</label><select id="forceAccount"></select><fieldset class="force-modes"><legend>When it runs out of usage</legend><label for="forceFallback"><input type="radio" name="forceWhenSpent" id="forceFallback" value="fallback" checked>Fall back to automatic routing</label><p class="dialog-help">The other members of this route serve it until the forced account is eligible again.</p><label for="forceHold"><input type="radio" name="forceWhenSpent" id="forceHold" value="hold">Hold on it</label><p class="dialog-help">No other member serves this route. Requests get a 429 with a retry-after until the forced account is eligible again.</p></fieldset><div class="explain"><strong>What changes</strong><ul><li>Every request matching this route goes to the selected account.</li><li>It stays forced until you clear it. There is no timer.</li><li>Sessions pinned with TC_ACCT bypass routes and are not affected.</li></ul></div><p id="forceHelp" class="dialog-help"></p><div id="forceResult" class="dialog-result" role="status"></div><div class="dialog-actions"><button data-close="forceDialog">Cancel</button><button id="forceUseCurrent" hidden>Use current</button><button id="applyForce" class="primary" disabled>Apply</button></div></dialog>
 <script>
@@ -1546,7 +1831,7 @@ ${SHARED_HELPERS}
   // "switch at 98%" / "cap 60%": the number a bar is graded against, worded by
   // which of the two limits binds. Rounded like the threshold badge.
   function limitPct(v) { return (Math.round(v * 1000) / 10) + '%'; }
-  function limitText(kind, limit) { return (kind === 'cap' ? 'cap ' : 'switch at ') + limitPct(limit); }
+  function gateText(kind, limit) { return (kind === 'cap' ? 'cap ' : 'switch at ') + limitPct(limit); }
   // Why a short bar can carry a red grade: the router gated the family on the shared weekly (quotaGate).
   function viaText(via, mode) { return via == null ? '' : ' · via shared weekly ' + quotaDisplay(via, mode) + '% ' + mode; }
   function resetIn(resetAt) {
@@ -1566,10 +1851,10 @@ ${SHARED_HELPERS}
     bar.setAttribute('aria-label', label + ', quota ' + quotaMode);
     bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
     bar.setAttribute('aria-valuenow', String(value));
-    bar.setAttribute('aria-valuetext', quotaDisplay(ratio, 'spent') + '% spent, ' + grade + viaText(lim.via, 'spent').replace(' ·', ',') + ', ' + limitText(lim.kind, lim.limit) + ', ' + reset);
+    bar.setAttribute('aria-valuetext', quotaDisplay(ratio, 'spent') + '% spent, ' + grade + viaText(lim.via, 'spent').replace(' ·', ',') + ', ' + gateText(lim.kind, lim.limit) + ', ' + reset);
     var fill = el('i', grade); fill.style.width = value + '%'; bar.appendChild(fill);
     // The tick sits where the router gates; a fill may run past a cap tick, so a bar can be at well short of full (FR 6).
-    var tick = el('b', lim.kind === 'cap' ? 'cap' : ''); tick.style.left = limitPct(lim.limit); tick.title = limitText(lim.kind, lim.limit); bar.appendChild(tick);
+    var tick = el('b', lim.kind === 'cap' ? 'cap' : ''); tick.style.left = limitPct(lim.limit); tick.title = gateText(lim.kind, lim.limit); bar.appendChild(tick);
     return bar;
   }
 
@@ -1620,7 +1905,7 @@ ${SHARED_HELPERS}
     main.appendChild(el('span', 'g', b.grade));
     if (b.via != null) main.appendChild(el('span', '', viaText(b.via, quotaMode)));
     line.appendChild(main);
-    line.appendChild(el('span', 'sub2', limitText(b.limitKind, b.limit) + ' · ' + resetIn(b.resetAt)));
+    line.appendChild(el('span', 'sub2', gateText(b.limitKind, b.limit) + ' · ' + resetIn(b.resetAt)));
     return line;
   }
 
@@ -1697,7 +1982,7 @@ ${SHARED_HELPERS}
         var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
         var identity = el('td'); identity.appendChild(el('span', 'account-name', a.label || a.name)); identity.appendChild(accountBadgeRow(a, s));
         identity.appendChild(bindingLine(binding));
-        identity.appendChild(el('div', 'account-meta', a.type === 'oauth' ? 'Subscription' : a.type === 'api_key' ? 'API account' : a.type));
+        identity.appendChild(el('div', 'account-meta', a.type === 'oauth' ? 'Subscription' : a.type === 'apikey' ? 'API account' : a.type));
         var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0];
         identity.appendChild(el('div', 'account-meta', probe && probe.lastProbedAt ? 'Last probe ' + fmtAgo(probe.lastProbedAt) + (probe.error ? ' · Failed' : '') : 'Quota reading time not reported'));
         tr.appendChild(identity);
@@ -1719,11 +2004,12 @@ ${SHARED_HELPERS}
     var wrap = document.getElementById('accountDetails'); wrap.textContent = '';
     var dialog = document.getElementById('accountDialog');
     document.getElementById('accountManual').disabled = !connected || !a;
+    var s = lastStatus || {};
+    renderLimits(a, s);
     if (!a) { dialog.removeAttribute('data-provider'); document.getElementById('saveLabel').disabled = true; wrap.appendChild(el('p', 'usage', 'This account is no longer in the latest status.')); return; }
     dialog.setAttribute('data-provider', a.provider || 'unknown');
     document.getElementById('accountDialogTitle').textContent = a.label || a.name;
     document.getElementById('saveLabel').disabled = !connected || labelPending;
-    var s = lastStatus || {};
     wrap.appendChild(accountBadgeRow(a, s));
     if (!connected) { var warning = el('p', 'warnt', 'Connection lost. These quota values may be stale.'); warning.setAttribute('role', 'status'); wrap.appendChild(warning); }
     var binding = bindingLimit(a, s.switchThreshold, s.switchThresholds);
@@ -1753,6 +2039,7 @@ ${SHARED_HELPERS}
     var a = detailRow();
     document.getElementById('accountLabel').value = (a && a.label) || '';
     document.getElementById('labelResult').textContent = '';
+    resetLimitsEditor(a);
     renderAccountDetails(); document.getElementById('accountDialog').showModal();
   }
 
@@ -1780,6 +2067,402 @@ ${SHARED_HELPERS}
     } catch (e) {
       if (generation === authGeneration) { result.className = 'dialog-result error'; result.textContent = 'Could not confirm the change. ' + e.message; }
     } finally { labelPending = false; document.getElementById('saveLabel').disabled = !connected; }
+  }
+
+  // ---- Rotation limits (FR 1-8, 12, 14, 15) ----
+  // The editor is static markup outside #accountDetails, so a poll never
+  // rebuilds it: the table is rebuilt only when the account or its rows
+  // change, and otherwise refreshed in place. An untouched input follows
+  // status and moves its field's baseline; a touched one keeps its draft and
+  // the baseline it was typed against, so only a real race answers 409.
+  var LIMIT_FIELDS = ['switchThreshold', 'maxUsage'];
+  var limitsBuilt = null;    // account id and row keys the table was built for
+  var limitsKeys = [];       // 'default' plus the offered buckets, in row order
+  var limitsInputs = [];     // every limits input, in focus order
+  var limitsForce = {};      // bucket -> its In force cell
+  var limitsBaseline = { switchThreshold: null, maxUsage: null };
+  var limitsDrafts = {};     // 'field:bucket' -> text of a touched input
+  var limitsPending = false;
+  var limitsConflict = null; // the 409's current value until Use current adopts it
+  var limitsConfirming = false;
+  // Held, not looked up: the Reset confirm takes both out of the document.
+  var resetLimitsButton = document.getElementById('resetLimits');
+  var saveLimitsButton = document.getElementById('saveLimits');
+
+  function limitRowLabel(key) { return key === 'default' ? 'All buckets' : bucketLabel(key); }
+  function limitColLabel(field) { return field === 'maxUsage' ? 'Cap' : 'Switch at'; }
+
+  // Opening the dialog starts the editor over from the latest status.
+  function resetLimitsEditor(a) {
+    limitsBuilt = null; limitsDrafts = {}; limitsConflict = null; limitsConfirming = false;
+    limitsBaseline = { switchThreshold: a && a.switchThreshold != null ? a.switchThreshold : null, maxUsage: a && a.maxUsage != null ? a.maxUsage : null };
+    var result = document.getElementById('limitsResult'); result.className = 'dialog-result'; result.textContent = '';
+    document.getElementById('limitsUseCurrent').hidden = true;
+    renderLimitActions(false);
+  }
+
+  function buildLimitRows(offered) {
+    var body = document.getElementById('limitsBody'); body.replaceChildren();
+    limitsInputs = []; limitsForce = {};
+    [{ key: 'default', routes: [] }].concat(offered).forEach(function (o) {
+      var tr = el('tr'); tr.setAttribute('data-bucket', o.key);
+      var th = el('th'); th.scope = 'row';
+      // The id sits on the label alone, so an input's name is "<row> <column>" without the route tag.
+      var name = el('span', '', limitRowLabel(o.key)); name.setAttribute('id', 'lim-row-' + o.key); th.appendChild(name);
+      if (o.routes.length) { var via = el('span', 'badge meta', 'via route ' + o.routes.join(', ')); via.title = via.textContent; th.appendChild(via); }
+      tr.appendChild(th);
+      LIMIT_FIELDS.forEach(function (field) {
+        var td = el('td'); td.setAttribute('data-label', limitColLabel(field));
+        var input = el('input');
+        input.setAttribute('type', 'text'); input.setAttribute('inputmode', 'decimal');
+        input.setAttribute('autocomplete', 'off'); input.setAttribute('spellcheck', 'false');
+        input.setAttribute('data-field', field); input.setAttribute('data-bucket', o.key);
+        input.setAttribute('aria-labelledby', 'lim-row-' + o.key + ' ' + (field === 'maxUsage' ? 'limColCap' : 'limColSwitch'));
+        input.setAttribute('placeholder', field === 'maxUsage' ? 'none' : 'inherit');
+        input.addEventListener('input', function () { limitsDrafts[field + ':' + o.key] = input.value; input.removeAttribute('aria-invalid'); });
+        input.addEventListener('keydown', function (e) { if (e.key === 'Enter') saveLimits(); });
+        td.appendChild(input);
+        var pct = el('span', 'pct', '%'); pct.setAttribute('aria-hidden', 'true'); td.appendChild(pct);
+        tr.appendChild(td); limitsInputs.push(input);
+      });
+      var force = el('td', 'force'); tr.appendChild(force); limitsForce[o.key] = force;
+      body.appendChild(tr);
+    });
+  }
+
+  // Untouched inputs show their field's baseline, the value a save is checked against.
+  function seedLimitInputs() {
+    limitsInputs.forEach(function (input) {
+      var field = input.getAttribute('data-field'), bucket = input.getAttribute('data-bucket');
+      if (Object.prototype.hasOwnProperty.call(limitsDrafts, field + ':' + bucket)) return;
+      var p = storedPercent(limitsBaseline[field], bucket);
+      input.value = p == null ? '' : String(p);
+    });
+  }
+
+  function renderLimits(a, s) {
+    var section = document.getElementById('accountLimits');
+    section.hidden = !a;
+    if (!a) return;
+    LIMIT_FIELDS.forEach(function (field) {
+      var touched = Object.keys(limitsDrafts).some(function (k) { return k.indexOf(field + ':') === 0; });
+      if (!touched) limitsBaseline[field] = a[field] == null ? null : a[field];
+    });
+    var offered = offeredBuckets(a, s.routes);
+    var built = (a.id || '') + '|' + offered.map(function (o) { return o.key + ':' + o.routes.join(','); }).join('|');
+    if (built !== limitsBuilt) { buildLimitRows(offered); limitsBuilt = built; }
+    limitsKeys = ['default'].concat(offered.map(function (o) { return o.key; }));
+    seedLimitInputs();
+    limitsKeys.forEach(function (key) {
+      var cell = limitsForce[key]; cell.replaceChildren();
+      if (key === 'default') { cell.appendChild(el('span', 'dim', 'for buckets left empty')); return; }
+      var lim = effectiveLimit(a, key, s.switchThreshold, s.switchThresholds);
+      var capBinds = lim.kind === 'cap';
+      cell.appendChild(el(capBinds ? 'span' : 'b', '', 'switch ' + limitPct(lim.threshold) + ' · ' + thresholdSource(a.switchThreshold, key)));
+      cell.appendChild(el(capBinds ? 'b' : 'span', '', lim.cap == null ? 'uncapped' : 'cap ' + limitPct(lim.cap) + (capBinds ? ' · binds' : '')));
+    });
+    // Keys the account stores that this dialog does not offer: shown, never sent.
+    var stored = [];
+    LIMIT_FIELDS.forEach(function (field) {
+      var v = a[field];
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return;
+      Object.keys(v).forEach(function (key) {
+        var p = storedPercent(v, key);
+        if (p != null && limitsKeys.indexOf(key) === -1) stored.push(limitRowLabel(key) + (field === 'maxUsage' ? ' cap ' : ' switch ') + p + '%');
+      });
+    });
+    var storedLine = document.getElementById('limitsStored');
+    storedLine.hidden = !stored.length;
+    storedLine.textContent = stored.length ? 'Also stored, not editable here: ' + stored.join(', ') + '.' : '';
+    document.getElementById('limitsHelp').textContent = 'Percent of each quota window. Rotation leaves this account at Switch at and refuses it at Cap. An empty Switch at uses the All buckets value, then the fleet. An empty Cap means no cap.'
+      + (a.backend === true ? ' This backend reports no Anthropic quota buckets.' : '');
+    var blocked = document.getElementById('limitsBlocked');
+    blocked.hidden = !!a.id;
+    blocked.textContent = a.id ? '' : 'This account has no config id yet. ' + reloadStep(!SESSION_AUTH) + ', then reopen Details.';
+    updateLimitsDisabled(a);
+  }
+
+  function updateLimitsDisabled(a) {
+    var off = !a || !a.id || !connected || limitsPending;
+    limitsInputs.forEach(function (input) { input.disabled = off; });
+    saveLimitsButton.disabled = off;
+    resetLimitsButton.disabled = off || (a.switchThreshold == null && a.maxUsage == null);
+    document.getElementById('limitsUseCurrent').disabled = off;
+    // Keep only folds the confirm away, so it stays usable, like Clear force's Keep.
+    var confirm = document.querySelector('#confirmResetLimits'); if (confirm) confirm.disabled = off;
+  }
+
+  // The inline Reset confirm replaces the two buttons, like Clear force's.
+  function renderLimitActions(focus) {
+    var actions = document.getElementById('limitsActions');
+    var reset = resetLimitsButton, save = saveLimitsButton;
+    actions.replaceChildren();
+    if (!limitsConfirming) {
+      actions.appendChild(reset); actions.appendChild(save);
+      if (focus) reset.focus();
+      return;
+    }
+    actions.appendChild(el('span', 'hint', 'Reset to the fleet threshold and no cap?'));
+    var yes = el('button', '', 'Reset'); yes.setAttribute('id', 'confirmResetLimits');
+    var keep = el('button', '', 'Keep'); keep.setAttribute('id', 'keepLimits');
+    yes.addEventListener('click', function () {
+      var a = detailRow();
+      limitsConfirming = false; renderLimitActions(false);
+      if (a && a.id) sendLimits({ id: a.id, expected: { switchThreshold: limitsBaseline.switchThreshold, maxUsage: limitsBaseline.maxUsage }, switchThreshold: { reset: true }, maxUsage: { reset: true } }, true);
+    });
+    keep.addEventListener('click', function () { limitsConfirming = false; renderLimitActions(true); });
+    actions.appendChild(yes); actions.appendChild(keep);
+    updateLimitsDisabled(detailRow());
+    if (focus) yes.focus();
+  }
+
+  function markLimitInputs(bad) {
+    limitsInputs.forEach(function (input) {
+      var hit = bad.some(function (b) { return b.field === input.getAttribute('data-field') && b.bucket === input.getAttribute('data-bucket'); });
+      if (hit) { input.setAttribute('aria-invalid', 'true'); input.setAttribute('aria-describedby', 'limitsResult'); }
+      else input.removeAttribute('aria-invalid');
+    });
+    var first = limitsInputs.filter(function (input) { return input.getAttribute('aria-invalid') === 'true'; })[0];
+    if (first) first.focus();
+  }
+
+  function saveLimits() {
+    var a = detailRow();
+    if (!a || !a.id || !connected || limitsPending) return;
+    var result = document.getElementById('limitsResult');
+    var req = limitsRequest(a.id, limitsBaseline, limitsDrafts, limitsKeys);
+    markLimitInputs(req.invalid);
+    if (req.invalid.length) {
+      result.className = 'dialog-result error';
+      result.textContent = 'Not saved. ' + req.invalid.map(function (b) { return limitRowLabel(b.bucket) + ' ' + limitColLabel(b.field) + ': enter a percent from 1 to 100, at most one decimal.'; }).join(' ');
+      return;
+    }
+    if (!req.body) { result.className = 'dialog-result'; result.textContent = 'No changes to save.'; return; }
+    sendLimits(req.body, false);
+  }
+
+  // A 400's field errors name a field and maybe a bucket ("maxUsage.unified7d");
+  // a field alone marks every touched input of it.
+  function serverLimitErrors(errors) {
+    var bad = [];
+    (errors || []).forEach(function (e) {
+      var parts = String((e || {}).field || '').split('.');
+      var field = parts[0], bucket = parts[parts.length - 1];
+      if (LIMIT_FIELDS.indexOf(field) === -1) return;
+      if (limitsKeys.indexOf(bucket) !== -1) bad.push({ field: field, bucket: bucket });
+      else Object.keys(limitsDrafts).forEach(function (k) { if (k.indexOf(field + ':') === 0) bad.push({ field: field, bucket: k.slice(field.length + 1) }); });
+    });
+    return bad;
+  }
+
+  async function sendLimits(body, reset) {
+    if (!connected || limitsPending) return;
+    limitsPending = true; updateLimitsDisabled(detailRow());
+    var generation = authGeneration;
+    var result = document.getElementById('limitsResult'); result.className = 'dialog-result'; result.textContent = 'Saving...';
+    document.getElementById('limitsUseCurrent').hidden = true; limitsConflict = null;
+    var focusUseCurrent = false;
+    try {
+      var res = await fetch('/teamclaude/accounts/limits', {
+        method: 'POST',
+        headers: { 'x-api-key': SESSION_AUTH ? '' : localStorage.getItem(KEY) || '', 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      if (generation !== authGeneration) return;
+      var out = limitsOutcome(res.status, json, reset, !SESSION_AUTH);
+      result.className = 'dialog-result ' + out.kind; result.textContent = out.text;
+      // The reply carries the stored values, not the sanitised form status
+      // shows, so the next baseline comes from the poll below: with no drafts
+      // left, renderLimits takes both fields and every input from status.
+      if (out.kind === 'ok') { limitsDrafts = {}; markLimitInputs([]); }
+      if (out.conflict && out.current) { limitsConflict = out.current; document.getElementById('limitsUseCurrent').hidden = false; focusUseCurrent = true; }
+      if (out.errors) markLimitInputs(serverLimitErrors(out.errors));
+      await poll(true);
+    } catch (e) {
+      if (generation === authGeneration) { result.className = 'dialog-result error'; result.textContent = 'Could not confirm the change. Refresh status before retrying. ' + e.message; }
+    } finally {
+      limitsPending = false;
+      if (generation === authGeneration) {
+        updateLimitsDisabled(detailRow());
+        if (focusUseCurrent) document.getElementById('limitsUseCurrent').focus();
+        else if (document.activeElement === document.body) saveLimitsButton.focus();
+      }
+    }
+  }
+
+  // Adopt the 409's value as the baseline. Typed fields stay as typed; the
+  // rest re-seed from it.
+  function useCurrentLimits() {
+    if (!limitsConflict) return;
+    var cur = limitsConflict;
+    limitsBaseline = { switchThreshold: cur.switchThreshold == null ? null : cur.switchThreshold, maxUsage: cur.maxUsage == null ? null : cur.maxUsage };
+    limitsConflict = null;
+    document.getElementById('limitsUseCurrent').hidden = true;
+    seedLimitInputs();
+    var result = document.getElementById('limitsResult'); result.className = 'dialog-result';
+    result.textContent = 'Using the values as they are now. Check your edits, then save again.';
+    saveLimitsButton.focus();
+  }
+
+  // ---- Fleet switch thresholds (Routing, FR 9-15) ----
+  // Same model as the limits editor: rows are built once and refreshed in
+  // place. Untouched inputs follow status and move the baseline; once any
+  // input is touched the baseline stays the table it was typed against.
+  var FLEET_KEYS = ['default'].concat(THRESHOLD_BUCKET_KEYS);
+  var fleetInputs = {};      // row key -> its input
+  var fleetForce = {};       // row key -> its In force cell
+  var fleetBaseline = null;  // { default, ...overrides } a save is checked against
+  var fleetDrafts = {};      // row key -> text of a touched input
+  var fleetPending = false;
+  var fleetConflict = null;  // the 409's current table until Use current adopts it
+  var saveFleetButton = document.getElementById('saveFleet');
+  updateFleetDisabled(); // disconnected until the first status arrives; renderFleet enables it
+
+  function fleetRowLabel(key) { return key === 'default' ? 'Default' : bucketLabel(key); }
+
+  function buildFleetRows() {
+    var body = document.getElementById('fleetBody'); body.replaceChildren();
+    FLEET_KEYS.forEach(function (key) {
+      var tr = el('tr'); tr.setAttribute('data-bucket', key);
+      var th = el('th'); th.scope = 'row';
+      var name = el('span', '', fleetRowLabel(key)); name.setAttribute('id', 'fleet-row-' + key); th.appendChild(name);
+      tr.appendChild(th);
+      var td = el('td'); td.setAttribute('data-label', 'Switch at');
+      var input = el('input');
+      input.setAttribute('type', 'text'); input.setAttribute('inputmode', 'decimal');
+      input.setAttribute('autocomplete', 'off'); input.setAttribute('spellcheck', 'false');
+      input.setAttribute('data-bucket', key);
+      input.setAttribute('aria-labelledby', 'fleet-row-' + key + ' fleetColSwitch');
+      if (key === 'default') input.setAttribute('aria-required', 'true');
+      else input.setAttribute('placeholder', 'default');
+      input.addEventListener('input', function () { fleetDrafts[key] = input.value; input.removeAttribute('aria-invalid'); });
+      input.addEventListener('keydown', function (e) { if (e.key === 'Enter') saveFleet(); });
+      td.appendChild(input);
+      var pct = el('span', 'pct', '%'); pct.setAttribute('aria-hidden', 'true'); td.appendChild(pct);
+      tr.appendChild(td);
+      var force = el('td', 'force'); tr.appendChild(force);
+      fleetInputs[key] = input; fleetForce[key] = force;
+      body.appendChild(tr);
+    });
+  }
+
+  function seedFleetInputs() {
+    FLEET_KEYS.forEach(function (key) {
+      if (Object.prototype.hasOwnProperty.call(fleetDrafts, key)) return;
+      var p = storedPercent(fleetBaseline, key);
+      fleetInputs[key].value = p == null ? '' : String(p);
+    });
+  }
+
+  // Why a fleet edit may not move an account: its own threshold outranks the
+  // fleet for every bucket it sets, and a bare number or a default sets all.
+  function ownThresholdScope(t) {
+    if (typeof t === 'number' || t.default != null) return 'all buckets';
+    return Object.keys(t).map(bucketLabel).join(', ') || 'all buckets';
+  }
+
+  function renderFleet(s) {
+    var reported = typeof s.switchThreshold === 'number';
+    document.getElementById('fleetEditor').hidden = !reported;
+    document.getElementById('fleetMissing').hidden = reported;
+    if (!reported) return;
+    if (!fleetForce.default) buildFleetRows();
+    if (!Object.keys(fleetDrafts).length) fleetBaseline = Object.assign({ default: s.switchThreshold }, s.switchThresholds || {});
+    seedFleetInputs();
+    FLEET_KEYS.forEach(function (key) { fleetForce[key].textContent = fleetInForce(key, s.switchThreshold, s.switchThresholds); });
+    var own = (s.accounts || []).filter(function (a) { return a.switchThreshold != null; });
+    var line = document.getElementById('fleetOverridden');
+    line.hidden = !own.length;
+    line.textContent = own.length ? 'Accounts with their own threshold ignore the buckets they set: '
+      + own.map(function (a) { return (a.label || a.name) + ' (' + ownThresholdScope(a.switchThreshold) + ')'; }).join(', ') + '.' : '';
+    updateFleetDisabled();
+  }
+
+  function updateFleetDisabled() {
+    var off = !connected || fleetPending;
+    FLEET_KEYS.forEach(function (key) { if (fleetInputs[key]) fleetInputs[key].disabled = off; });
+    saveFleetButton.disabled = off;
+    document.getElementById('fleetUseCurrent').disabled = off;
+  }
+
+  function markFleetInputs(bad) {
+    var first = null;
+    FLEET_KEYS.forEach(function (key) {
+      var input = fleetInputs[key];
+      if (bad.indexOf(key) === -1) { input.removeAttribute('aria-invalid'); return; }
+      input.setAttribute('aria-invalid', 'true'); input.setAttribute('aria-describedby', 'fleetResult');
+      if (!first) first = input;
+    });
+    if (first) first.focus();
+  }
+
+  function saveFleet() {
+    if (!fleetBaseline || !connected || fleetPending) return;
+    var result = document.getElementById('fleetResult');
+    var req = fleetRequest(fleetBaseline, fleetDrafts);
+    markFleetInputs(req.invalid);
+    if (req.invalid.length) {
+      result.className = 'dialog-result error';
+      result.textContent = 'Not saved. ' + req.invalid.map(function (key) {
+        return key === 'default' && req.emptyDefault ? 'Default: enter a percent. The default can\\'t be empty.'
+          : fleetRowLabel(key) + ': enter a percent from 1 to 100, at most one decimal.';
+      }).join(' ');
+      return;
+    }
+    if (!req.body) { result.className = 'dialog-result'; result.textContent = 'No changes to save.'; return; }
+    sendFleet(req.body);
+  }
+
+  async function sendFleet(body) {
+    fleetPending = true; updateFleetDisabled();
+    var generation = authGeneration;
+    var result = document.getElementById('fleetResult'); result.className = 'dialog-result'; result.textContent = 'Saving...';
+    document.getElementById('fleetUseCurrent').hidden = true; fleetConflict = null;
+    var focusUseCurrent = false;
+    try {
+      var res = await fetch('/teamclaude/threshold', {
+        method: 'POST',
+        headers: { 'x-api-key': SESSION_AUTH ? '' : localStorage.getItem(KEY) || '', 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      if (generation !== authGeneration) return;
+      var out = fleetOutcome(res.status, json, !SESSION_AUTH);
+      result.className = 'dialog-result ' + out.kind; result.textContent = out.text;
+      // The next baseline comes from the poll below, as in the limits editor.
+      if (out.kind === 'ok') { fleetDrafts = {}; markFleetInputs([]); }
+      if (out.conflict && out.current) { fleetConflict = out.current; document.getElementById('fleetUseCurrent').hidden = false; focusUseCurrent = true; }
+      if (out.errors) markFleetInputs(out.errors.map(function (e) { return String((e || {}).field || '').replace(/^buckets\\./, ''); }));
+      await poll(true);
+    } catch (e) {
+      if (generation === authGeneration) { result.className = 'dialog-result error'; result.textContent = 'Could not confirm the change. Refresh status before retrying. ' + e.message; }
+    } finally {
+      fleetPending = false;
+      if (generation === authGeneration) {
+        updateFleetDisabled();
+        if (focusUseCurrent) document.getElementById('fleetUseCurrent').focus();
+        else if (document.activeElement === document.body) saveFleetButton.focus();
+      }
+    }
+  }
+
+  // Adopt the 409's table as the baseline; typed fields stay as typed.
+  function useCurrentFleet() {
+    if (!fleetConflict) return;
+    fleetBaseline = typeof fleetConflict === 'number' ? { default: fleetConflict } : fleetConflict;
+    fleetConflict = null;
+    document.getElementById('fleetUseCurrent').hidden = true;
+    seedFleetInputs();
+    var result = document.getElementById('fleetResult'); result.className = 'dialog-result';
+    result.textContent = 'Using the values as they are now. Check your edits, then save again.';
+    saveFleetButton.focus();
   }
 
   function emptyTable(id, text) {
@@ -2440,6 +3123,7 @@ ${SHARED_HELPERS}
     renderForecast(s.forecast);
     renderProblems(s);
     renderRoutes(s);
+    renderFleet(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
     renderSessions(s.sessions);
@@ -2465,7 +3149,7 @@ ${SHARED_HELPERS}
       var exhausted = accountQuotaGroups(a).models.filter(function (q) { return q.ratio >= 1; });
       if (exhausted.length) help += ' ' + exhausted.map(function (q) { return q.label; }).join(', ') + ' exhausted. Selecting this account does not restore those limits.';
       var b = bindingLimit(a, lastStatus.switchThreshold, lastStatus.switchThresholds);
-      help += b ? ' Binding limit: ' + b.label + ' ' + quotaDisplay(b.ratio, 'spent') + '% spent · ' + b.grade + viaText(b.via, 'spent') + ', ' + limitText(b.limitKind, b.limit) + '.' : ' No quota reported.';
+      help += b ? ' Binding limit: ' + b.label + ' ' + quotaDisplay(b.ratio, 'spent') + '% spent · ' + b.grade + viaText(b.via, 'spent') + ', ' + gateText(b.limitKind, b.limit) + '.' : ' No quota reported.';
     }
     document.getElementById('switchHelp').textContent = help;
     tintSelect('switchAccount', a);
@@ -2712,7 +3396,7 @@ ${SHARED_HELPERS}
       document.getElementById('probe').disabled = true;
       document.getElementById('accountManual').disabled = true; updateSwitchHelp(); updateForceHelp();
       if (document.getElementById('accountDialog').open) renderAccountDetails();
-      if (lastStatus) renderRoutes(lastStatus);
+      if (lastStatus) { renderRoutes(lastStatus); renderFleet(lastStatus); }
       document.getElementById('connection').textContent = 'Disconnected';
       document.getElementById('connection').className = 'live';
       var err = document.getElementById('err'); err.style.display = 'block';
@@ -2771,6 +3455,11 @@ ${SHARED_HELPERS}
   document.getElementById('switchAccount').addEventListener('change', updateSwitchHelp);
   document.getElementById('saveLabel').addEventListener('click', saveLabel);
   document.getElementById('accountLabel').addEventListener('keydown', function (e) { if (e.key === 'Enter') saveLabel(); });
+  saveLimitsButton.addEventListener('click', saveLimits);
+  resetLimitsButton.addEventListener('click', function () { limitsConfirming = true; renderLimitActions(true); });
+  document.getElementById('limitsUseCurrent').addEventListener('click', useCurrentLimits);
+  saveFleetButton.addEventListener('click', saveFleet);
+  document.getElementById('fleetUseCurrent').addEventListener('click', useCurrentFleet);
   document.getElementById('applySwitch').addEventListener('click', doSwitch);
   document.getElementById('forceAccount').addEventListener('change', updateForceHelp);
   document.getElementById('applyForce').addEventListener('click', applyForce);

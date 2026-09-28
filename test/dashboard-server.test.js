@@ -212,3 +212,67 @@ test('a route override is forwarded field by field, and a malformed one never le
   const notJson = await fetch(url + '/teamclaude/routes/override', { method: 'POST', headers: { cookie, origin: url }, body: '{}' });
   assert.equal(notJson.status, 415);
 });
+
+// The rotation-limit and fleet threshold saves go through the same relay. It
+// checks their shape and every percent itself and forwards only named fields.
+test('limit and threshold saves are allowed after sign-in and forwarded field by field', async t => {
+  const { url, requests, login } = await fixture(t);
+  const post = (path, body, extra = {}) => fetch(url + path, { method: 'POST', headers: { origin: url, 'content-type': 'application/json', ...extra }, body: JSON.stringify(body) });
+  const account = { id: 'a1', expected: { switchThreshold: null, maxUsage: { default: 0.9 } }, switchThreshold: { buckets: { unified7d: 100 } } };
+  const fleet = { expected: { default: 0.98 }, buckets: { default: 99.5 } };
+
+  assert.equal((await post('/teamclaude/accounts/limits', account)).status, 401);
+  assert.equal((await post('/teamclaude/threshold', fleet)).status, 401);
+
+  const cookie = (await login()).headers.get('set-cookie').split(';')[0];
+  const send = (path, body) => post(path, body, { cookie });
+  for (const [method, path] of [['GET', '/teamclaude/accounts/limits'], ['GET', '/teamclaude/threshold'], ['POST', '/teamclaude/accounts/limitsX'], ['POST', '/teamclaude/thresholds']]) {
+    assert.equal((await fetch(url + path, { method, headers: { cookie, origin: url, 'content-type': 'application/json' }, ...(method === 'POST' ? { body: '{}' } : {}) })).status, 404, `${method} ${path}`);
+  }
+  assert.equal(requests.length, 0);
+
+  assert.equal((await send('/teamclaude/accounts/limits', account)).status, 200);
+  assert.deepEqual(JSON.parse(requests[0].body), account);
+  assert.equal(requests[0].url, '/teamclaude/accounts/limits');
+  assert.equal((await send('/teamclaude/threshold', fleet)).status, 200);
+  assert.deepEqual(JSON.parse(requests[1].body), fleet);
+  assert.equal((await send('/teamclaude/accounts/limits', { id: 'a1', expected: { switchThreshold: 1, maxUsage: null }, switchThreshold: { reset: true }, maxUsage: { reset: true } })).status, 200);
+  assert.deepEqual(JSON.parse(requests[2].body), { id: 'a1', expected: { switchThreshold: 1, maxUsage: null }, switchThreshold: { reset: true }, maxUsage: { reset: true } });
+
+  // Extra fields at every level and prototype keys are dropped, not relayed.
+  const noisy = JSON.parse('{"id":"a1","note":"x","__proto__":{"admin":true},"expected":{"switchThreshold":null,"maxUsage":null,"extra":1},'
+    + '"switchThreshold":{"buckets":{"__proto__":50,"constructor":50,"unified5h":"60"},"extra":1},"maxUsage":{"reset":true,"buckets":{"default":70}}}');
+  assert.equal((await send('/teamclaude/accounts/limits', noisy)).status, 200);
+  const forwarded = requests[3].body;
+  assert.doesNotMatch(forwarded, /__proto__|constructor|note|extra|admin/);
+  assert.deepEqual(JSON.parse(forwarded), { id: 'a1', expected: { switchThreshold: null, maxUsage: null }, switchThreshold: { buckets: { unified5h: '60' } }, maxUsage: { reset: true } });
+  assert.equal((await send('/teamclaude/threshold', JSON.parse('{"expected":0.98,"buckets":{"default":null,"constructor":1},"switchThreshold":1}'))).status, 200);
+  assert.deepEqual(JSON.parse(requests[4].body), { expected: 0.98, buckets: { default: null } });
+  // The preconditions are rebuilt too: only known table keys with plain values.
+  const table = '{"__proto__":{"admin":true},"constructor":0.5,"prototype":1,"typo":0.9,"unified7d":{"x":1},"default":0.98,"unified5h":null}';
+  assert.equal((await send('/teamclaude/accounts/limits', JSON.parse(`{"id":"a1","expected":{"switchThreshold":${table},"maxUsage":${table}},"maxUsage":{"reset":true}}`))).status, 200);
+  assert.doesNotMatch(requests[5].body, /__proto__|constructor|prototype|admin|typo|"x"/);
+  assert.deepEqual(JSON.parse(requests[5].body).expected, { switchThreshold: { default: 0.98, unified5h: null }, maxUsage: { default: 0.98, unified5h: null } });
+  assert.equal((await send('/teamclaude/threshold', JSON.parse(`{"expected":${table},"buckets":{"default":98}}`))).status, 200);
+  assert.doesNotMatch(requests[6].body, /__proto__|constructor|prototype|admin|typo|"x"/);
+  assert.deepEqual(JSON.parse(requests[6].body), { expected: { default: 0.98, unified5h: null }, buckets: { default: 98 } });
+  assert.equal(requests.length, 7);
+
+  const withBuckets = buckets => ({ id: 'a1', expected: { switchThreshold: null, maxUsage: null }, maxUsage: { buckets } });
+  const eight = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`b${i}`, 50]));
+  for (const bad of [
+    { ...account, id: 'x'.repeat(257) },
+    { ...account, id: '' },
+    { ...account, expected: 'stale' },
+    { ...account, switchThreshold: { reset: 'yes' } },
+    { ...account, switchThreshold: [] },
+    withBuckets([50]),
+    withBuckets(eight),
+    withBuckets({ ['k'.repeat(33)]: 50 }),
+    ...['1e2', '98.55', 98.55, ' 98', 0, 101, true, [], '', -5, {}, '060', '100.5'].map(v => withBuckets({ unified7d: v })),
+  ]) assert.equal((await send('/teamclaude/accounts/limits', bad)).status, 400, JSON.stringify(bad));
+  for (const bad of [null, [], { buckets: { default: 99 } }, { expected: 'x', buckets: {} }, { expected: null }, { expected: null, buckets: { default: '1e2' } }]) {
+    assert.equal((await send('/teamclaude/threshold', bad)).status, 400, JSON.stringify(bad));
+  }
+  assert.equal(requests.length, 7, 'nothing malformed was forwarded');
+});

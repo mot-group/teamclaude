@@ -25,13 +25,21 @@ import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from '.
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
+import { QUOTA_BUCKETS, strictPercent } from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
+/**
+ * One field of an account-limits save: drop the account's own value, or set
+ * and clear individual buckets (percentages, null clears).
+ * @typedef {{ reset: true } | { pairs: Array<[string, number|null]> }} LimitChange
+ */
 /**
  * @typedef {Object} ServerHooks
  * @property {(() => Promise<number>)} [reload]
  * @property {(() => Promise<unknown>)} [persistAccounts]
  * @property {((change: Record<string, any>) => Promise<any>)} [saveOverride]
  * @property {((change: { id: string, label: string }) => Promise<void>)} [saveLabel]
+ * @property {((change: { id: string, expected: { switchThreshold: any, maxUsage: any }, switchThreshold?: LimitChange, maxUsage?: LimitChange }) => Promise<{ switchThreshold: any, maxUsage: any }>)} [saveAccountLimits]
+ * @property {((change: { expected: any, pairs: Array<[string, number|null]> }) => Promise<{ switchThreshold: any }>)} [saveFleetThreshold]
  * @property {((hours?: number) => any)} [getForecast]
  * @property {(() => Record<string, any>)} [getStatusExtra]
  * @property {(() => Record<string, any>)} [getQuotaExtra]
@@ -727,6 +735,96 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Thresholds and caps decide rotation for every client of the fleet, so
+      // they are the operator's to change: the shared key, or key-less
+      // loopback. A named client key is a consumer, and gets the same answer the
+      // MCP endpoint gives it (read-only there, see modeFor in mcp-tools.js).
+      if (req.method === 'POST' && req.tcClient
+        && (req.url === '/teamclaude/accounts/limits' || req.url === '/teamclaude/threshold')) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'a named client key cannot change thresholds or caps; use the proxy key' }));
+        return;
+      }
+
+      // Limits endpoint: the account dialog's switch threshold and usage cap,
+      // saved together so both land or neither does. By id, like the rename.
+      // Body: {"id", "expected": {"switchThreshold", "maxUsage"} as status showed
+      // them, "switchThreshold"?: {"reset": true} | {"buckets": {<bucket>: percent|null}},
+      // "maxUsage"?: the same}. `expected` is the precondition: the file may have
+      // changed since the poll the dialog is showing.
+      if (req.method === 'POST' && req.url === '/teamclaude/accounts/limits') {
+        if (!hooks.saveAccountLimits) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'account limits not supported' }));
+          return;
+        }
+        const payload = await readControlJson(req, res);
+        if (payload === undefined) return;
+        const errors = accountLimitsBodyErrors(payload);
+        if (errors.length) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, errors }));
+          return;
+        }
+        // What status shows for the account after the reload: a 409's `current`
+        // is what the page reads on its next poll.
+        const limitsOf = () => {
+          const a = accountManager.accounts.find((/** @type {any} */ x) => x.id === payload.id);
+          return { switchThreshold: a?.switchThreshold ?? null, maxUsage: a?.maxUsage ?? null };
+        };
+        try {
+          // The values the update stored, raw: a hand-edited key the save did
+          // not touch is part of it, even where status drops it.
+          const stored = await hooks.saveAccountLimits({
+            id: payload.id,
+            expected: payload.expected,
+            ...(payload.switchThreshold ? { switchThreshold: limitChange(payload.switchThreshold) } : {}),
+            ...(payload.maxUsage ? { maxUsage: limitChange(payload.maxUsage) } : {}),
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, switchThreshold: stored.switchThreshold, maxUsage: stored.maxUsage }));
+        } catch (err) {
+          sendWriteFailure(res, /** @type {CodedError} */ (err), 'account limits', limitsOf);
+        }
+        return;
+      }
+
+      // Fleet threshold endpoint: the Routing section's editor. Patches the
+      // fleet table bucket by bucket, so editing the default never drops an
+      // override. Body: {"expected": {default, ...buckets} as status showed it,
+      // "buckets": {<bucket|default>: percent|null}}.
+      if (req.method === 'POST' && req.url === '/teamclaude/threshold') {
+        if (!hooks.saveFleetThreshold) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'threshold editing not supported' }));
+          return;
+        }
+        const payload = await readControlJson(req, res);
+        if (payload === undefined) return;
+        const errors = fleetThresholdBodyErrors(payload);
+        if (errors.length) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, errors }));
+          return;
+        }
+        // The table in the form the page builds `expected` from status.
+        const fleetTable = () => {
+          const t = accountManager.switchThreshold;
+          return { default: accountManager.effectiveThreshold, ...(t && typeof t === 'object' ? t : {}) };
+        };
+        try {
+          const stored = await hooks.saveFleetThreshold({
+            expected: payload.expected,
+            pairs: /** @type {{ pairs: Array<[string, number|null]> }} */ (limitChange(payload)).pairs,
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, switchThreshold: stored.switchThreshold }));
+        } catch (err) {
+          sendWriteFailure(res, /** @type {CodedError} */ (err), 'fleet threshold', fleetTable);
+        }
+        return;
+      }
+
       // The /teamclaude/mcp management endpoint is the tool-shaped face of this control plane,
       // off unless proxy.mcp says otherwise. The gates above are the same ones
       // the other /teamclaude/ routes pass, with one addition: a config with no
@@ -897,6 +995,151 @@ export function overrideBodyErrors(body) {
   if (expected.persisted !== null && (typeof expected.persisted !== 'object' || Array.isArray(expected.persisted))) {
     errors.push({ field: 'expected.persisted', message: 'expected.persisted must be an object or null' });
   }
+  return errors;
+}
+
+/**
+ * A control POST's JSON body, or undefined once a 413 or 400 has been sent.
+ * Same rule as the override endpoint: say which of the two it was, never echo
+ * the parser's own message.
+ * @param {http.IncomingMessage} req
+ * @param {http.ServerResponse} res
+ */
+async function readControlJson(req, res) {
+  try {
+    return JSON.parse(await readControlBody(req) || '{}');
+  } catch (err) {
+    const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+    res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: false,
+      errors: [{ field: 'body', message: tooLarge ? 'request body too large' : 'invalid request body' }],
+    }));
+    return undefined;
+  }
+}
+
+/**
+ * The reply for a limits or threshold write the hook refused or could not
+ * finish: 404, 409 with the value as it is now, or a 500 that says whether
+ * the write landed. The reason stays in the log, as for the force endpoint.
+ * @param {http.ServerResponse} res
+ * @param {CodedError} err
+ * @param {string} what
+ * @param {() => unknown} current
+ */
+function sendWriteFailure(res, err, what, current) {
+  if (err.code === 'no-such-account') {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'no such account' }));
+    return;
+  }
+  if (err.code === 'changed-elsewhere') {
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'changed elsewhere', current: current() }));
+    return;
+  }
+  const persisted = err.code === 'reload-failed';
+  console.error(`[TeamClaude] Saving the ${what} failed${persisted ? ' to apply' : ''}:`, err.message);
+  res.writeHead(500, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    ok: false,
+    persisted,
+    error: persisted ? 'saved to the config, but the reload failed; see the proxy log'
+      : `could not save the ${what}; see the proxy log`,
+  }));
+}
+
+/** @param {unknown} v */
+const plainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * What is wrong with a `{ buckets: { <bucket|default>: percent|null } }` map,
+ * one entry per bad key. Percentages go through strictPercent: 98.55 and "1e2"
+ * are refused, not rounded, so what is stored is what the operator typed.
+ * @param {unknown} buckets
+ * @param {string} field where the map sits in the body, for the error
+ * @param {boolean} fleet the fleet default cannot be cleared
+ */
+function bucketErrors(buckets, field, fleet) {
+  if (!plainObject(buckets) || !Object.keys(/** @type {object} */ (buckets)).length) {
+    return [{ field, message: 'buckets must map at least one bucket to a percentage or null' }];
+  }
+  const errors = [];
+  for (const [key, value] of Object.entries(/** @type {Record<string, unknown>} */ (buckets))) {
+    const at = `${field}.${key}`;
+    if (key !== 'default' && !QUOTA_BUCKETS.includes(key)) {
+      errors.push({ field: at, message: `unknown bucket; expected default or one of ${QUOTA_BUCKETS.join(', ')}` });
+    } else if (value === null) {
+      if (fleet && key === 'default') errors.push({ field: at, message: 'the fleet default cannot be cleared; set a percentage' });
+    } else if (strictPercent(value) === null) {
+      errors.push({ field: at, message: 'a percentage from 1 to 100 with at most one decimal' });
+    }
+  }
+  return errors;
+}
+
+/**
+ * The checked body's buckets as the hook takes them: [bucket, percent|null].
+ * @param {{ reset?: true, buckets?: Record<string, number|string|null> }} change
+ * @returns {LimitChange}
+ */
+function limitChange(change) {
+  if (change.reset === true) return { reset: true };
+  return { pairs: Object.entries(change.buckets || {}).map(([k, v]) => [k, v === null ? null : Number(v)]) };
+}
+
+/**
+ * What is wrong with a POST /teamclaude/accounts/limits body, field by field.
+ * Empty when it is usable. Whether the id exists and whether `expected` still
+ * matches the file are the writer's answer (404 / 409).
+ * @param {unknown} body
+ */
+export function accountLimitsBodyErrors(body) {
+  if (!plainObject(body)) return [{ field: 'body', message: 'expected a JSON object' }];
+  const b = /** @type {Record<string, any>} */ (body);
+  const errors = [];
+  if (typeof b.id !== 'string' || !b.id || b.id.length > 256) {
+    errors.push({ field: 'id', message: 'id must be the account id from /teamclaude/status' });
+  }
+  // null (none set), a number, or a per-bucket table: what status shows.
+  const limitValue = (/** @type {unknown} */ v) => v === null || typeof v === 'number' || plainObject(v);
+  if (!plainObject(b.expected)) {
+    errors.push({ field: 'expected', message: 'expected must hold the switchThreshold and maxUsage you read' });
+  } else {
+    for (const key of ['switchThreshold', 'maxUsage']) {
+      if (!limitValue(b.expected[key])) errors.push({ field: `expected.${key}`, message: `expected.${key} must be a number, an object or null` });
+    }
+  }
+  // Absent means "leave it"; a null is not a change this body can describe.
+  if (!Object.hasOwn(b, 'switchThreshold') && !Object.hasOwn(b, 'maxUsage')) {
+    errors.push({ field: 'body', message: 'nothing to change: send switchThreshold, maxUsage or both' });
+  }
+  for (const key of ['switchThreshold', 'maxUsage']) {
+    if (!Object.hasOwn(b, key)) continue;
+    const change = b[key];
+    if (plainObject(change) && change.reset === true && !('buckets' in change)) continue;
+    if (!plainObject(change) || 'reset' in change) {
+      errors.push({ field: key, message: `${key} must be {"reset": true} or {"buckets": {...}}` });
+      continue;
+    }
+    errors.push(...bucketErrors(change.buckets, `${key}.buckets`, false));
+  }
+  return errors;
+}
+
+/**
+ * What is wrong with a POST /teamclaude/threshold body, field by field.
+ * @param {unknown} body
+ */
+export function fleetThresholdBodyErrors(body) {
+  if (!plainObject(body)) return [{ field: 'body', message: 'expected a JSON object' }];
+  const b = /** @type {Record<string, any>} */ (body);
+  const errors = [];
+  if (typeof b.expected !== 'number' && !plainObject(b.expected)) {
+    errors.push({ field: 'expected', message: 'expected must be the threshold table you read' });
+  }
+  errors.push(...bucketErrors(b.buckets, 'buckets', true));
   return errors;
 }
 

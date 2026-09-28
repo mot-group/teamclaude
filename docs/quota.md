@@ -93,7 +93,7 @@ teamclaude threshold unified7d=90     # add or change one bucket
 teamclaude threshold unified7d=default  # drop it again
 ```
 
-A running server picks the change up on the reload the command sends it. This is the only way to edit a per-bucket table in place: the TUI shows it read-only, and the single-number form there would flatten it.
+A running server picks the change up on the reload the command sends it. The web dashboard can edit the table in place too, from **Routing > Switch thresholds** (see [Editing limits from the dashboard](#editing-limits-from-the-dashboard)). The TUI shows a table read-only, because its single-number form would flatten it.
 
 ### Per-account thresholds
 
@@ -130,7 +130,7 @@ A bare-number override reads `switch at 100%` instead. The TUI and the dashboard
 
 A bare number whose default matches the fleet's can still move a bucket, because it outranks the fleet's per-bucket entries: with a fleet `{ "default": 0.98, "unified7d": 0.85 }`, an account set to `0.98` rotates off the weekly bucket at 98%, not 85%, and is shown as `switch 7d 98%`.
 
-No CLI editor for this one, matching `maxUsage`: hand-edit the config and let a running server pick it up on reload, or restart. Values are ratios: a number must be above 0 and at most 1 (`1.0` is valid, `98` is not). An out-of-range or non-numeric entry is ignored, the account falls back to the fleet value for it, and one log line names the account and the field.
+There is no CLI editor for this one, matching `maxUsage`. Edit it from the account's **Details** dialog in the web dashboard, which saves and applies it without a restart (see [Editing limits from the dashboard](#editing-limits-from-the-dashboard)). You can also hand-edit the config and let a running server pick it up on reload, or restart. In the file, values are ratios: a number must be above 0 and at most 1 (`1.0` is valid, `98` is not). An out-of-range or non-numeric entry is ignored, the account falls back to the fleet value for it, and one log line names the account and the field.
 
 ## Per-account usage caps
 
@@ -167,7 +167,55 @@ A cap shows on the status screen before it binds — marked on the bar it applie
 
 The mark stays inside the bar rather than widening it, so capped and uncapped rows still line up. In the TUI the bar reddens at the cap instead of at the switch threshold.
 
-Edits apply live on config reload — no restart.
+Edits apply live on config reload, with no restart. The account's **Details** dialog in the web dashboard edits the cap next to the switch threshold.
+
+## Editing limits from the dashboard
+
+The web dashboard edits the fleet threshold and each account's own threshold and cap. It works the same on the proxy's page and on the [LAN dashboard](lan-dashboard.md). Every save is one config write and one reload, so the next routing decision uses it. Nothing needs a restart.
+
+Values are percentages of the quota window, from 1 to 100 with at most one decimal: `100`, `99.5` and `60` are fine. The page names any other entry, such as `98.55`, `1e2`, `0` or `101`, and sends nothing. The proxy repeats that check and answers `400` naming the bucket. The config still stores ratios, so `100` is saved as `1`.
+
+### Account limits
+
+An account's **Details** dialog has a **Rotation limits** table. The first row is **All buckets**. Below it is one row for each bucket the account actually has:
+
+- Claude OAuth: 5-hour, Weekly, Sonnet weekly, Fable weekly.
+- Codex: 5-hour, Weekly.
+- API key: Tokens, Requests.
+- Third-party backend: none, so only All buckets.
+
+A configured route that assigns a bucket to one of this account's models adds that row too, tagged "via route <name>". Each row has a **Switch at** box for `switchThreshold` and a **Cap** box for `maxUsage`. An empty Switch at inherits the All buckets value, then the fleet. An empty Cap means no cap. The **In force** column shows what the router uses for that bucket and where it comes from, and adds "binds" when the cap is the lower of the two. A stored bucket the account doesn't have is listed under the table as "Also stored, not editable here". Save limits never changes it, though Reset to inherited removes it with the rest of the field.
+
+**Save limits** sends only the boxes you changed. Clearing a box removes that bucket's key. A table left holding only `default` is stored as a bare number, so All buckets at `100` and every other box empty saves `"switchThreshold": 1`. **Reset to inherited** asks once, then removes both `switchThreshold` and `maxUsage` from the account. It then follows the fleet threshold and has no cap.
+
+The dialog addresses the account by its config `id`, so two accounts that share a name can't be confused. The proxy gives every entry an id when it loads the config. If an account has none yet, its editors stay disabled until a config reload gives it one.
+
+### Fleet threshold
+
+**Routing > Switch thresholds** edits the fleet `switchThreshold`. It has a **Default** row plus one row per bucket, and In force marks each bucket `· override` or `· default`. Changing Default keeps every bucket override, and clearing a bucket drops only its override. Default can't be empty. Under the table, the panel lists accounts whose own threshold outranks the fleet, with the buckets it covers, because a fleet edit won't move those accounts.
+
+### Changed elsewhere
+
+Every save carries the values the page was showing. The proxy re-reads the config inside the write and compares them with what is on disk. If the CLI, the TUI, MCP, a hand edit or another browser tab changed them since, the proxy answers `409` with the current values and writes nothing. The page says "Not saved: changed elsewhere since you opened this" with the current values, and offers **Use current**. That adopts the current values as the new starting point and keeps whatever you typed, so the next Save applies your edit on top of them. The comparison covers `default` and the known bucket names only. A key TeamClaude doesn't recognise is never compared and never changed.
+
+A reload that fails after the write answers `500` with `persisted: true`. The file changed but the router did not, so reload the config to apply it. The LAN dashboard has no Reload config button, so use the proxy's own page or the TUI. `persisted: false` means nothing was written.
+
+### Endpoints
+
+The dashboard posts to two control endpoints, behind the same key and same-origin gate as `/teamclaude/switch`. `POST /teamclaude/accounts/limits` takes the account id, the `expected` values, and a change per field, either `{ "buckets": { <bucket>: percent or null } }` or `{ "reset": true }`. A field left out is not touched:
+
+```json
+{ "id": "a1b2c3", "expected": { "switchThreshold": null, "maxUsage": null },
+  "switchThreshold": { "buckets": { "default": 100 } } }
+```
+
+`POST /teamclaude/threshold` takes the fleet table as the page saw it and the buckets to change:
+
+```json
+{ "expected": { "default": 0.98 }, "buckets": { "unified7d": 90 } }
+```
+
+A `200` reply carries the values the write stored. A `404` from the account endpoint means no account has that id, and nothing was written.
 
 ## Third-party backend quota
 

@@ -3033,7 +3033,9 @@ export class AccountManager {
       ...sample, blocked, route: route?.name || null, pinned: this._pinnedAccountForModel(model)?.name || null,
       target: blocked ? null : this._routeTarget(model, provider),
       accounts: this.accounts.filter(a => !excluded?.has(a.index) && this._routeAllows(a, model))
-        .map(a => ({ name: a.name, eligible: !blocked && this._isAvailable(a, model) })),
+        // `id` tells apart two accounts sharing a name, so the dashboard can
+        // offer a route's bucket to the one account the route admits.
+        .map(a => ({ id: a.id || null, name: a.name, eligible: !blocked && this._isAvailable(a, model) })),
     };
   }
 
@@ -4538,6 +4540,9 @@ export class AccountManager {
         provider: providerOf(a),
         type: a.type,
         orgName: a.orgName || null,
+        // A third-party backend (config `upstream`) has no Anthropic quota
+        // buckets. The flag only: the URL itself stays off the wire.
+        backend: !!a.upstream,
         priority: a.priority || 0,
         // The attached TUI spreads these fields onto its own account objects
         // and sorts its rows by this one, so without it `teamclaude attach`
