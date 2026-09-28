@@ -3367,12 +3367,21 @@ export class AccountManager {
     // request that cannot be sent there settles nothing and leaves the event too.
     const spends = !scopedRouting
       || (scope != null && canRouteTo(this.accounts[this.currentIndex]));
+    // The fleet whose cursor the switch would move: the provider a selection walk
+    // is choosing for, or the one that owns currentIndex for a poll. With the
+    // knob off `scope` is null, so without this a Codex request spent an
+    // Anthropic account's reset, moved the slot onto it mid-walk, and the walk
+    // then re-picked its Codex account from scratch, dropping the operator's
+    // manual choice.
+    const fleet = this._selectingProvider ?? providerOf(this.accounts[this.currentIndex]);
     const sessionReset = [];
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
       if (r.changed) changed = true;
       // Clearing windows is a poll's whole job. Spending the event is not.
       if (!spends) continue;
+      // Another provider's reset is left pending for a walk of its own.
+      if (!canServeProvider(account, fleet)) continue;
       // The reset belongs to the first request that can act on it, so consuming
       // the flag for one that cannot leaves the next nothing to act on. Read
       // after _clearExpiredQuotas, since before it every account refuses.

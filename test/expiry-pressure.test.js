@@ -1386,9 +1386,12 @@ test('path 3: the knob-off poll spends the reset on sight', () => {
     'the knob-off poll skipped a switch the router performs');
 });
 
-test('path 3: the knob-off switch sees the whole fleet', () => {
-  // The exclusion is gated at the call site for the reason the model is. Both
-  // challengers rank equally off, so the tiebreak takes the Codex account.
+test('path 3: the knob-off switch keeps to the cursor\'s provider', () => {
+  // The exclusion is gated at the call site for the reason the model is, but the
+  // provider partition is not: an Anthropic request cannot be sent to a Codex
+  // account, so the switch must not install one. The tiebreak would take the
+  // Codex account, which resets first; the Anthropic challenger wins instead and
+  // the Codex reset stays pending for a Codex walk.
   const am = mgr([oauth('cur'), oauth('anth'), oauth('codex', { provider: 'codex' })], { expiry: OFF });
   bucket(am, 0, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7d', 0.50, 40);
@@ -1397,11 +1400,11 @@ test('path 3: the knob-off switch sees the whole fleet', () => {
     am.accounts[i].quota.unified5h = 0.5;
     am.accounts[i].quota.unified5hReset = Date.now() - 1000;
   }
-  // The switch's own pick, read before the walk can move the cursor again: an
-  // Anthropic request cannot be sent where the knob-off switch installs.
   am.refreshExpiredQuotas(OPUS, am._excludeOtherProviders(null, DEFAULT_PROVIDER));
-  assert.equal(am.accounts[am.currentIndex].name, 'codex',
-    'the knob-off switch dropped a candidate the router keeps');
+  assert.equal(am.accounts[am.currentIndex].name, 'anth',
+    'the knob-off switch installed an account of another provider');
+  assert.equal(am.accounts[2].sessionResetPending, true,
+    'an Anthropic walk spent the Codex account\'s reset');
 });
 
 test('path 3: the knob-off switch keeps a spent account out', () => {
