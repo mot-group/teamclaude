@@ -440,7 +440,11 @@ function formatSessions(sessions, paint) {
   else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');
-  return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
+  // Conversations graceful switch is letting finish on an account past its
+  // threshold. Said only while there are some: the setting itself is config.
+  const graceful = sessions.graceful || 0;
+  const held = graceful ? ` ${paint.dim('·')} ${paint.yellow(`finishing ${graceful}`)}` : '';
+  return `${active} active / ${known} known ${paint.dim('·')} ${mode}${held}`;
 }
 
 // Weekly buckets, named for the model family an operator thinks in rather than

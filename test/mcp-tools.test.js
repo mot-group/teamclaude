@@ -79,7 +79,7 @@ test('full mode lists every tool in a fixed order, annotated', async () => {
     'get_status', 'get_quota', 'get_settings',
     'switch_account', 'reload_config', 'probe_quota',
     'set_account_enabled', 'set_account_priority', 'set_account_routing', 'remove_account',
-    'set_threshold', 'set_distribution', 'set_probe_interval', 'set_warmup',
+    'set_threshold', 'set_distribution', 'set_graceful_switch', 'set_probe_interval', 'set_warmup',
     'set_route', 'remove_route', 'set_blocked_models', 'set_client_mode',
   ]);
   const byName = Object.fromEntries(listed.map(t => [t.name, t]));

@@ -207,6 +207,7 @@ teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude threshold 90      # Utilization at which rotation leaves an account
 teamclaude distribute on     # Spread new sessions across equal-priority accounts
+teamclaude graceful on       # Let conversations mid-turn finish on the old account
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
 teamclaude warmup reset 15:30 --timezone Europe/Moscow
@@ -284,7 +285,7 @@ The running server can expose its control plane to Claude Code (or any other MCP
 { "proxy": { "mcp": "read" } }
 ```
 
-`"read"` serves `get_status` (the fleet at a glance: server version, current account, and for each account its priority, whether it is disabled, whether rotation can use it and why not, sessions and known quota windows), `get_quota` and `get_settings`. `"full"` adds everything the CLI's management commands can do: `switch_account`, `reload_config`, `probe_quota`, `set_account_enabled`, `set_account_priority`, `set_account_routing`, `remove_account`, `set_threshold`, `set_distribution`, `set_probe_interval`, `set_warmup`, `set_route`, `remove_route`, `set_blocked_models` and `set_client_mode`. There is no tool for adding accounts or handling account credentials, and none for changing `proxy.mcp` itself. `set_account_routing` does take a proxy URL with its password, and the write log prints that URL masked. `reload_config` re-reads the file and reports how many accounts it added and how many it removed: an account whose entry is gone from the file is dropped from the running fleet (see [accounts](accounts.md)). A reload picks the `proxy.mcp` setting up, so the endpoint can be opened, narrowed or closed while the server runs.
+`"read"` serves `get_status` (the fleet at a glance: server version, current account, and for each account its priority, whether it is disabled, whether rotation can use it and why not, sessions and known quota windows), `get_quota` and `get_settings`. `"full"` adds everything the CLI's management commands can do: `switch_account`, `reload_config`, `probe_quota`, `set_account_enabled`, `set_account_priority`, `set_account_routing`, `remove_account`, `set_threshold`, `set_distribution`, `set_graceful_switch`, `set_probe_interval`, `set_warmup`, `set_route`, `remove_route`, `set_blocked_models` and `set_client_mode`. There is no tool for adding accounts or handling account credentials, and none for changing `proxy.mcp` itself. `set_account_routing` does take a proxy URL with its password, and the write log prints that URL masked. `reload_config` re-reads the file and reports how many accounts it added and how many it removed: an account whose entry is gone from the file is dropped from the running fleet (see [accounts](accounts.md)). A reload picks the `proxy.mcp` setting up, so the endpoint can be opened, narrowed or closed while the server runs.
 
 Point Claude Code at it once; `teamclaude run` and `teamclaude env` already keep loopback out of the proxy variables, so the connection goes straight to the server and is key-exempt like every other loopback caller:
 

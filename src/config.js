@@ -107,6 +107,7 @@ export function createDefaultConfig() {
     holdSeconds: 0,
     distributeSessions: false,
     preferFableDepletedAccounts: false,
+    gracefulSwitch: false,
     sessionTitles: { enabled: false, width: 18 },
     quotaBarPercent: true,
     eventLogging: 'hide',

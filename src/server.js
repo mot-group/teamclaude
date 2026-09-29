@@ -44,6 +44,7 @@ import { envVar, legacyControlUrl } from './brand.js';
  * @property {(() => Promise<unknown>)} [persistAccounts]
  * @property {((change: Record<string, any>) => Promise<any>)} [saveOverride]
  * @property {((change: { id: string, label: string }) => Promise<void>)} [saveLabel]
+ * @property {((enabled: boolean) => Promise<void>)} [saveGracefulSwitch]
  * @property {((change: { id: string, expected: { switchThreshold: any, maxUsage: any }, switchThreshold?: LimitChange, maxUsage?: LimitChange }) => Promise<{ switchThreshold: any, maxUsage: any }>)} [saveAccountLimits]
  * @property {((change: { expected: any, pairs: Array<[string, number|null]> }) => Promise<{ switchThreshold: any }>)} [saveFleetThreshold]
  * @property {((hours?: number) => any)} [getForecast]
@@ -387,6 +388,7 @@ export function resolveClientAuth(proxyConfig, presented) {
 // See the check in createProxyServer for why a tenant may not reach these.
 // The threshold and limit editors refuse client keys in their own handlers.
 const CLIENT_KEY_REFUSED_PATHS = new Map([
+  ['/teamclaude/graceful', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
 ]);
@@ -847,6 +849,32 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             applied: false,
             error: persisted ? 'reload failed; see the proxy log' : 'could not save the override; see the proxy log',
           }));
+        }
+        return;
+      }
+
+      // Graceful switch endpoint: the Routing panel's toggle. Body:
+      // {"enabled": true|false}. Saved to the config and applied by the reload,
+      // in the same queue as the other dashboard writes.
+      if (req.method === 'POST' && req.url === '/teamclaude/graceful') {
+        if (!hooks.saveGracefulSwitch) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'graceful switch not supported' }));
+          return;
+        }
+        const payload = await readControlJson(req, res);
+        if (payload === undefined) return;
+        if (typeof payload?.enabled !== 'boolean') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, errors: [{ field: 'enabled', message: 'enabled is true or false' }] }));
+          return;
+        }
+        try {
+          await hooks.saveGracefulSwitch(payload.enabled);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, gracefulSwitch: accountManager.gracefulSwitch === true }));
+        } catch (err) {
+          sendWriteFailure(res, /** @type {CodedError} */ (err), 'graceful switch', () => accountManager.gracefulSwitch === true);
         }
         return;
       }
