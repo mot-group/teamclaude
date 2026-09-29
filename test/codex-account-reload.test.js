@@ -46,16 +46,16 @@ for (const opaque of [false, true]) {
 test('reload resolves new and reappearing Codex files without admitting empty credentials', async t => {
   const { disk, mem, write } = await fileFixture(t, { missing: true });
   const am = new AccountManager([]);
-  for (let i = 0; i < 2; i++) assert.equal(await syncAccountsFromDisk(disk, mem, am), 0);
+  for (let i = 0; i < 2; i++) assert.equal((await syncAccountsFromDisk(disk, mem, am)).added, 0);
   assert.equal(mem.accounts.length, 1);
   assert.equal(am.accounts.length, 0);
   await write('A');
-  assert.equal(await syncAccountsFromDisk(disk, mem, am), 1);
+  assert.equal((await syncAccountsFromDisk(disk, mem, am)).added, 1);
   assert.equal(am.accounts[0].accountId, 'A');
   assert.equal(mem.accounts[0].accountId, undefined);
   const freshMem = { accounts: [] };
   const freshAm = new AccountManager([]);
-  assert.equal(await syncAccountsFromDisk(disk, freshMem, freshAm), 1);
+  assert.equal((await syncAccountsFromDisk(disk, freshMem, freshAm)).added, 1);
   assert.equal(freshAm.accounts[0].id, freshMem.accounts[0].id);
   assert.equal(freshAm.accounts[0].refreshToken, 'file-refresh-A');
 });

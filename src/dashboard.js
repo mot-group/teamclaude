@@ -16,9 +16,24 @@
 
 import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
+import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml({ sessionAuth = false } = {}) {
   return PAGE.replace("var SESSION_AUTH = false;", `var SESSION_AUTH = ${sessionAuth};`);
+}
+
+/**
+ * The body of every `<script>` in the page, in order. Attribute-free tags only,
+ * which is all this page has and all the hash policy can admit anyway.
+ *
+ * @param {string} html
+ */
+export function inlineScripts(html) {
+  const out = [];
+  const re = /<script>([\s\S]*?)<\/script>/g;
+  let m;
+  while ((m = re.exec(html)) !== null) out.push(m[1]);
+  return out;
 }
 
 /**
@@ -26,20 +41,25 @@ export function renderDashboardHtml({ sessionAuth = false } = {}) {
  *
  * The page holds the proxy key in localStorage, so the policy is the backstop
  * for a script that should never run there: nothing loads from anywhere
- * (`default-src 'none'`), the one inline script is admitted by its hash rather
- * than by `'unsafe-inline'` — the page is static, so the hash is stable — and
- * the only network the script may touch is this origin, for status and switch.
+ * (`default-src 'none'`), each inline script (the theme bootstrap in `<head>`
+ * and the main script) is admitted by its hash rather than by
+ * `'unsafe-inline'` — the page is static, so the hashes are stable — and the
+ * only network the script may touch is this origin, for status and switch.
  * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
  * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
  * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
  * another site's iframe, where a click on "switch" could be overlaid.
  */
 export function dashboardCsp(html = PAGE) {
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-  const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+  // Every inline script, not just the first: the theme is applied by a short
+  // script in <head> so the page does not paint dark and then flip to light,
+  // and a hash that covered only the main script would leave that one blocked.
+  const hashes = inlineScripts(html)
+    .map(script => `'sha256-${createHash('sha256').update(script, 'utf8').digest('base64')}'`)
+    .join(' ');
   return [
     "default-src 'none'",
-    `script-src 'sha256-${hash}'`,
+    `script-src ${hashes}`,
     "style-src 'unsafe-inline'",
     "connect-src 'self'",
     "base-uri 'none'",
@@ -469,6 +489,14 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // or the comparison falls back to thresholdBadgeText's own 0.98 default.
   var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
   if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
+  // Extra-usage fallback: one badge, the louder state winning. Strict `true`
+  // so a missing field on an older server's payload shows nothing.
+  if (a.onExtraUsage === true) badges.push({ cls: 'extra-usage billing', text: 'on extra usage \u2014 billing' });
+  else if (a.allowExtraUsage === true) badges.push({ cls: 'extra-usage', text: 'extra usage allowed' });
+  // The account's own egress proxy, as the status payload carries it: already
+  // password-masked (describeRouting), and absent for an account on the fleet
+  // path, which is the default and earns no badge.
+  if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
   return badges;
 }
 
@@ -1334,6 +1362,30 @@ export function fleetOutcome(status, res, canReload) {
   return limitsOutcome(status, res, false, canReload);
 }
 
+// The usage views the page offers, derived from the windows the tracker
+// actually keeps rather than listed again here: a window added or renamed in
+// client-usage.js must not leave a button behind that reads zero for everyone.
+// `total` is first because it is the lifetime counter the status payload has
+// always carried, and the view the page opens on.
+export const USAGE_VIEWS = [{ key: 'total', label: 'Total' }].concat(
+  Object.keys(USAGE_WINDOWS).map(key => ({ key, label: 'Last ' + key })));
+
+// Which counters one usage row shows. Every usage table reads the selected
+// window through this, rather than each renderer reaching into `windows`
+// itself — the Clients table and the per-dimension tables carry the same shape
+// and must not drift into answering the same question differently.
+/** @param {any} entry @param {string} [view] */
+export function usageFor(entry, view) {
+  var e = entry || {};
+  var src = !view || view === 'total' ? e : ((e.windows || {})[view] || {});
+  return {
+    requests: src.requests || 0,
+    connections: src.connections || 0,
+    inputTokens: src.inputTokens || 0,
+    outputTokens: src.outputTokens || 0,
+  };
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
@@ -1341,7 +1393,7 @@ const SHARED_HELPERS = [
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
   currentFor, accountLabel, gatingUtilization, quotaGate, latestReset,
   offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, reloadStep, limitsOutcome,
-  fleetInForce, fleetRequest, fleetOutcome,
+  fleetInForce, fleetRequest, fleetOutcome, usageFor,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1358,6 +1410,7 @@ const SHARED_CONSTS = [
   `var QUOTA_NEAR_BAND = ${QUOTA_NEAR_BAND};`,
   `var RESET_WINDOW_BUCKETS = ${JSON.stringify(RESET_WINDOW_BUCKETS)};`,
   `var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};`,
+  `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -1716,7 +1769,7 @@ const PAGE = `<!doctype html>
     </section>
     <section data-section="activity" hidden class="section-body">
       <div id="overview" class="stats"></div><div class="split"><section><h2>Request activity</h2><div class="card"><p class="usage">Requests observed while this page is open</p><div class="history empty-chart" id="history" role="img" aria-label="This chart fills while the page is open and resets on reload.">No samples yet</div><p class="history-label" id="historyLabel">This chart fills while the page is open and resets on reload.</p></div></section><section><h2>Token accounting</h2><div class="card" id="tokens"></div></section></div>
-      <div id="clientsWrap"><h2>Clients</h2><div class="card"><table id="clients"></table></div></div><div id="dimensionsWrap"></div>
+      <div class="quota-toggle" role="group" aria-label="Usage window" id="usageViewWrap" style="display:none"></div><div id="clientsWrap"><h2 id="clientsHeading">Clients</h2><div class="card"><table id="clients"></table></div></div><div id="dimensionsWrap"></div>
       <section id="sessionsWrap"><h2>Claude session activity</h2><p class="sub" id="sessionActivity"></p><p class="usage" id="sessionKnown"></p><p class="usage">Counts only requests carrying a Claude session ID. A session remains recent for two minutes after a request, or while a request is running. Codex and requests without a session ID are not included. This does not count open apps or terminals.</p><div class="card"><div class="filters"><label>Project <select id="fProject"></select></label><label>Client <select id="fClient"></select></label><span class="hint" id="sessionCount"></span></div><table id="sessions"></table></div></section>
     </section>
     <section data-section="routing" hidden class="section-body">
@@ -1752,6 +1805,11 @@ const PAGE = `<!doctype html>
   function shown(name, provider) { return accountLabel(lastStatus, name, provider); }
   var quotaMode = 'spent';
   try { if (localStorage.getItem('teamclaude-quota-display') === 'left') quotaMode = 'left'; } catch {}
+  // The usage window applies to every table the usage trackers feed (Clients
+  // and each configured dimension), so it is page state rather than per-table.
+  // Like the sort, it survives the poll.
+  var usageView = 'total';
+  var usageButtons = [];
   var detailAccount = null;
   var switchPending = false;
   var forceRoute = null;
@@ -2470,33 +2528,79 @@ ${SHARED_HELPERS}
     var row = el('tr'); row.appendChild(el('td', 'usage', text)); table.appendChild(row);
   }
 
+  // The window a usage table is showing, in its own heading. The control sits
+  // above the Clients table, but the dimension tables are below it and can be
+  // scrolled clear of it — and a five-hour figure under a bare "Input tok" is
+  // the one way this feature can state a number under the wrong label.
+  // Last used is a lifetime figure in a table whose heading may name a window.
+  // Under Total that needs no saying; under a window it does, or it reads as
+  // the one thing this control must never do — a number under the wrong label.
+  function lastUsedLabel() {
+    return usageView === 'total' ? 'Last used' : 'Last used (all time)';
+  }
+
+  function usageHeading(base) {
+    if (usageView === 'total') return base;
+    var view = USAGE_VIEWS.filter(function (v) { return v.key === usageView; })[0];
+    return view ? base + ' · ' + view.label.toLowerCase() : base;
+  }
+
   function renderClients(clients) {
     var wrap = document.getElementById('clientsWrap');
     var names = Object.keys(clients || {});
     if (!names.length) { wrap.style.display = ''; emptyTable('clients', 'No client-attributed usage yet. Requests using the shared proxy key are unattributed.'); return; }
     wrap.style.display = '';
+    document.getElementById('clientsHeading').textContent = usageHeading('Clients');
+    // Sorted on the window being shown, not on the lifetime total: a table
+    // ordered by all-time spend while displaying the last five hours would put
+    // the quiet clients on top of the busy one.
     names.sort(function (a, b) {
-      var ca = clients[a], cb = clients[b];
-      return ((cb.inputTokens || 0) + (cb.outputTokens || 0)) - ((ca.inputTokens || 0) + (ca.outputTokens || 0));
+      var ua = usageFor(clients[a], usageView), ub = usageFor(clients[b], usageView);
+      return (ub.inputTokens + ub.outputTokens) - (ua.inputTokens + ua.outputTokens);
     });
     var table = document.getElementById('clients');
     table.textContent = '';
     var hr = el('tr');
-    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
+    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', lastUsedLabel()].forEach(function (h, i) {
       hr.appendChild(el('th', i ? 'num' : '', h));
     });
     table.appendChild(hr);
     names.forEach(function (n) {
       var c = clients[n];
+      var u = usageFor(c, usageView);
       var tr = el('tr');
       tr.appendChild(el('td', '', n));
-      tr.appendChild(el('td', 'num', fmtNum(c.requests)));
-      tr.appendChild(el('td', 'num', fmtNum(c.connections || 0)));
-      tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
-      tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(u.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(u.connections)));
+      tr.appendChild(el('td', 'num', fmtNum(u.inputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(u.outputTokens)));
+      // Last used stays the lifetime figure under every window: it answers
+      // when this client was last seen at all, which a window cannot.
       tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
       table.appendChild(tr);
     });
+  }
+
+  // The window buttons, built once: the windows are fixed by the server that
+  // served this page. Visibility is decided per render, since the control only
+  // means something when there is a usage table under it.
+  function buildUsageViews() {
+    var wrap = document.getElementById('usageViewWrap');
+    USAGE_VIEWS.forEach(function (v) {
+      var btn = el('button', '', v.label);
+      btn.addEventListener('click', function () {
+        usageView = v.key;
+        markUsageView();
+        if (lastStatus) render(lastStatus);
+      });
+      wrap.appendChild(btn);
+      usageButtons.push({ key: v.key, btn: btn });
+    });
+    markUsageView();
+  }
+
+  function markUsageView() {
+    usageButtons.forEach(function (b) { b.btn.setAttribute('aria-pressed', String(b.key === usageView)); });
   }
 
   // Header cells that re-sort in place. The sort is state, not a re-fetch, so
@@ -2599,11 +2703,12 @@ ${SHARED_HELPERS}
       var entries = dimensions[name] || {};
       var rows = Object.keys(entries).map(function (key) {
         var e = entries[key] || {};
+        var u = usageFor(e, usageView);
         return {
           name: key,
-          requests: e.requests || 0,
-          inputTokens: e.inputTokens || 0,
-          outputTokens: e.outputTokens || 0,
+          requests: u.requests,
+          inputTokens: u.inputTokens,
+          outputTokens: u.outputTokens,
           lastUsed: e.lastUsed ? Date.parse(e.lastUsed) : 0,
         };
       });
@@ -2611,7 +2716,7 @@ ${SHARED_HELPERS}
       sortState[name] = sortState[name] || { key: 'inputTokens', dir: 'desc' };
       rows = sortRows(rows, sortState[name].key, sortState[name].dir);
 
-      wrap.appendChild(el('h2', '', name.charAt(0).toUpperCase() + name.slice(1)));
+      wrap.appendChild(el('h2', '', usageHeading(name.charAt(0).toUpperCase() + name.slice(1))));
       var card = el('div', 'card');
       card.style.padding = '4px 6px';
       var table = el('table');
@@ -2620,7 +2725,7 @@ ${SHARED_HELPERS}
         { key: 'requests', label: 'Req', num: true },
         { key: 'inputTokens', label: 'Input tok', num: true },
         { key: 'outputTokens', label: 'Output tok', num: true },
-        { key: 'lastUsed', label: 'Last used', num: true }].forEach(function (c) {
+        { key: 'lastUsed', label: lastUsedLabel(), num: true }].forEach(function (c) {
         addSortableHeader(hr, name, c.label, c.key, !!c.num);
       });
       table.appendChild(hr);
@@ -3126,6 +3231,10 @@ ${SHARED_HELPERS}
     renderFleet(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
+    // The control means nothing with no usage table under it. The payload
+    // already answers that: the server omits a dimension with no entries.
+    var anyUsage = Object.keys(s.clients || {}).length || Object.keys(s.usageDimensions || {}).length;
+    document.getElementById('usageViewWrap').style.display = anyUsage ? '' : 'none';
     renderSessions(s.sessions);
     document.getElementById('foot').textContent = 'Status refreshes every ' + (POLL_MS / 1000) + 's' + (lastUpdated ? ' · Last received ' + new Date(lastUpdated).toLocaleTimeString() : '') + (s.server && s.server.uptimeSeconds != null ? ' · Proxy uptime ' + fmtIn(s.server.uptimeSeconds) : '');
   }
@@ -3436,6 +3545,7 @@ ${SHARED_HELPERS}
     if (e.key === 'Enter') document.getElementById('go').click();
   });
   document.getElementById('refresh').addEventListener('click', poll);
+  buildUsageViews();
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'Config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'Quota probe', this); });
   window.addEventListener('hashchange', showView);

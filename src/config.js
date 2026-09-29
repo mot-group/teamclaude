@@ -1,16 +1,23 @@
 import { readFile, open, mkdir, chmod, rename, unlink, realpath } from 'node:fs/promises';
-import { openSync, writeSync, closeSync, readFileSync, statSync } from 'node:fs';
+import { openSync, writeSync, closeSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
 import { ensureAccountIds } from './account-id.js';
 import { normalizeAccountSources } from './account-source.js';
+import { envVar, NAME, LEGACY_NAME } from './brand.js';
 
 export function getConfigPath() {
-  if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
+  const fromEnv = envVar('CONFIG');
+  if (fromEnv) return fromEnv;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  return join(configDir, 'teamclaude.json');
+  // The renamed file is used when it exists; until then, and for a fresh
+  // install, the file keeps its current name (issue #72, phase 1). The state
+  // file, crash log and certificates sit beside whichever one this returns.
+  const renamed = join(configDir, `${NAME}.json`);
+  if (existsSync(renamed)) return renamed;
+  return join(configDir, `${LEGACY_NAME}.json`);
 }
 
 /**
@@ -101,9 +108,15 @@ export function createDefaultConfig() {
     distributeSessions: false,
     preferFableDepletedAccounts: false,
     sessionTitles: { enabled: false, width: 18 },
+    quotaBarPercent: true,
     eventLogging: 'hide',
     defaultClientMode: 'mitm',
+    // Written out rather than left absent, so a fresh config states the one
+    // setting whose default matters most: a redemption cannot be undone and the
+    // credits are scarce, so nothing spends one until this is switched on.
+    autoRedeemResets: false,
     blockedModels: [],
+    stripOverageHeaders: false,
     accounts: [],
   };
 }
@@ -192,6 +205,14 @@ const LOCK_STALE_MS = 10_000;
 const LOCK_WAIT_MS = 2_000;
 const LOCK_POLL_MS = 25;
 
+/** The wait budget, read per acquisition: TEAMCLAUDE_CONFIG_LOCK_WAIT_MS
+ * overrides the 2 s for a deployment whose writers are known to hold the
+ * lock longer (and lets a test pick a budget its assertions do not race). */
+function lockWaitMs() {
+  const env = Number(envVar('CONFIG_LOCK_WAIT_MS'));
+  return env > 0 ? env : LOCK_WAIT_MS;
+}
+
 /** @param {string} lockPath */
 function lockIsStale(lockPath) {
   let pid, at;
@@ -214,7 +235,8 @@ function lockIsStale(lockPath) {
  * @param {string} lockPath
  */
 async function acquireConfigLock(lockPath) {
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const waitMs = lockWaitMs();
+  const deadline = Date.now() + waitMs;
   for (;;) {
     try {
       const fd = openSync(lockPath, 'wx', 0o600);
@@ -232,7 +254,7 @@ async function acquireConfigLock(lockPath) {
       continue;
     }
     if (Date.now() >= deadline) {
-      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${LOCK_WAIT_MS}ms; writing the config without it`);
+      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
       return false;
     }
     await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));

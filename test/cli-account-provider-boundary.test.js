@@ -10,7 +10,9 @@ import { fileURLToPath } from 'node:url';
 const cliPath = process.env.TEAMCLAUDE_TEST_CLI
   || fileURLToPath(new URL('../src/index.js', import.meta.url));
 
-async function runAccountCommand(accounts, command = ['accounts', '--verbose']) {
+// `direct` leaves out upstreamProxy: every request through it is a CONNECT
+// tunnel, which hides the Authorization header a test may need to read.
+async function runAccountCommand(accounts, command = ['accounts', '--verbose'], { direct = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'teamclaude-provider-cli-'));
   const configPath = join(directory, 'config.json');
   const connections = [];
@@ -28,7 +30,7 @@ async function runAccountCommand(accounts, command = ['accounts', '--verbose']) 
     await writeFile(configPath, JSON.stringify({
       proxy: { port: 3, apiKey: 'synthetic-proxy-key' },
       upstream: `http://127.0.0.1:${proxy.address().port}`,
-      upstreamProxy: `http://127.0.0.1:${proxy.address().port}`,
+      ...(direct ? {} : { upstreamProxy: `http://127.0.0.1:${proxy.address().port}` }),
       autoUpdate: false,
       accounts,
     }));
@@ -112,7 +114,7 @@ test('Anthropic API convenience command skips a Codex account listed first when 
     oauth('codex', { provider: 'codex', accountId: 'synthetic-codex-account' }),
     oauth('claude', { expiresAt: Date.now() + 3_600_000 }),
   ];
-  const result = await runAccountCommand(accounts, ['api', '/v1/models']);
+  const result = await runAccountCommand(accounts, ['api', '/v1/models'], { direct: true });
   assert.ok(result.connections.length > 0, 'the Anthropic account behind the Codex row must be used');
   assert.ok(result.connections.every(c => c.includes('synthetic-access-claude')), 'only the Anthropic credential may be sent');
   assert.ok(result.connections.every(c => !c.includes('synthetic-access-codex')));

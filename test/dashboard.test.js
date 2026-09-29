@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { UNAVAILABLE_TEXT } from '../src/status-renderer.js';
 import { createProxyServer } from '../src/server.js';
 import {
-  renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
+  renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
   accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routeStripLines, problems, STARVED_MIN, STARVED_LIST_MAX,
@@ -15,7 +15,9 @@ import {
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, QUOTA_NEAR_BAND, THRESHOLD_BUCKET_KEYS, accountQuotaGroups, capBadgeText, providerOrder, forecastWindowLabel, bucketLabel,
   offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, reloadStep, limitsOutcome,
   fleetInForce, fleetRequest, fleetOutcome,
+  usageFor, USAGE_VIEWS,
 } from '../src/dashboard.js';
+import { USAGE_WINDOWS } from '../src/client-usage.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -118,6 +120,16 @@ test('thresholdBadgeText names a bucket the account default moves off the fleet 
   assert.equal(thresholdBadgeText({ default: 0.98, unified7d: 0.85 }, 0.98, fleetTable), '');
   // A differing default already covers every unlisted bucket.
   assert.equal(thresholdBadgeText(1.0, 0.98, fleetTable), 'switch at 100%');
+});
+
+test('accountBadges names a routed account\'s proxy as the status payload masks it, and stays silent otherwise', () => {
+  const routed = accountBadges({ name: 'a', type: 'oauth', routing: 'socks5h://alice:***@proxy.example.com:1080' }, null, null);
+  assert.deepEqual(routed.find(b => b.cls === 'meta routing'), { cls: 'meta routing', text: 'via socks5h://alice:***@proxy.example.com:1080' });
+  assert.equal(accountBadges({ name: 'a', type: 'oauth' }, null, null).some(b => /routing/.test(b.cls)), false);
+  // The payload is masked at the source. A parsed object would mean the live
+  // account leaked into it, password and all: draw nothing rather than that.
+  const leaked = accountBadges({ name: 'a', type: 'oauth', routing: { host: 'h', password: 'p' } }, null, null);
+  assert.equal(leaked.some(b => /routing/.test(b.cls)), false);
 });
 
 test('accountBadges adds the threshold badge only when it differs from the fleet', () => {
@@ -733,7 +745,7 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
   // constant the page never ships — it would ReferenceError at first render.
   // Evaluate ONLY the serialized bundle and call into it.
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return problems;`)();
   const payload = { sessions: { items: [{ id: 'deadbeef1234', client: 'alice', active: true, starved: 9, requests: 9, pins: {}, tokens: {} }] } };
@@ -747,7 +759,7 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
 // grepping the source would not catch — only running the bundle does.
 test('accountBadges calls thresholdBadgeText inside the same serialized bundle', () => {
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: 1.0 };
@@ -761,7 +773,7 @@ test('accountBadges calls thresholdBadgeText inside the same serialized bundle',
 // it threw a ReferenceError from render() and blanked the accounts pane.
 test('a table-form override renders its badge inside the serialized bundle', () => {
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } };
@@ -778,11 +790,13 @@ test('the page ships the same helper implementations it is tested against', () =
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems,
     chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
-    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, providerOrder, routeStripLines, forecastWindowLabel, bucketLabel]) {
+    fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, providerOrder, routeStripLines, forecastWindowLabel, bucketLabel, usageFor]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-  assert.doesNotThrow(() => new Function(script), 'inline script must parse');
+  // Every inline script must parse, not just the last.
+  for (const script of inlineScripts(html)) {
+    assert.doesNotThrow(() => new Function(script), 'inline script must parse');
+  }
 });
 
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
@@ -790,9 +804,27 @@ test('the page ships the same helper implementations it is tested against', () =
 // runs without a real DOM; only the style and text the startup path sets are read.
 function bootPage({ storedKey = null, dom = null, sessionAuth = false } = {}) {
   const els = new Map();
+  // Listeners are recorded rather than absorbed, and every element built is
+  // kept, so a test can drive a control the page created for itself — the
+  // window buttons have no id to look up.
+  const built = [];
   const stubEl = () => {
-    const target = { style: {}, value: '', textContent: '', className: '', disabled: false };
-    return new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
+    // Listeners are recorded rather than absorbed, so a test can fire a click
+    // the way the page registered it instead of reaching for an onclick the
+    // page never sets. Every listener for a type is kept, in registration
+    // order, since a page may attach more than one to the same element.
+    const listeners = new Map();
+    const target = {
+      style: {}, value: '', textContent: '', className: '', disabled: false,
+      addEventListener: (type, fn) => { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); },
+      listens: type => (listeners.get(type) || []).length > 0,
+    };
+    const proxy = new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
+    // Fire with the proxy as `this`, the way the page sees the element, so a
+    // handler that touches an unstubbed property gets the absorbing stub.
+    target.fire = type => { for (const fn of listeners.get(type) || []) fn.call(proxy); };
+    built.push(proxy);
+    return proxy;
   };
   const byId = dom ? dom.getElementById : id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
   const store = new Map(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []);
@@ -808,6 +840,7 @@ function bootPage({ storedKey = null, dom = null, sessionAuth = false } = {}) {
     body: { classList },
     getElementById: byId,
     createElement: () => stubEl(),
+    querySelector: () => stubEl(),
     querySelectorAll: () => [],
   };
   const window = { addEventListener() {} };
@@ -821,7 +854,19 @@ function bootPage({ storedKey = null, dom = null, sessionAuth = false } = {}) {
     requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
   };
-  return { byId, store, requests, answer };
+  // Click the control carrying this label, whoever built it. A render replaces
+  // a table by building new elements rather than mutating the old ones, so the
+  // mark is what keeps `labelled` counting what is on the page now instead of
+  // everything ever built.
+  let mark = 0;
+  const click = label => {
+    const el = built.find(e => e.textContent === label && e.listens('click'));
+    assert.ok(el, `no clickable element labelled ${label}`);
+    mark = built.length;
+    el.fire('click');
+  };
+  const labelled = label => built.slice(mark).filter(e => e.textContent === label).length;
+  return { byId, store, requests, answer, click, labelled };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -903,9 +948,13 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     assert.match(csp, /(^|; )connect-src 'self'(;|$)/);
     assert.match(csp, /(^|; )frame-ancestors 'none'(;|$)/);
     assert.doesNotMatch(csp, /script-src[^;]*'unsafe-inline'/);
-    const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-    const hash = createHash('sha256').update(script, 'utf8').digest('base64');
-    assert.match(csp, new RegExp(`script-src 'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
+    // Every inline script is admitted by hash, not just the first.
+    const scripts = inlineScripts(html);
+    assert.ok(scripts.length >= 1, 'the page has its main script');
+    for (const script of scripts) {
+      const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+      assert.match(csp, new RegExp(`'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
+    }
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
 
     // The asset route is GET + exact path only — a POST to the same path must
@@ -3009,4 +3058,73 @@ test('fleet: Save starts disabled and stays so when the first status poll fails'
   assert.equal(dom.getElementById('fleetUseCurrent').disabled, true);
   dom.getElementById('saveFleet').click();
   assert.equal(page.requests.filter(r => r.url === '/teamclaude/threshold').length, 0);
+});
+
+// ── usage windows ───────────────────────────────────────────
+
+const ENTRY = {
+  requests: 100, connections: 4, inputTokens: 9000, outputTokens: 500,
+  windows: {
+    '5h': { requests: 3, connections: 0, inputTokens: 300, outputTokens: 20 },
+    '24h': { requests: 12, connections: 1, inputTokens: 1200, outputTokens: 80 },
+  },
+};
+
+test('the total view reads the lifetime counters', () => {
+  assert.deepEqual(usageFor(ENTRY, 'total'), { requests: 100, connections: 4, inputTokens: 9000, outputTokens: 500 });
+  // No view at all is the same question, asked before the page has state.
+  assert.deepEqual(usageFor(ENTRY), usageFor(ENTRY, 'total'));
+});
+
+test('a window view reads that window, not the lifetime counters', () => {
+  assert.deepEqual(usageFor(ENTRY, '24h'), { requests: 12, connections: 1, inputTokens: 1200, outputTokens: 80 });
+  assert.equal(usageFor(ENTRY, '5h').inputTokens, 300);
+});
+
+test('a window the payload does not carry reads as zero, never as the total', () => {
+  // The alternative — falling back to the lifetime figure — would label an
+  // all-time number as a five-hour one, which is the one answer that misleads
+  // rather than merely disappoints.
+  assert.deepEqual(usageFor({ requests: 7, inputTokens: 5 }, '24h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(usageFor(null, '5h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(usageFor(undefined, 'total'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+});
+
+test('every offered view names a window the tracker actually keeps', () => {
+  // The buttons are derived from USAGE_WINDOWS rather than listed twice: a
+  // renamed window must not leave behind a button that reads zero for everyone.
+  assert.equal(USAGE_VIEWS[0].key, 'total');
+  assert.deepEqual(USAGE_VIEWS.slice(1).map(v => v.key), Object.keys(USAGE_WINDOWS));
+  for (const view of USAGE_VIEWS) assert.ok(view.label, 'every view carries a button label');
+});
+
+test('the page ships the view list it renders buttons from', () => {
+  assert.ok(renderDashboardHtml().includes(`var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`));
+});
+
+test('selecting a window relabels every table it governs', async () => {
+  const page = bootPage();
+  const windows = { '5h': { requests: 1, connections: 0, inputTokens: 10, outputTokens: 2 },
+    '24h': { requests: 9, connections: 0, inputTokens: 900, outputTokens: 40 } };
+  await page.answer(200, {
+    accounts: [],
+    clients: { alice: { requests: 99, connections: 0, inputTokens: 9000, outputTokens: 400, lastUsed: new Date().toISOString(), windows } },
+    usageDimensions: { project: { widgets: { requests: 99, inputTokens: 9000, outputTokens: 400, windows } } },
+  });
+
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients');
+  assert.equal(page.labelled('Last used'), 2, 'both tables label the column plainly under Total');
+  assert.equal(page.labelled('Project'), 2, 'the dimension heading and its first column');
+
+  page.click('Last 24h');
+
+  // The heading is what stops a windowed figure being read as a lifetime one
+  // once the control itself is scrolled out of view.
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients · last 24h');
+  assert.equal(page.labelled('Project · last 24h'), 1, 'the dimension table names the window too');
+  assert.equal(page.labelled('Last used (all time)'), 2, 'and the one lifetime column says so');
+  assert.equal(page.labelled('Last used'), 0);
+
+  page.click('Total');
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients', 'and back again');
 });
