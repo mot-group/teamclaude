@@ -8,7 +8,7 @@ import net from 'node:net';
 import { createControlQueue, createLimitWriters, fail } from './control-queue.js';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
+import { AccountManager, distributionMode, accountRouting, resolveAccountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { normalizeRoutes, routeMembers, configuredPinId } from './routes.js';
 import { createProxyServer } from './server.js';
@@ -699,9 +699,13 @@ async function serverCommand() {
       // then an in-process reload instead of the CLI's HTTP notify. Never exits:
       // a failed login is a line in the activity pane, not the end of the proxy.
       loginAccount: async (/** @type {Record<string, any>} */ account) => {
+        // A live manager account: its routing is already parsed. The sign-in
+        // and the profile lookup are that account's traffic, so they take it.
+        if (account?.routingRefused) throw new Error(`"${account.name}" has a routing that cannot be used; fix accounts[].routing first`);
+        const routing = account?.routing || null;
         const outcome = account && providerOf(account) === 'codex'
-          ? await storeCodexLogin(undefined, await loginCodex({ showUrl: false }), null, false)
-          : await upsertOAuthAccount(undefined, await loginOAuth({ interactive: false }), 'login', null, false, { fatal: false, notify: false });
+          ? await storeCodexLogin(undefined, await loginCodex({ showUrl: false, routing }), routing, false)
+          : await upsertOAuthAccount(undefined, await loginOAuth({ interactive: false, routing }), 'login', routing, false, { fatal: false, notify: false });
         await reloadQueued();
         return outcome;
       },
@@ -1192,6 +1196,19 @@ function noteUnusedRouting(entry, used) {
  * endpoint to discover identity, whereas a Codex id_token already carries the
  * email and the ChatGPT account id, so there is nothing further to fetch.
  */
+/**
+ * The account's own routing for credential-bearing CLI traffic. Throws when a
+ * routing is configured but cannot be used, rather than sending the account's
+ * credential by the fleet path (see resolveAccountRouting).
+ * @param {Record<string, any>} account
+ * @param {Record<string, any>} config
+ */
+function ownRouting(account, config) {
+  const { routing, refused } = resolveAccountRouting(account, localListener(config));
+  if (refused) throw new Error(`"${account.name}": accounts[].routing cannot be used; fix it before using this account`);
+  return routing;
+}
+
 async function loginCodexCommand() {
   // loadOrCreateConfig, not loadConfig: `login` is a first-run entry point and
   // must work before any config file exists. This copy is not what gets
@@ -1812,7 +1829,7 @@ async function accountsCommand() {
   // has one: this is that account's traffic.
   const { profiles } = await loadAccountProfiles(config.accounts, {
     isTokenExpiringSoon,
-    refreshAccessToken: (token, a) => refreshAccessToken(token, undefined, accountRouting(a, localListener(config))),
+    refreshAccessToken: (token, a) => refreshAccessToken(token, undefined, ownRouting(a, config)),
     persistRefreshed: async refreshed => {
       // Save each rotated grant before profile I/O. An interruption after the
       // refresh must not leave the old refresh token on disk.
@@ -1827,7 +1844,9 @@ async function accountsCommand() {
         }
       });
     },
-    fetchProfile: (token, a) => fetchProfile(token, accountRouting(a, localListener(config))),
+    fetchProfile: async (token, a) => {
+      try { return await fetchProfile(token, ownRouting(a, config)); } catch (/** @type {any} */ err) { return { error: err.message }; }
+    },
   });
 
   // Backfill account+org identity from profiles, then deduplicate by
@@ -1979,7 +1998,8 @@ async function apiCommand() {
   // This call carries the account's credential, so it is that account's
   // traffic: it leaves by the account's own routing when it has one, and by
   // the fleet path (the upstream proxy when configured) otherwise.
-  const routing = accountRouting(account, localListener(config));
+  let routing;
+  try { routing = ownRouting(account, config); } catch (/** @type {any} */ err) { console.error(err.message); process.exit(1); }
   if (routing) console.error(`(via ${describeRouting(routing)})`);
   const res = await proxyFetch(url, { ...fetchOpts, routing });
 

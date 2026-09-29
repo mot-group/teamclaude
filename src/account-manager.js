@@ -4,7 +4,7 @@ import { refreshCodexToken, validateCodexCredentials } from './codex-auth.js';
 import { credentialFile, importedCodexTuple } from './account-source.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveMaxSpendMinor, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
@@ -280,6 +280,26 @@ export function accountAllowsExtraUsage(acct) {
  * @returns {import('./account-routing.js').RoutingProxy|null}
  */
 export function accountRouting(acct, listener = null) {
+  return resolveAccountRouting(acct, listener).routing;
+}
+
+/**
+ * The account's routing, and whether one was configured but cannot be used
+ * (unparseable, or this server's own address). A refused routing must not fall
+ * back to the fleet path: credential-bearing traffic would leave by a network
+ * the operator routed this account away from. The account is held instead.
+ * @param {Record<string, any>} acct
+ * @param {{ host: string, port: number }|null} [listener]
+ * @returns {{ routing: import('./account-routing.js').RoutingProxy|null, refused: boolean }}
+ */
+export function resolveAccountRouting(acct, listener = null) {
+  const configured = typeof acct?.routing === 'string' && !/^(none|off)?$/i.test(acct.routing.trim());
+  const routing = parseAccountRouting(acct, listener);
+  return { routing, refused: configured && !routing };
+}
+
+/** @param {Record<string, any>} acct @param {{ host: string, port: number }|null} listener */
+function parseAccountRouting(acct, listener) {
   try {
     const routing = parseRoutingUrl(acct?.routing);
     if (routing && isSelfProxy(routing, listener)) {
@@ -301,6 +321,7 @@ export function accountRouting(acct, listener = null) {
 // accountRouting; null when the manager was built without a config.
 /** @param {{ host: string, port: number }|null} [listener] */
 function makeAccount(acct, index, listener = null) {
+  const egress = resolveAccountRouting(acct, listener);
   // Once, at construction, not on every reload: the flag names money the
   // operator meant to spend, so silently doing nothing would be the one wrong
   // answer.
@@ -368,7 +389,10 @@ function makeAccount(acct, index, listener = null) {
     // token refresh, profile, usage and quota probes — and it outranks both sx
     // and the fleet upstream proxy for this account. Null goes by the fleet
     // path. See account-routing.js.
-    routing: accountRouting(acct, listener),
+    routing: egress.routing,
+    // A routing was configured but cannot be used: the account is held rather
+    // than sent by the fleet path (see resolveAccountRouting).
+    routingRefused: egress.refused,
     // Whether this account is EXEMPT from spending one of its free Codex
     // rate-limit reset credits (see codex-reset-credits.js). Negative-only, and
     // the polarity is the opposite of what the name suggests: the switch that
@@ -997,11 +1021,12 @@ export class AccountManager {
    * operator who just fixed the URL should not wait out the old one's hold.
    * @param {number} index
    * @param {import('./account-routing.js').RoutingProxy|null} routing */
-  setRouting(index, routing) {
+  setRouting(index, routing, refused = false) {
     const account = this.accounts[index];
     if (!account) return;
     if (routingToUrl(routing) !== routingToUrl(account.routing)) account.routingFailedUntil = null;
     account.routing = routing;
+    account.routingRefused = refused;
   }
 
   /** Public form for the request path, which re-checks after a token refresh.
@@ -2599,8 +2624,12 @@ export class AccountManager {
         continue;
       }
       if (!account.allowExtraUsage) continue;
-      const spend = /** @type {{ enabled?: boolean } | null} */ (account.quota.spend);
+      const spend = /** @type {{ enabled?: boolean, exponent?: number } | null} */ (account.quota.spend);
       if (spend?.enabled === false) continue;
+      // `maxSpend: 0` is "not one cent". spendCapReached lets an account that has
+      // billed nothing through (its free quota is still under the cap), so the
+      // paid tier has to refuse it here.
+      if (resolveMaxSpendMinor(account.maxSpend, spend) === 0) continue;
       if (better(priority, usage, paidRank)) { paid = account; paidRank = [priority, usage]; }
     }
     if (free) return { account: free, paid: false };
@@ -2647,7 +2676,7 @@ export class AccountManager {
     if (this._entitlementDenied(account)) return 'entitlement';
 
     // The account's own routing proxy could not be reached a moment ago.
-    if (this._routingDown(account)) return 'routing';
+    if (account.routingRefused || this._routingDown(account)) return 'routing';
 
     // Upstream answered 401 to this account's API key a moment ago.
     if (this._credentialHeld(account)) return 'credential';

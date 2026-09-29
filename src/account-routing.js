@@ -179,7 +179,13 @@ export function routingToUrl(routing) {
   const auth = routing.username
     ? `${encodeURIComponent(routing.username)}${routing.password ? `:${encodeURIComponent(routing.password)}` : ''}@`
     : '';
-  return `${routing.protocol}://${auth}${routing.host}:${routing.port}`;
+  return `${routing.protocol}://${auth}${hostPart(routing.host)}:${routing.port}`;
+}
+
+/** An IPv6 literal goes back in brackets, or the port reads as part of it.
+ * @param {string} host */
+function hostPart(host) {
+  return host.includes(':') ? `[${host}]` : host;
 }
 
 /** Render a routing with the password masked; null when there is none. For logs and the TUI.
@@ -191,7 +197,7 @@ export function describeRouting(routing) {
   // `:***` only where there is a password to mask: SOCKS4 has a userid and
   // nothing else, and a masked password that does not exist misleads.
   const auth = routing.username ? `${routing.username}${routing.password ? ':***' : ''}@` : '';
-  return `${routing.protocol}://${auth}${routing.host}:${routing.port}`;
+  return `${routing.protocol}://${auth}${hostPart(routing.host)}:${routing.port}`;
 }
 
 // ── SOCKS5 (RFC 1928 + 1929) ─────────────────────────────────
