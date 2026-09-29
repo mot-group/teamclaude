@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { AccountManager, resolveAccountRouting } from '../src/account-manager.js';
 import { parseRoutingUrl, routingToUrl, describeRouting } from '../src/account-routing.js';
 import { fetchResetCreditDetails, consumeResetCredit } from '../src/codex-reset-credits.js';
+import { Prober } from '../src/prober.js';
 
 // Fixes to upstream 1.1.22 code found by the Codex review of the merge (#23).
 
@@ -53,4 +54,32 @@ test('an IPv6 routing survives a save and a reload', () => {
   assert.equal(routingToUrl(routing), 'socks5h://u:p@[::1]:1080');
   assert.deepEqual(parseRoutingUrl(routingToUrl(routing)), routing);
   assert.equal(describeRouting(routing), 'socks5h://u:***@[::1]:1080');
+});
+
+test('the exhausted-fleet probe skips a zero money cap and a refused routing', () => {
+  const am = quietly(() => new AccountManager([
+    oauth('zero', { maxSpend: 0 }),
+    oauth('bad', { routing: 'socks9://nope' }),
+    oauth('ok'),
+  ], 0.98));
+  for (const a of am.accounts) {
+    Object.assign(a.quota, { unified7d: 1.0, spend: { enabled: true, usedMinor: 0, exponent: 2, currency: 'USD' } });
+  }
+  am._nextProbeAt = 0;
+  assert.equal(am._selectProbe(null, OPUS)?.name, 'ok');
+  am._nextProbeAt = 0;
+  assert.equal(am._selectProbe(new Set([2]), OPUS), null);
+});
+
+test('no background path sends a refused account\'s credential', async () => {
+  const am = quietly(() => new AccountManager([oauth('bad', { routing: 'socks9://nope', expiresAt: Date.now() - 1000 })], 0.98, {
+    refreshFn: async () => { throw new Error('refresh must not run'); },
+  }));
+  const bad = am.accounts[0];
+  await am.ensureTokenFresh(0);
+  assert.equal(Prober.prototype._probeable.call({}, bad), false);
+  const codex = { credential: 'c', accountId: 'acct', routingRefused: true };
+  const fetchImpl = async () => { throw new Error('must not fetch'); };
+  assert.ok((await fetchResetCreditDetails(codex, { fetchImpl })).error);
+  assert.ok((await consumeResetCredit(codex, { redeemRequestId: 'r1' }, { fetchImpl })).error);
 });

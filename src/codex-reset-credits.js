@@ -137,6 +137,7 @@ function creditRow(raw) {
  */
 export async function fetchResetCreditDetails(account, { fetchImpl = proxyFetch, timeoutMs = 10_000, url = CODEX_RESET_CREDITS_URL } = {}) {
   if (!account?.credential || !account?.accountId) return { error: 'missing Codex account identity' };
+  if (account.routingRefused) return { error: 'account routing cannot be used' };
   try {
     const res = await fetchImpl(url, {
       headers: codexHeaders(account),
@@ -180,6 +181,7 @@ export async function fetchResetCreditDetails(account, { fetchImpl = proxyFetch,
  */
 export async function consumeResetCredit(account, { creditId = null, redeemRequestId }, { fetchImpl = proxyFetch, timeoutMs = 20_000, url = CODEX_RESET_CREDITS_CONSUME_URL } = {}) {
   if (!account?.credential || !account?.accountId) return { error: 'missing Codex account identity' };
+  if (account.routingRefused) return { error: 'account routing cannot be used' };
   if (!redeemRequestId) return { error: 'missing redeem request id' };
   // `credit_id` is written only when the caller named one, so the shape is
   // declared rather than inferred from the seed.

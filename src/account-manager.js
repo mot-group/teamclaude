@@ -2302,6 +2302,9 @@ export class AccountManager {
     // Nor a routing cooldown: probing would spend the connect budget on a
     // proxy that was unreachable seconds ago, and the hold is short anyway.
     if (this._routingDown(account)) return false;
+    // Nor a routing that cannot be used: the probe carries the credential, and
+    // the fleet path is the one the operator routed this account away from.
+    if (account.routingRefused) return false;
     // Nor a 401 cooldown. The probe path runs when every account is
     // unavailable, which is exactly when a held API key would otherwise be
     // asked again on every request — the loop the hold exists to prevent.
@@ -2497,6 +2500,9 @@ export class AccountManager {
       // might refresh, so the exhausted-fleet probe does not get to override it.
       // Checked here rather than in _isProbeable because a cap is model-scoped.
       if (this.capExceeded(account, model)) continue;
+      // A zero money cap too: an exhausted account's probe is the request that
+      // would start billing.
+      if (this._zeroSpendCap(account)) continue;
       // Same for routing/ownership: a probe for a routed or owned model must not
       // land on an ineligible account (it would just reject the unknown model id).
       if (model && !this._routeAllows(account, model)) continue;
@@ -2626,14 +2632,23 @@ export class AccountManager {
       if (!account.allowExtraUsage) continue;
       const spend = /** @type {{ enabled?: boolean, exponent?: number } | null} */ (account.quota.spend);
       if (spend?.enabled === false) continue;
-      // `maxSpend: 0` is "not one cent". spendCapReached lets an account that has
-      // billed nothing through (its free quota is still under the cap), so the
-      // paid tier has to refuse it here.
-      if (resolveMaxSpendMinor(account.maxSpend, spend) === 0) continue;
+      if (this._zeroSpendCap(account)) continue;
       if (better(priority, usage, paidRank)) { paid = account; paidRank = [priority, usage]; }
     }
     if (free) return { account: free, paid: false };
     return paid ? { account: paid, paid: true } : null;
+  }
+
+  /**
+   * `maxSpend: 0` ("not one cent") on an account that can bill. spendCapReached
+   * lets such an account through while it has billed nothing, so its free quota
+   * still serves; the paths that may spend past quota (the paid fallback and the
+   * exhausted-fleet probe) have to refuse it themselves.
+   * @param {Record<string, any>} account
+   */
+  _zeroSpendCap(account) {
+    const spend = account.quota?.spend;
+    return spend?.enabled !== false && resolveMaxSpendMinor(account.maxSpend, spend) === 0;
   }
 
   _isAvailable(account, model = null, advisorModel = null) {
@@ -4962,6 +4977,10 @@ export class AccountManager {
     // the warmer already draw this line; this is the third caller that reaches
     // a credential, and the one the send path and the 401 retry go through.
     if (!account || account.type !== 'oauth' || !account.refreshToken || account.upstream) return;
+    // A routing that cannot be used: the refresh would send the token by the
+    // fleet path (see resolveAccountRouting). The account stays held until the
+    // routing is fixed.
+    if (account.routingRefused) return;
 
     // Dead-token guard: a refresh token upstream already rejected (invalid_grant)
     // will be rejected every time, so retrying it only floods the OAuth endpoint

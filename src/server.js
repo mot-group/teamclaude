@@ -3333,6 +3333,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return;
   }
 
+  // A configured routing that cannot be used: the credential must not leave by
+  // the fleet path (see resolveAccountRouting). Selection already holds such an
+  // account; a caller pin names it anyway, so it is answered here.
+  if (account.routingRefused) {
+    if (ctx.pinnedIndex == null && retryCount < maxRetries) {
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+    ctx.status = 503;
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: `Account "${safeLine(account.name, 64)}" has a routing that cannot be used; fix accounts[].routing` } }));
+    return;
+  }
+
   // Track which account handles this request
   ctx.account = account.name;
   // Pin this conversation to the serving account for the model's weekly bucket

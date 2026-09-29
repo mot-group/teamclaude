@@ -149,6 +149,9 @@ export class Prober {
   _probeable(account) {
     if (!account?.credential) return false;
     if (account.disabled) return false;
+    // A configured routing that cannot be used: a probe would send the
+    // credential by the fleet path instead (see resolveAccountRouting).
+    if (account.routingRefused) return false;
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return false;
     return true;
   }
