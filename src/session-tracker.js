@@ -431,6 +431,29 @@ export class SessionTracker {
   }
 
   /**
+   * The account `sessionId` is pinned to for `bucket` when the conversation is
+   * mid-turn, else null. Mid-turn: another of its requests is in flight, or the
+   * pin was used within `withinMs`. The asking request is already counted in
+   * `inFlight` (beginRequest runs before selection), hence `> 1`. The pin's
+   * stamp moves when a request is routed and again when the last one ends (see
+   * endRequest), so it measures the gap since the conversation last worked.
+   * Graceful switch reads it (see AccountManager._gracefulHold).
+   *
+   * @param {string|null} sessionId
+   * @param {string} bucket
+   * @param {number} withinMs
+   * @param {number} [now]
+   * @returns {number|null}
+   */
+  recentPin(sessionId, bucket, withinMs, now = this._now()) {
+    sessionId = keyOf(sessionId);
+    const s = sessionId && this.sessions.get(sessionId);
+    const pin = s ? s.pins.get(bucket) : null;
+    if (!s || !pin) return null;
+    return s.inFlight > 1 || now - pin.at <= withinMs ? pin.idx : null;
+  }
+
+  /**
    * The rollover observation this session holds for `bucket`: the account
    * traffic was last found resting on and what its windows read then. Kept
    * beside the pin rather than on it because it outlives a relocation — a pin

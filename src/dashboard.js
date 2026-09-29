@@ -1782,6 +1782,10 @@ const PAGE = `<!doctype html>
         <div class="section-head"><div><h2 id="fleetThresholdTitle">Switch thresholds</h2><p class="sub">Rotation leaves an account when a bucket reaches this share. An account's own threshold (in Details) outranks every value here.</p></div></div>
         <div class="limits-body"><p class="usage" id="fleetMissing" hidden>This proxy does not report its switch threshold.</p><div id="fleetEditor"><table class="limits" id="fleetTable"><thead><tr><th scope="col">Bucket</th><th scope="col" id="fleetColSwitch">Switch at</th><th scope="col">In force</th></tr></thead><tbody id="fleetBody"></tbody></table><p class="usage" id="fleetOverridden" hidden></p><div class="limits-actions"><span></span><button id="saveFleet" class="primary">Save thresholds</button></div><div id="fleetResult" class="dialog-result" role="status"></div><button id="fleetUseCurrent" hidden>Use current</button></div></div>
         <p class="routing-help">Tokens and requests apply to API-key accounts. Changes apply to new requests at once, no restart.</p>
+      </section>
+      <section aria-labelledby="gracefulTitle" id="gracefulPanel" class="route-panel">
+        <div class="section-head"><div><h2 id="gracefulTitle">Graceful switch</h2><p class="sub">When an account crosses its switch threshold, a conversation mid-turn (a request in flight, or one in the last 2 minutes) finishes there and keeps its prompt cache. It moves once the account reaches 100% or is refused. New conversations move at once.</p></div><div class="quota-toggle" role="group" aria-label="Graceful switch"><button id="gracefulOff" aria-pressed="true">Off</button><button id="gracefulOn" aria-pressed="false">On</button></div></div>
+        <p class="usage" id="gracefulCount"></p><div id="gracefulResult" class="dialog-result" role="status"></div>
       </section></section>
     <section data-section="resets" hidden class="section-body" id="resetsSection"><h2>Watched limits</h2><p class="usage" id="resetSummary"></p><div class="split" id="resetAccounts"></div><h2>Reset history</h2><div class="card"><table id="resetEvents" class="reset-table"></table><div id="resetReveal"></div></div><p class="usage" id="resetHistoryNote"></p></section>
     <section data-section="forecast" hidden class="section-body" id="forecastSection">
@@ -1809,6 +1813,7 @@ const PAGE = `<!doctype html>
   // and each configured dimension), so it is page state rather than per-table.
   // Like the sort, it survives the poll.
   var usageView = 'total';
+  var gracefulPending = false;
   var usageButtons = [];
   var detailAccount = null;
   var switchPending = false;
@@ -2421,6 +2426,51 @@ ${SHARED_HELPERS}
   function ownThresholdScope(t) {
     if (typeof t === 'number' || t.default != null) return 'all buckets';
     return Object.keys(t).map(bucketLabel).join(', ') || 'all buckets';
+  }
+
+  // Graceful switch: the toggle and how many conversations it is holding now.
+  // Disabled while a save is in flight, and against a proxy that does not
+  // report the setting (an older one would answer the POST with 404).
+  function renderGraceful(s) {
+    var on = s.gracefulSwitch === true;
+    document.getElementById('gracefulOn').setAttribute('aria-pressed', String(on));
+    document.getElementById('gracefulOff').setAttribute('aria-pressed', String(!on));
+    var n = (s.sessions || {}).graceful || 0;
+    document.getElementById('gracefulCount').textContent = !on
+      ? 'Off. A conversation moves as soon as its account crosses the threshold.'
+      : n ? n + (n === 1 ? ' conversation is' : ' conversations are') + ' finishing on an account past its threshold.'
+        : 'On. No conversation is finishing on an account past its threshold right now.';
+    var off = !connected || gracefulPending || typeof s.gracefulSwitch !== 'boolean';
+    document.getElementById('gracefulOn').disabled = off;
+    document.getElementById('gracefulOff').disabled = off;
+  }
+
+  async function sendGraceful(enabled) {
+    if (!connected || gracefulPending || !lastStatus || lastStatus.gracefulSwitch === enabled) return;
+    gracefulPending = true; renderGraceful(lastStatus);
+    var generation = authGeneration;
+    var result = document.getElementById('gracefulResult'); result.className = 'dialog-result'; result.textContent = 'Saving...';
+    try {
+      var res = await fetch('/teamclaude/graceful', {
+        method: 'POST',
+        headers: { 'x-api-key': SESSION_AUTH ? '' : localStorage.getItem(KEY) || '', 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: enabled }),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (generation !== authGeneration) return;
+      if (res.status === 401) { if (!SESSION_AUTH) localStorage.removeItem(KEY); showKeybox(); return; }
+      var json = await res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      if (generation !== authGeneration) return;
+      if (res.ok && json.ok) { result.className = 'dialog-result ok'; result.textContent = 'Saved. Graceful switch is ' + (json.gracefulSwitch ? 'on' : 'off') + '.'; }
+      else if (res.status === 404 || res.status === 501) { result.className = 'dialog-result error'; result.textContent = 'Not saved: this proxy cannot change the graceful switch. Update TeamClaude and restart it.'; }
+      else { result.className = 'dialog-result error'; result.textContent = 'Not saved: ' + (json.error || 'status ' + res.status); }
+      await poll(true);
+    } catch (e) {
+      result.className = 'dialog-result error'; result.textContent = 'Not saved: ' + e.message;
+    } finally {
+      gracefulPending = false;
+      if (lastStatus) renderGraceful(lastStatus);
+    }
   }
 
   function renderFleet(s) {
@@ -3229,6 +3279,7 @@ ${SHARED_HELPERS}
     renderProblems(s);
     renderRoutes(s);
     renderFleet(s);
+    renderGraceful(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
     // The control means nothing with no usage table under it. The payload
@@ -3546,6 +3597,8 @@ ${SHARED_HELPERS}
   });
   document.getElementById('refresh').addEventListener('click', poll);
   buildUsageViews();
+  document.getElementById('gracefulOn').addEventListener('click', function () { sendGraceful(true); });
+  document.getElementById('gracefulOff').addEventListener('click', function () { sendGraceful(false); });
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'Config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'Quota probe', this); });
   window.addEventListener('hashchange', showView);

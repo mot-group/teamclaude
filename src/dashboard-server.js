@@ -167,7 +167,8 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
       const labeling = req.method === 'POST' && req.url === '/teamclaude/accounts/label';
       const limits = req.method === 'POST' && req.url === '/teamclaude/accounts/limits';
       const threshold = req.method === 'POST' && req.url === '/teamclaude/threshold';
-      if (!allowed && !switching && !forcing && !labeling && !limits && !threshold) { reply(404, { error: 'Not found' }); return; }
+      const graceful = req.method === 'POST' && req.url === '/teamclaude/graceful';
+      if (!allowed && !switching && !forcing && !labeling && !limits && !threshold && !graceful) { reply(404, { error: 'Not found' }); return; }
       let payload;
       if (switching) {
         if (!String(req.headers['content-type']).startsWith('application/json')) { reply(415, { error: 'Use JSON' }); return; }
@@ -203,6 +204,12 @@ export function createDashboardServer({ credential, proxyUrl = 'http://127.0.0.1
         const text = (/** @type {unknown} */ v) => typeof v === 'string' && v.length <= 256;
         if (!text(data.id) || !data.id || !text(data.label)) { reply(400, { error: 'Rename request is malformed' }); return; }
         payload = JSON.stringify({ id: data.id, label: data.label });
+      }
+      if (graceful) {
+        if (!String(req.headers['content-type']).startsWith('application/json')) { reply(415, { error: 'Use JSON' }); return; }
+        const data = await body(req);
+        if (typeof data.enabled !== 'boolean') { reply(400, { error: 'Graceful switch request is malformed' }); return; }
+        payload = JSON.stringify({ enabled: data.enabled });
       }
       if (limits || threshold) {
         if (!String(req.headers['content-type']).startsWith('application/json')) { reply(415, { error: 'Use JSON' }); return; }

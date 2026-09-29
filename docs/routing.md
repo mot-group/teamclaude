@@ -359,6 +359,28 @@ URL-encode spaces and parens in a name here. The fully-qualified `accountUuid/or
 
 </details>
 
+## Graceful switch
+
+A switch never cuts off a request that is already running. The account is chosen once, when a request starts, and a stream finishes on it however long it runs. The cost of a switch is between requests. A Claude Code turn is a chain of requests (model call, tool, model call), and when the current account crosses `switchThreshold`, the next request from every running conversation moves to the new account. Each one takes a prompt-cache miss, all at the same moment, often in the middle of a turn.
+
+`gracefulSwitch` lets those conversations finish where they are:
+
+```json
+"gracefulSwitch": true
+```
+
+When it is on, a request stays on the account its conversation has been using for the request's weekly bucket (the same [per-bucket pin](#session-aware-routing) distribution uses) when all of these hold:
+
+- The conversation is **mid-turn**: another of its requests is in flight, or it made one in the last **2 minutes**. A conversation that keeps working keeps its account; one that goes quiet for longer moves on its next request.
+- The account's only problem is the **switch threshold**. It is still under 100% of every bucket that gates the request, upstream has not rejected it, and it is not capped (`maxUsage`, `maxSpend`), rate-limited, in error, disabled, held for its routing, or barred by a route.
+- This request has not already tried the account.
+
+New conversations, and requests without a session id, move to the next account as they do today. A request under a [forced route](#overrides-force-a-route-onto-one-account) is never held: the route's own `whenSpent` decides, and with `hold` the spent account stops serving. A `TC_ACCT` override resolves first, as it always does. The hold applies whether `distributeSessions` is off, even or adaptive.
+
+The price is headroom: during a switch the fleet spends some of the quota between `switchThreshold` and 100%. The same gap is what [extra-usage fallback](quota.md#extra-usage-fallback) spends. A reserve that must hold is `maxUsage`, which a hold never crosses. If the account runs out while a conversation is held, the 429 goes through the [failover hop](#one-failover-hop-on-a-rate-limit) like any other.
+
+`teamclaude status` shows `finishing N` beside the session counts while conversations are being held (`finish N` in the TUI header), and the dashboard's Routing section shows the same count next to the toggle. The proxy logs one line when a hold starts on an account, not one per request. Set it with `teamclaude graceful on`, from the dashboard, with the `set_graceful_switch` MCP tool, or in the config. Off by default, and applied live on reload.
+
 ## Prompt caching across rotation
 
 Rotation is transparent to your Claude Code session, but it's worth knowing how it interacts with Anthropic's [prompt cache](https://docs.claude.com/en/docs/build-with-claude/prompt-caching).

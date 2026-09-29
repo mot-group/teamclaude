@@ -293,6 +293,25 @@ export function setDistribution(config, mode) {
   return changed;
 }
 
+/**
+ * Turn graceful switching on or off. Strictly a boolean, like the other opt-in
+ * switches, so a stray truthy value in a hand edit cannot arm it.
+ * @param {Record<string, any>} config
+ * @param {unknown} enabled
+ * @returns {boolean} whether the stored value changed
+ */
+export function setGracefulSwitch(config, enabled) {
+  if (typeof enabled !== 'boolean') throw new ConfigOpError('Graceful switch is on or off.');
+  const changed = (config.gracefulSwitch === true) !== enabled;
+  if (changed) config.gracefulSwitch = enabled;
+  return changed;
+}
+
+export const GRACEFUL_SAID = {
+  on: 'Graceful switch on — a conversation mid-turn finishes on an account that crosses its switch threshold; new and idle ones move on.',
+  off: 'Graceful switch off — every conversation moves as soon as its account crosses the switch threshold.',
+};
+
 // C0 and C1 control characters, ESC and the 8-bit CSI among them. These values
 // are drawn on a terminal as they are stored (the TUI prints a route's name
 // raw), so one that carries an escape sequence would let whoever set it

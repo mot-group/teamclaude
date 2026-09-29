@@ -63,6 +63,8 @@ import {
   removeRoute,
   setBucketThresholds,
   setDistribution,
+  setGracefulSwitch,
+  GRACEFUL_SAID,
   setProbeSeconds,
   setThreshold,
   setWarmupSchedule,
@@ -102,6 +104,7 @@ const THRESHOLD_USAGE = [
 ].join('\n');
 
 const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
+const GRACEFUL_USAGE = 'Usage: teamclaude graceful <on|off>';
 
 const ROUTING_USAGE = [
   'Usage: teamclaude routing <account-name|email> [--check]      (show the account\'s routing; --check tests it)',
@@ -202,6 +205,10 @@ switch (command) {
     break;
   case 'distribute':
     await distributeCommand();
+    process.exit(0);
+    break;
+  case 'graceful':
+    await gracefulCommand();
     process.exit(0);
     break;
   case 'route':
@@ -334,7 +341,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferFableDepletedAccounts: config.preferFableDepletedAccounts, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferFableDepletedAccounts: config.preferFableDepletedAccounts, gracefulSwitch: config.gracefulSwitch === true, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   for (const warning of accountManager.routeWarnings) {
     console.error(`[TeamClaude] ${warning}`);
   }
@@ -483,6 +490,8 @@ async function serverCommand() {
     accountManager.setDistributeSessions(config.distributeSessions);
     config.preferFableDepletedAccounts = diskConfig.preferFableDepletedAccounts === true;
     accountManager.preferFableDepletedAccounts = config.preferFableDepletedAccounts;
+    config.gracefulSwitch = diskConfig.gracefulSwitch === true;
+    accountManager.gracefulSwitch = config.gracefulSwitch;
     // Pick up a switchThreshold change the same way (teamclaude threshold, the
     // TUI settings screen, or a hand edit). thresholdFor() reads it off the
     // manager on every decision, so assigning it is the whole application —
@@ -784,6 +793,10 @@ async function serverCommand() {
   hooks.saveOverride = saveOverride;
   // The dashboard's rename. Written by entry id, never by name: `name` is what
   // routes and name-matched pairing key on, so only the display label changes.
+  // The Routing panel's graceful switch toggle.
+  hooks.saveGracefulSwitch = (/** @type {boolean} */ enabled) => applyChange(async () => {
+    await atomicConfigUpdate(async diskConfig => { setGracefulSwitch(diskConfig, enabled); });
+  });
   hooks.saveLabel = (/** @type {{ id: string, label: string }} */ { id, label }) => applyChange(async () => {
     if (!accountManager.accounts.some(a => a.id === id)) throw fail('no-such-account', `no account with id "${id}"`);
     await atomicConfigUpdate(async diskConfig => {
@@ -2268,6 +2281,31 @@ async function distributeCommand() {
   await notifyRunningServer(config);
 }
 
+// ── graceful ────────────────────────────────────────────────
+
+async function gracefulCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+  if (arg === undefined) {
+    console.log(`Graceful switch: ${config.gracefulSwitch === true ? 'on' : 'off'}`);
+    console.log('Set with: teamclaude graceful <on|off>');
+    console.log('On: when an account crosses its switch threshold, a conversation that is mid-turn');
+    console.log('(a request in flight, or one in the last 2 minutes) finishes there, keeping its');
+    console.log('prompt cache, until the account reaches 100% or is refused. New ones move on.');
+    return;
+  }
+  let next = null;
+  if (['on', 'true', 'yes', '1'].includes(arg)) next = true;
+  else if (['off', 'false', 'no', '0'].includes(arg)) next = false;
+  if (next === null) {
+    console.error(GRACEFUL_USAGE);
+    process.exit(1);
+  }
+  if (setGracefulSwitch(config, next)) await saveConfig(config);
+  console.log(GRACEFUL_SAID[next ? 'on' : 'off']);
+  await notifyRunningServer(config);
+}
+
 // ── update ──────────────────────────────────────────────────
 
 async function updateCommand() {
@@ -2596,6 +2634,8 @@ Commands:
                       Spread new sessions across equal-priority accounts, each
                       pinned to its own for cache reuse (off by default);
                       'adaptive' spreads by remaining weekly credit and load
+  graceful [on|off]   Let a conversation mid-turn finish on an account that
+                      crosses its switch threshold (off by default)
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
@@ -2659,8 +2699,8 @@ one, which is what 'teamclaude switch' calls.
 MCP endpoint (off by default). With "proxy": { "mcp": "read" } the server
 serves its status, quota and settings as MCP tools at /teamclaude/mcp; "full"
 adds the tools that change them (switch, enable/disable, priority, remove,
-threshold, distribute, probe, warmup, routes, routing, blocked models, client
-mode).
+threshold, distribute, graceful switch, probe, warmup, routes, routing, blocked
+models, client mode).
 Connect Claude Code with:
   claude mcp add --transport http teamclaude http://localhost:3456/teamclaude/mcp
 Same gates as the other /teamclaude/ routes. A named client key is served

@@ -2071,7 +2071,7 @@ export class TUI {
     const sessStr = (sess.active || sess.known)
       ? `${sess.active} sess${this.am.distributeSessions
         ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : ' dist')
-        : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
+        : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}${sess.graceful ? yellow(` finish ${sess.graceful}`) : ''}  `
       : '';
     // ▼ marks a dashboard that lost contact with the server it polls (attach
     // mode): what is on screen is the last snapshot, not the current state.

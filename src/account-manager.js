@@ -66,6 +66,10 @@ const ADAPTIVE_STATS_CACHE_MS = 1000;
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// Graceful switch: how long after its last request a conversation still counts
+// as mid-turn, and so keeps the account it was using after that account crosses
+// its switch threshold. Covers a tool loop and a short human reply.
+export const GRACEFUL_IDLE_MS = 2 * 60_000;
 // An organization-level OAuth policy denial is not repaired by an immediate
 // retry. Keep the account out of automatic rotation long enough for other
 // members to serve, then re-admit it so an administrator's policy change is
@@ -532,10 +536,11 @@ export class AccountManager {
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
    * @param {boolean} [opts.preferFableDepletedAccounts]
+   * @param {boolean} [opts.gracefulSwitch]  let mid-turn conversations finish on an account past its threshold (see _gracefulHold)
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferFableDepletedAccounts = false, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferFableDepletedAccounts = false, gracefulSwitch = false, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -560,6 +565,15 @@ export class AccountManager {
     // header and the remote dashboard all ask only that question.
     this.distributionMode = distributionMode(distributeSessions);
     this.distributeSessions = this.distributionMode !== 'off';
+    // Opt-in: mid-turn conversations finish on an account past its switch
+    // threshold (see _gracefulHold). Assigned again on every reload.
+    this.gracefulSwitch = gracefulSwitch === true;
+    // sessionId -> { idx, at } for each conversation a hold served, and account
+    // index -> when a hold last served there (one log line per episode).
+    /** @type {Map<string, { idx: number, at: number, model: any, advisorModel: any }>} */
+    this._gracefulHolds = new Map();
+    /** @type {Map<number, number>} */
+    this._gracefulLogAt = new Map();
     // Adaptive burn rate and tolerated concurrency are inferred from live
     // traffic. Plan size is authoritative OAuth profile metadata, not a learned
     // estimate. Learners are constructed unconditionally so enabling adaptive
@@ -1550,6 +1564,15 @@ export class AccountManager {
     // route pin that can serve it. Falls through to the normal walk if nothing
     // eligible is found (e.g. the whole tier is exhausted).
     const pinEntry = this._pinForRequest(model, advisorModel);
+    // Graceful switch (opt-in): a conversation mid-turn on an account that just
+    // crossed its threshold finishes there. Ahead of distribution and the drain,
+    // so it holds in every distribution mode. Not under a manual route pin at
+    // all: a forced route's own whenSpent policy decides what happens when its
+    // account is spent, and `hold` means that account stops serving.
+    if (sessionId && this.gracefulSwitch && !pinEntry) {
+      const held = this._gracefulHold(sessionId, exclude, model, advisorModel);
+      if (held) return held;
+    }
     if (sessionId && !(pinEntry && this._pinServes(pinEntry.pin, model, advisorModel, exclude))) {
       if (this.distributeSessions) {
         const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
@@ -2200,7 +2223,57 @@ export class AccountManager {
 
   /** { known, active, perAccount } session counts for status/TUI. */
   sessionStats() {
-    return { ...this.sessionTracker.stats(), mode: this.distributionMode, draining: this.drainingCount() };
+    return { ...this.sessionTracker.stats(), mode: this.distributionMode, draining: this.drainingCount(), graceful: this.gracefulHoldCount() };
+  }
+
+  /**
+   * Graceful switch: the account a mid-turn conversation should stay on, or
+   * null to route it as usual. The conversation's pin for this request's weekly
+   * bucket must have been used within GRACEFUL_IDLE_MS or have another request
+   * in flight (SessionTracker.recentPin). Only the switch threshold is waived:
+   * the account must be unavailable for `quota` and nothing else (caps, holds,
+   * errors and routing are all checked ahead of it in unavailableReason), still
+   * under 100% of every bucket that gates the request, not rejected upstream,
+   * allowed for the model by the routes, and not already tried by this request.
+   * New and idle conversations switch as before.
+   * @param {string} sessionId
+   * @param {Set<number>|null} exclude
+   * @param {any} model
+   * @param {any} advisorModel
+   */
+  _gracefulHold(sessionId, exclude, model, advisorModel) {
+    const idx = this.sessionTracker.recentPin(sessionId, this._weeklyBucketFor(model), GRACEFUL_IDLE_MS);
+    if (idx == null || exclude?.has(idx)) return null;
+    const account = this.accounts[idx];
+    if (!account || this.unavailableReason(account, model, advisorModel) !== 'quota') return null;
+    if (account.quota.unifiedStatus === 'rejected' || this._maxUtilization(account, model) >= 1) return null;
+    if (model && !this._routeAllows(account, model)) return null;
+    if (advisorModel && (this.capExceeded(account, advisorModel) || this._maxUtilization(account, advisorModel) >= 1
+      || !this._routeAllows(account, advisorModel))) return null;
+    const now = Date.now();
+    const last = this._gracefulLogAt.get(idx);
+    if (last == null || now - last > GRACEFUL_IDLE_MS) {
+      console.log(`[TeamClaude] Graceful switch: "${safeLine(account.name, 64)}" is past its switch threshold; conversations mid-turn finish there, new ones move on`);
+    }
+    this._gracefulLogAt.set(idx, now);
+    // Pruned here too, not only when status asks: the ids are client-supplied,
+    // and a server nobody polls must not grow the map without bound.
+    this.gracefulHoldCount(now);
+    this._gracefulHolds.set(sessionId, { idx, at: now, model, advisorModel });
+    return account;
+  }
+
+  /** How many conversations a graceful hold is serving now: held within
+   * GRACEFUL_IDLE_MS, on an account still past its threshold for that model.
+   * Zero, and nothing kept, while the setting is off. */
+  gracefulHoldCount(now = Date.now()) {
+    if (!this.gracefulSwitch) { this._gracefulHolds.clear(); return 0; }
+    for (const [id, hold] of this._gracefulHolds) {
+      const account = this.accounts[hold.idx];
+      if (now - hold.at > GRACEFUL_IDLE_MS || !account
+        || this.unavailableReason(account, hold.model, hold.advisorModel) !== 'quota') this._gracefulHolds.delete(id);
+    }
+    return this._gracefulHolds.size;
   }
 
   /**
@@ -5406,7 +5479,8 @@ export class AccountManager {
       // override cannot express — so the page says so before anything is set.
       forceBlocked: this.hasOwnershipClaims() ? { reason: 'ownership-claims' } : null,
       providerRouting: this.getProviderRouting({ blockedModels }),
-      sessions: { ...sessions, scope: 'claude-session-header', distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
+      sessions: { ...sessions, scope: 'claude-session-header', distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount(), graceful: this.gracefulHoldCount() },
+      gracefulSwitch: this.gracefulSwitch,
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
