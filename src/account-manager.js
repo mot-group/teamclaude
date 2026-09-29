@@ -570,7 +570,7 @@ export class AccountManager {
     this.gracefulSwitch = gracefulSwitch === true;
     // sessionId -> { idx, at } for each conversation a hold served, and account
     // index -> when a hold last served there (one log line per episode).
-    /** @type {Map<string, { idx: number, at: number }>} */
+    /** @type {Map<string, { idx: number, at: number, model: any, advisorModel: any }>} */
     this._gracefulHolds = new Map();
     /** @type {Map<number, number>} */
     this._gracefulLogAt = new Map();
@@ -1566,9 +1566,10 @@ export class AccountManager {
     const pinEntry = this._pinForRequest(model, advisorModel);
     // Graceful switch (opt-in): a conversation mid-turn on an account that just
     // crossed its threshold finishes there. Ahead of distribution and the drain,
-    // so it holds in every distribution mode; behind a manual route pin, which
-    // resolves first as it does for affinity.
-    if (sessionId && this.gracefulSwitch && !(pinEntry && this._pinServes(pinEntry.pin, model, advisorModel, exclude))) {
+    // so it holds in every distribution mode. Not under a manual route pin at
+    // all: a forced route's own whenSpent policy decides what happens when its
+    // account is spent, and `hold` means that account stops serving.
+    if (sessionId && this.gracefulSwitch && !pinEntry) {
       const held = this._gracefulHold(sessionId, exclude, model, advisorModel);
       if (held) return held;
     }
@@ -2258,14 +2259,19 @@ export class AccountManager {
     // Pruned here too, not only when status asks: the ids are client-supplied,
     // and a server nobody polls must not grow the map without bound.
     this.gracefulHoldCount(now);
-    this._gracefulHolds.set(sessionId, { idx, at: now });
+    this._gracefulHolds.set(sessionId, { idx, at: now, model, advisorModel });
     return account;
   }
 
-  /** How many conversations a graceful hold served within GRACEFUL_IDLE_MS. */
+  /** How many conversations a graceful hold is serving now: held within
+   * GRACEFUL_IDLE_MS, on an account still past its threshold for that model.
+   * Zero, and nothing kept, while the setting is off. */
   gracefulHoldCount(now = Date.now()) {
+    if (!this.gracefulSwitch) { this._gracefulHolds.clear(); return 0; }
     for (const [id, hold] of this._gracefulHolds) {
-      if (now - hold.at > GRACEFUL_IDLE_MS) this._gracefulHolds.delete(id);
+      const account = this.accounts[hold.idx];
+      if (now - hold.at > GRACEFUL_IDLE_MS || !account
+        || this.unavailableReason(account, hold.model, hold.advisorModel) !== 'quota') this._gracefulHolds.delete(id);
     }
     return this._gracefulHolds.size;
   }

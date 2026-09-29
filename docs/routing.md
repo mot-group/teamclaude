@@ -375,7 +375,7 @@ When it is on, a request stays on the account its conversation has been using fo
 - The account's only problem is the **switch threshold**. It is still under 100% of every bucket that gates the request, upstream has not rejected it, and it is not capped (`maxUsage`, `maxSpend`), rate-limited, in error, disabled, held for its routing, or barred by a route.
 - This request has not already tried the account.
 
-New conversations, and requests without a session id, move to the next account as they do today. A manual route pin and a `TC_ACCT` override resolve first. The hold applies whether `distributeSessions` is off, even or adaptive.
+New conversations, and requests without a session id, move to the next account as they do today. A request under a [forced route](#overrides-force-a-route-onto-one-account) is never held: the route's own `whenSpent` decides, and with `hold` the spent account stops serving. A `TC_ACCT` override resolves first, as it always does. The hold applies whether `distributeSessions` is off, even or adaptive.
 
 The price is headroom: during a switch the fleet spends some of the quota between `switchThreshold` and 100%. The same gap is what [extra-usage fallback](quota.md#extra-usage-fallback) spends. A reserve that must hold is `maxUsage`, which a hold never crosses. If the account runs out while a conversation is held, the 429 goes through the [failover hop](#one-failover-hop-on-a-rate-limit) like any other.
 

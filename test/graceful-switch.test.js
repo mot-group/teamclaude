@@ -154,3 +154,30 @@ test('POST /teamclaude/graceful saves through the hook and refuses a malformed b
     proxy.close();
   }
 });
+
+test('a forced route keeps its own policy: `hold` stops serving at the threshold', () => {
+  const { am, clock } = fleet({ routes: [{ name: 'main', match: ['*opus*'] }] });
+  assert.equal(am.setRoutePin('configured:main', 0, { whenSpent: 'hold' }).ok, true);
+  assert.equal(send(am, 'conv'), 'a');
+  pastThreshold(am);
+  clock.now += 1000;
+  am._nextProbeAt = Date.now() + 60_000;
+  assert.equal(send(am, 'conv'), null);
+});
+
+test('the count is only holds still in force', () => {
+  const { am, clock } = fleet();
+  send(am, 'conv');
+  pastThreshold(am);
+  clock.now += 1000;
+  assert.equal(send(am, 'conv'), 'a');
+  assert.equal(am.gracefulHoldCount(), 1);
+  // The account recovers (a window rolled), so nothing is being held.
+  am.accounts[0].quota.unified7d = 0.1;
+  assert.equal(am.gracefulHoldCount(), 0);
+  // Turned off with a hold recorded: nothing is reported either.
+  pastThreshold(am);
+  assert.equal(send(am, 'conv'), 'a');
+  am.gracefulSwitch = false;
+  assert.equal(am.sessionStats().graceful, 0);
+});
