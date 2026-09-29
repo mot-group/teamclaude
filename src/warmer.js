@@ -199,6 +199,7 @@ export class Warmer {
     if (account.type !== 'oauth' || !account.credential) return false;
     if (account.upstream) return false;
     if (account.disabled) return false;
+    if (account.routingRefused) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
     return true;
   }

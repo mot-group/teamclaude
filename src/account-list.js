@@ -5,9 +5,9 @@ import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 /**
  * @typedef {object} AccountProfileDependencies
  * @property {(expiresAt: any) => boolean} isTokenExpiringSoon
- * @property {(refreshToken: any) => Promise<{ accessToken: any, refreshToken: any, expiresAt: any }>} refreshAccessToken
+ * @property {(refreshToken: any, account: Account) => Promise<{ accessToken: any, refreshToken: any, expiresAt: any }>} refreshAccessToken
  * @property {(accounts: Account[]) => Promise<void>} persistRefreshed
- * @property {(accessToken: any) => Promise<AccountProfile>} fetchProfile
+ * @property {(accessToken: any, account: Account) => Promise<AccountProfile>} fetchProfile
  */
 
 /**
@@ -45,7 +45,7 @@ export async function loadAccountProfiles(accounts, {
     if (!usesAnthropicAccountMetadata(account)) return;
     if (account.refreshToken && isTokenExpiringSoon(account.expiresAt)) {
       try {
-        const tokens = await refreshAccessToken(account.refreshToken);
+        const tokens = await refreshAccessToken(account.refreshToken, account);
         account.accessToken = tokens.accessToken;
         account.refreshToken = tokens.refreshToken;
         account.expiresAt = tokens.expiresAt;
@@ -60,7 +60,7 @@ export async function loadAccountProfiles(accounts, {
 
   const profiles = await Promise.all(accounts.map(account =>
     usesAnthropicAccountMetadata(account) && account.accessToken
-      ? fetchProfile(account.accessToken)
+      ? fetchProfile(account.accessToken, account)
       : null
   ));
 

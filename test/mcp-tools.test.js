@@ -6,7 +6,9 @@ import { join } from 'node:path';
 
 import { AccountManager } from '../src/account-manager.js';
 import { createControlQueue } from '../src/control-queue.js';
+import { QUOTA_BUCKETS } from '../src/config-ops.js';
 import { createToolSet } from '../src/mcp-tools.js';
+import { WEEKLY_BUCKET_KEYS } from '../src/model.js';
 
 // The write tools drive a real AccountManager against a throwaway config file,
 // with the hooks a server would wire in replaced by spies. Whether reloading
@@ -76,7 +78,7 @@ test('full mode lists every tool in a fixed order, annotated', async () => {
   assert.deepEqual(listed.map(t => t.name), [
     'get_status', 'get_quota', 'get_settings',
     'switch_account', 'reload_config', 'probe_quota',
-    'set_account_enabled', 'set_account_priority', 'remove_account',
+    'set_account_enabled', 'set_account_priority', 'set_account_routing', 'remove_account',
     'set_threshold', 'set_distribution', 'set_probe_interval', 'set_warmup',
     'set_route', 'remove_route', 'set_blocked_models', 'set_client_mode',
   ]);
@@ -94,6 +96,13 @@ test('full mode lists every tool in a fixed order, annotated', async () => {
     assert.ok(tool.description.length > 20, tool.name);
   }
   assert.deepEqual(byName.set_account_enabled.inputSchema.required, ['account', 'enabled']);
+  // What the validator enforces, the schema says up front: a list is a list of
+  // strings, and a bucket table only takes the bucket names the setter accepts.
+  for (const [tool, key] of [['set_route', 'match'], ['set_route', 'accounts'], ['set_blocked_models', 'patterns']]) {
+    assert.deepEqual(byName[tool].inputSchema.properties[key].items, { type: 'string' }, `${tool}.${key}`);
+  }
+  assert.deepEqual(byName.set_threshold.inputSchema.properties.buckets.propertyNames, { enum: ['default', ...QUOTA_BUCKETS] });
+  assert.deepEqual(byName.set_route.inputSchema.properties.bucket.enum, [...WEEKLY_BUCKET_KEYS]);
 });
 
 test('switch_account moves the preference and says whether rotation will follow', async () => {
@@ -158,8 +167,8 @@ test('arguments that do not fit a tool are a tool error the model can read, and 
 });
 
 test('reload_config and probe_quota call through to the server hooks', async () => {
-  const { tools, calls } = await fixture({ hooks: { reload: async () => { calls.push('reload'); return 2; } } });
-  assert.deepEqual(await ok(tools, 'reload_config'), { added: 2 });
+  const { tools, calls } = await fixture({ hooks: { reload: async () => { calls.push('reload'); return { added: 2, removed: 1 }; } } });
+  assert.deepEqual(await ok(tools, 'reload_config'), { added: 2, removed: 1 });
   assert.deepEqual(await ok(tools, 'probe_quota'), { ok: true });
   assert.deepEqual(calls, ['reload', 'probe']);
 });
@@ -189,6 +198,56 @@ test('set_account_priority writes the number to both the account and its entry',
   assert.equal(am.accounts[1].priority, -3);
   assert.equal(config.accounts[1].priority, -3);
   assert.match(await refused(tools, 'set_account_priority', { account: 'alice@example.com', priority: 1.5 }), /integer/);
+});
+
+test('set_account_routing sets, masks, and clears the account proxy', async () => {
+  const { tools, am, config } = await fixture();
+  assert.deepEqual(
+    await ok(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'socks5h://alice:s3cret@proxy.example.com:1080' }),
+    { account: 'bob@example.com (Acme)', routing: 'socks5h://alice:***@proxy.example.com:1080', persisted: true },
+  );
+  assert.equal(am.accounts[1].routing.protocol, 'socks5h');
+  assert.equal(am.accounts[1].routing.password, 's3cret', 'the live account keeps the credential');
+  assert.equal(config.accounts[1].routing, 'socks5h://alice:s3cret@proxy.example.com:1080', 'the entry stores it canonical');
+
+  // Clearing writes an explicit null, not a deleted key (the save merges over disk).
+  await ok(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'none' });
+  assert.equal(am.accounts[1].routing, null);
+  assert.equal(config.accounts[1].routing, null);
+
+  assert.match(await refused(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'https://proxy.example.com' }), /unsupported routing protocol/);
+});
+
+test('set_account_routing refuses this server\'s own address, and stores nothing', async () => {
+  // The MITM listener intercepts the upstream host, so a routing through it
+  // would loop every request straight back in. The fixture's config carries
+  // no port; give it the one the server would be bound to.
+  const { tools, am, config, calls } = await fixture();
+  config.proxy.port = 3456;
+  const text = await refused(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'http://localhost:3456' });
+  assert.match(text, /http:\/\/localhost:3456 is this server's own address/);
+  assert.equal(am.accounts[1].routing, null);
+  assert.equal('routing' in config.accounts[1], false, 'the entry is untouched');
+  assert.deepEqual(calls, [], 'nothing was persisted or reloaded');
+});
+
+test('set_account_routing keeps the proxy password out of the write log', async () => {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  try {
+    const { tools } = await fixture();
+    await ok(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'socks5h://alice:s3cret@proxy.example.com:1080' });
+    // A value that will not parse is logged before it is refused, and an
+    // unescaped '@' in the password is the usual reason it will not parse.
+    await refused(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'socks9://alice:s3c@ret@proxy.example.com:1080' });
+  } finally {
+    console.log = original;
+  }
+  const logged = lines.filter(l => l.includes('MCP set_account_routing'));
+  assert.equal(logged.length, 2, lines.join('\n'));
+  assert.ok(logged[0].includes('socks5h://alice:***@proxy.example.com:1080'), logged[0]);
+  assert.equal(lines.some(l => /s3c/.test(l)), false, lines.join('\n'));
 });
 
 test('remove_account takes the account out of rotation and marks its entry removed before saving', async () => {
@@ -300,20 +359,23 @@ test('a tool that blows up reports a generic failure, never the exception', asyn
 test('write tools run one at a time, so a removal cannot race a reload', async () => {
   const order = [];
   let releaseReload;
-  const reload = () => new Promise(resolve => { order.push('reload:start'); releaseReload = () => { order.push('reload:end'); resolve(0); }; });
+  // The reload announces that it was reached, so the test waits for that —
+  // not for a duration, and not against a deadline of its own: the runner's
+  // timeout bounds a write that never arrives.
+  let reachedReload;
+  const reached = new Promise(resolve => { reachedReload = resolve; });
+  const reload = () => new Promise(resolve => {
+    order.push('reload:start');
+    releaseReload = () => { order.push('reload:end'); resolve(0); };
+    reachedReload();
+  });
   const persistAccounts = async () => { order.push('persist'); };
   const { tools } = await fixture({ hooks: { reload, persistAccounts } });
 
   const first = tools.call('set_threshold', { percent: 70 });
   const second = tools.call('remove_account', { account: 'alice@example.com' });
   try {
-    // Wait for the first call to reach its reload — not for a duration — before
-    // judging what the second has done meanwhile.
-    const deadline = Date.now() + 5000;
-    while (!releaseReload) {
-      if (Date.now() > deadline) throw new Error('the first write never reached its reload');
-      await new Promise(r => setTimeout(r, 5));
-    }
+    await reached;
     assert.deepEqual(order, ['reload:start'], 'the removal must wait for the running write to finish');
   } finally {
     // Released whatever the verdict: the queue is shared by every write tool
@@ -370,6 +432,61 @@ test('a write that never settles is answered, and the queue moves on without it'
   const next = await ok(tools, 'set_account_priority', { account: 'alice@example.com', priority: 2 });
   assert.equal(next.priority, 2);
   assert.equal(am.accounts[0].priority, 2);
+});
+
+test('the write queue takes only so many turns; past that a call is refused at once', async () => {
+  // Each write's reload hands out its release and announces that it was
+  // reached; waitFor(n) is that announcement, not a poll against a deadline
+  // (the runner's own timeout bounds a write that never arrives).
+  const releases = [];
+  const arrivals = [];
+  const reload = () => new Promise(resolve => {
+    releases.push(resolve);
+    for (const arrival of arrivals.splice(0)) arrival();
+  });
+  const { tools, disk } = await fixture({ hooks: { reload }, options: { writeQueueDepth: 2 } });
+  const waitFor = async (n) => {
+    while (releases.length < n) await new Promise(resolve => arrivals.push(resolve));
+  };
+  const first = tools.call('set_probe_interval', { seconds: 120 });
+  const second = tools.call('set_probe_interval', { seconds: 130 });
+  try {
+    await waitFor(1);
+    // A third has no place in line: answered now, and nothing of it ran.
+    const text = await refused(tools, 'set_probe_interval', { seconds: 140 });
+    assert.match(text, /2 writes are already waiting/);
+    assert.equal((await disk()).quotaProbeSeconds, 120);
+  } finally {
+    // Shared queue: whatever the verdict, the pending turns are let through.
+    await waitFor(1);
+    releases[0]();
+    await first;
+    await waitFor(2);
+    releases[1]();
+    await second;
+  }
+  // Once the line has cleared, the next call is served.
+  const next = tools.call('set_probe_interval', { seconds: 150 });
+  await waitFor(3);
+  releases[2]();
+  assert.deepEqual(await next.then(r => r.structuredContent), { quotaProbeSeconds: 150 });
+});
+
+test('a write is logged once it has happened; a refused one says it was refused', async () => {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  try {
+    const { tools } = await fixture();
+    await refused(tools, 'set_threshold', { percent: 0 });
+    await refused(tools, 'set_account_priority', { account: 'nobody@example.com', priority: 1 });
+  } finally {
+    console.log = original;
+  }
+  const audit = lines.filter(l => l.includes('] MCP '));
+  assert.equal(audit.length, 2, lines.join('\n'));
+  for (const line of audit) assert.match(line, /^\[TeamClaude\] MCP \w+ by ci refused \(/, line);
+  assert.match(audit[1], /nobody@example\.com/);
 });
 
 test('every write is logged with the tool, the caller and what changed', async () => {

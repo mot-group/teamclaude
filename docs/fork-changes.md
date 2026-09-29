@@ -2,7 +2,9 @@
 
 This page tracks additions and fixes maintained in [mot-group/teamclaude](https://github.com/mot-group/teamclaude), based on [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude). The upstream npm package retains its original name and publisher. Its version number does not identify which MOT changes are installed. Use the reviewed Git commit to identify a fork deployment.
 
-This fork is synced to upstream 1.1.21 through the merge of `upstream/master` at `3d5bb6f`. The `.github/workflows/docker.yml` job is gated off on this fork.
+This fork is synced to the upstream release 1.1.22 through a merge of tag `v1.1.22` at `931e8b1`. Syncs follow upstream release tags only, never upstream `master`. The `.github/workflows/docker.yml` job is gated off on this fork.
+
+The fork keeps its own dashboard. From upstream's 1.1.22 dashboard work it takes the usage window (Total, last 5h, last 24h) for the Clients and dimension tables. It leaves out the light theme and the single-number threshold field, because the fork's Routing panel edits thresholds per bucket through the same `POST /teamclaude/threshold`. Upstream's `/teamclaude/disable` and `/teamclaude/priority` endpoints are merged but have no dashboard control yet.
 
 ## Merged features and fixes
 

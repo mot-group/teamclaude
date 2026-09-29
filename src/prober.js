@@ -149,6 +149,9 @@ export class Prober {
   _probeable(account) {
     if (!account?.credential) return false;
     if (account.disabled) return false;
+    // A configured routing that cannot be used: a probe would send the
+    // credential by the fleet path instead (see resolveAccountRouting).
+    if (account.routingRefused) return false;
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return false;
     return true;
   }
@@ -165,11 +168,11 @@ export class Prober {
     if (this._isCodexProbeTarget(account)) return this._probeCodex(account, startedAt);
     try {
       await this.am.ensureTokenFresh(account.index);
-      let usage = await this._withTimeout(this.probeFn(account.credential));
+      let usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
       if (usage?.status === 401) {
         // Token rejected: force refresh and retry once.
         await this.am.ensureTokenFresh(account.index, true);
-        usage = await this._withTimeout(this.probeFn(account.credential));
+        usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
       }
 
       if (!usage || usage.error) {
@@ -201,7 +204,7 @@ export class Prober {
       const missingTier = !account.rateLimitTier && !account.seatTier
         && account.hasClaudeMax == null && account.hasClaudePro == null;
       if (missingTier && this.profileFn) {
-        const profile = await this._withTimeout(this.profileFn(account.credential));
+        const profile = await this._withTimeout(this.profileFn(account.credential, account.routing ?? null));
         this.am.applyProfileData(account.index, profile);
       }
       const finishedAt = Date.now();
