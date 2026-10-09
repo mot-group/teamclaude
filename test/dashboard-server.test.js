@@ -1,15 +1,53 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdtemp, symlink, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, symlink, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createDashboardServer, hashPassword } from '../src/dashboard-server.js';
 
 const credential = await hashPassword('test-dashboard-password');
+
+test('the CLI accepts HTTPS browser origins and sets Secure cookies behind a TLS proxy', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-dashboard-https-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, 'teamclaude-dashboard-password.json'), JSON.stringify(credential));
+  await writeFile(join(dir, 'teamclaude.json'), JSON.stringify({ proxy: { port: 1, apiKey: 'test-key' } }));
+  const reservation = http.createServer();
+  await listen(reservation);
+  const port = reservation.address().port;
+  await new Promise(resolve => reservation.close(resolve));
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/dashboard-server.js', import.meta.url))], {
+    env: { ...process.env, XDG_CONFIG_HOME: dir, TEAMCLAUDE_CONFIG: join(dir, 'teamclaude.json'), TEAMCLAUDE_DASHBOARD_PASSWORD_FILE: join(dir, 'teamclaude-dashboard-password.json'), TEAMCLAUDE_DASHBOARD_HOST: '127.0.0.1', TEAMCLAUDE_DASHBOARD_PORT: String(port), TEAMCLAUDE_DASHBOARD_HOSTNAMES: 'dashboard.test', TEAMCLAUDE_DASHBOARD_SECURE: 'true' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => child.kill());
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Dashboard CLI did not start')), 5000);
+    child.once('error', error => { clearTimeout(timer); reject(error); });
+    child.once('exit', code => { clearTimeout(timer); reject(new Error(`Dashboard CLI exited: ${code}`)); });
+    child.stdout.on('data', data => {
+      if (String(data).includes('TeamClaude dashboard:')) { clearTimeout(timer); resolve(); }
+    });
+  });
+  const url = `http://127.0.0.1:${port}/teamclaude/login`;
+  const options = { method: 'POST', headers: { host: 'dashboard.test', origin: 'https://dashboard.test', 'content-type': 'application/json' }, body: JSON.stringify({ password: 'test-dashboard-password' }) };
+  const send = options => new Promise((resolve, reject) => {
+    const req = http.request(url, options, res => { res.resume(); resolve(res); });
+    req.on('error', reject);
+    req.end(options.body);
+  });
+  const response = await send(options);
+  assert.equal(response.statusCode, 200);
+  assert.match(response.headers['set-cookie'][0], /; Secure/);
+  for (const origin of ['http://dashboard.test', 'https://attacker.test']) {
+    assert.equal((await send({ ...options, headers: { ...options.headers, origin } })).statusCode, 403);
+  }
+});
+
 async function listen(server) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return `http://127.0.0.1:${server.address().port}`;

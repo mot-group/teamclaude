@@ -256,9 +256,10 @@ async function main() {
   const credential = JSON.parse(await readFile(passwordFile, 'utf8'));
   const host = process.env.TEAMCLAUDE_DASHBOARD_HOST || '127.0.0.1';
   const port = Number(process.env.TEAMCLAUDE_DASHBOARD_PORT || 3457);
+  const secure = process.env.TEAMCLAUDE_DASHBOARD_SECURE === 'true';
   if (['0.0.0.0', '::'].includes(host)) throw new Error('Bind to a specific LAN address');
   const hosts = [...new Set([host, '127.0.0.1', 'localhost', ...(process.env.TEAMCLAUDE_DASHBOARD_HOSTNAMES || '').split(',').filter(Boolean)])];
-  const server = createDashboardServer({ credential, hosts, proxyUrl: `http://127.0.0.1:${config.proxy?.port || 3456}`, apiKey: config.proxy?.apiKey || '' });
+  const server = createDashboardServer({ credential, hosts, secure, proxyUrl: `http://127.0.0.1:${config.proxy?.port || 3456}`, apiKey: config.proxy?.apiKey || '' });
   server.on('error', err => { console.error(`Dashboard: ${err.message}`); process.exitCode = 1; });
   server.listen(port, host, () => console.log(`TeamClaude dashboard: http://${host}:${port}`));
   for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
