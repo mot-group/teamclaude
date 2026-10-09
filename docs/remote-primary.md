@@ -14,7 +14,9 @@ The primary must not have its own `remotePrimary` configuration. Chained primary
 
 ## Configure each client
 
-Keep independently enrolled local accounts available for fallback. Do not copy refresh tokens between independently refreshing processes. Shared subscriptions still have shared quota.
+Keep independently enrolled local accounts available for fallback. Do not copy refresh tokens between independently refreshing processes. Shared subscriptions still have shared quota. For the same reason, `teamclaude callback login` refuses on an install with `remotePrimary` set: callback.net credential sync uploads every OAuth refresh token and has signed-in installs adopt each other's. Do not run it on the primary either.
+
+On a client with the quota probe on, the account Details line "Outside this proxy" counts the primary's spend on shared subscriptions as spend that went elsewhere. That reading is correct for the client and needs no action.
 
 Add this block to the client's TeamClaude configuration, substituting the actual HTTPS hostname, absolute key file path, and primary instance ID:
 

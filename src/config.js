@@ -70,7 +70,7 @@ export async function saveState(state) {
  * was once world-readable becomes 0600 on the next save, and the tokens are
  * never on disk under a looser mode even for an instant.
  */
-async function writeJsonAtomic(path, value) {
+export async function writeJsonAtomic(path, value) {
   // A rename replaces the NAME, so a config that is a symlink (a dotfiles
   // checkout, say) would silently become a regular file where the old in-place
   // write followed the link. Resolve it first; a dangling or absent path is
@@ -109,7 +109,8 @@ export function createDefaultConfig() {
     preferFableDepletedAccounts: false,
     gracefulSwitch: false,
     sessionTitles: { enabled: false, width: 18 },
-    quotaBarPercent: true,
+    quotaBarPercent: false,
+    accountSort: 'arranged',
     eventLogging: 'hide',
     defaultClientMode: 'mitm',
     // Written out rather than left absent, so a fresh config states the one
@@ -118,6 +119,7 @@ export function createDefaultConfig() {
     autoRedeemResets: false,
     blockedModels: [],
     stripOverageHeaders: false,
+    synthesizeQuotaHeaders: false,
     accounts: [],
   };
 }

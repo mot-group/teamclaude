@@ -7,6 +7,7 @@
 import { codexWindows } from './forecast/observations.js';
 import { proxyFetch } from './upstream-fetch.js';
 import { safeLine } from './safe-text.js';
+import { windowBucket } from './codex-quota.js';
 
 export const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 
@@ -31,8 +32,10 @@ function windowReading(window) {
  */
 function classify(rateLimit) {
   const readings = Object.values(rateLimit || {}).flatMap(w => windowReading(w) ?? []);
-  const fiveHour = readings.find(r => r.seconds <= 6 * 60 * 60) || null;
-  const sevenDay = readings.find(r => r.seconds >= 6 * 24 * 60 * 60) || null;
+  // Filed by length with the header path's own rule, so the two paths agree
+  // and a monthly window is dropped instead of read as the weekly one.
+  const fiveHour = readings.find(r => windowBucket(r.seconds / 60) === 'fiveHour') || null;
+  const sevenDay = readings.find(r => windowBucket(r.seconds / 60) === 'weekly') || null;
   return { fiveHour, sevenDay };
 }
 
@@ -111,7 +114,7 @@ const RESET_CREDIT_COUNT_MAX = 99;
  * @param {unknown} value
  * @returns {number|null}
  */
-function creditCount(value) {
+export function creditCount(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return null;
   return Math.min(Math.trunc(n), RESET_CREDIT_COUNT_MAX);

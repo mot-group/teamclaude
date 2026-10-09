@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, showSessionRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml({ sessionAuth = false } = {}) {
@@ -101,6 +101,41 @@ export function accountTokens(usage) {
   var u = usage || {};
   return (u.totalInputTokens || 0) + (u.totalOutputTokens || 0)
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
+}
+
+// A model id as a person would say it: claude-opus-5-5 -> "Opus 5.5",
+// claude-haiku-4-5-20251001 -> "Haiku 4.5", gpt-6.1-sol -> "GPT 6.1 Sol".
+// A context suffix ("[1m]") is dropped; any other shape is shown as sent.
+export function modelLabel(/** @type {string} */ id) {
+  var s = String(id);
+  var br = s.indexOf('[');
+  if (br > 0) s = s.slice(0, br);
+  var parts = s.split('-');
+  var isNum = function (/** @type {string} */ p) { return p !== '' && !isNaN(Number(p)); };
+  var cap = function (/** @type {string} */ w) { return w.charAt(0).toUpperCase() + w.slice(1); };
+  if (parts[0] === 'claude' && parts.length >= 3) {
+    // Date stamps (8 digits) are a snapshot id, not part of the version.
+    var nums = parts.slice(2).filter(function (p) { return isNum(p) && p.length < 8; });
+    if (nums.length) return cap(parts[1]) + ' ' + nums.slice(0, 2).join('.');
+  }
+  if (parts[0] === 'gpt' && parts.length >= 2) {
+    return 'GPT ' + parts[1] + (parts.length > 2 ? ' ' + parts.slice(2).map(cap).join(' ') : '');
+  }
+  return s;
+}
+
+// The models an account served in the last 15 minutes, newest first, at most
+// three. Haiku is what Claude Code uses for side requests (titles, summaries),
+// so it is listed only when nothing else ran — otherwise it would crowd out
+// the model the sessions on that account are actually working with.
+export function recentModelLabels(/** @type {any} */ usage, /** @type {number} */ now) {
+  /** @type {Record<string, number>} */
+  var seen = (usage && usage.recentModels) || {};
+  var at = now == null ? Date.now() : now;
+  var ids = Object.keys(seen).filter(function (k) { return at - seen[k] < 15 * 60 * 1000; })
+    .sort(function (x, y) { return seen[y] - seen[x]; });
+  var main = ids.filter(function (k) { return k.toLowerCase().indexOf('haiku') < 0; });
+  return (main.length ? main : ids).slice(0, 3).map(modelLabel);
 }
 
 /** @param {string|null|undefined} provider */
@@ -477,9 +512,16 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // one may describe a credit that has since been redeemed or has expired.
   var reading = (a.quota || {}).resetCredits || {};
   var credits = reading.available;
-  var stale = Number.isFinite(reading.seenAt) && (now == null ? Date.now() : now) - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
-  if (Number.isFinite(credits) && credits > 0 && !stale) {
-    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') });
+  var at = now == null ? Date.now() : now;
+  var stale = Number.isFinite(reading.seenAt) && at - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
+  // A Claude banked reset states when it lapses: drop it past then, and say
+  // the date while it stands (the claude.ai Resets page names it the same way).
+  var expired = Number.isFinite(reading.expiresAt) && reading.expiresAt <= at;
+  if (Number.isFinite(credits) && credits > 0 && !stale && !expired) {
+    var expires = Number.isFinite(reading.expiresAt)
+      ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+      : '';
+    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText
@@ -1387,13 +1429,14 @@ export function usageFor(entry, view) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, providerOrder, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, routingCards, routeStripLines, problems, quotaDisplay, accountQuotaGroups, sessionActivityText, resetHistoryRows,
   chipFor, forceDefaultAccount, expectedFor, overrideRequest, overrideOutcome,
   fleetFor, resolveSwitchThreshold, resolveMaxUsage, effectiveLimit, quotaGrade, bindingLimit, capBadgeText, forecastWindowLabel, bucketLabel,
   currentFor, accountLabel, gatingUtilization, quotaGate, latestReset,
   offeredBuckets, thresholdSource, parsePercent, storedPercent, limitText, limitsRequest, reloadStep, limitsOutcome,
   fleetInForce, fleetRequest, fleetOutcome, usageFor,
+  outsideSpendText, showSessionRow,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -2046,6 +2089,9 @@ ${SHARED_HELPERS}
         var identity = el('td'); identity.appendChild(el('span', 'account-name', a.label || a.name)); identity.appendChild(accountBadgeRow(a, s));
         identity.appendChild(bindingLine(binding));
         identity.appendChild(el('div', 'account-meta', a.type === 'oauth' ? 'Subscription' : a.type === 'apikey' ? 'API account' : a.type));
+        // What this account served in the last 15 minutes; Haiku only when nothing else ran.
+        var serving = recentModelLabels(a.usage);
+        if (serving.length) identity.appendChild(el('div', 'account-meta', 'Serving ' + serving.join(' · ')));
         var probe = ((s.probe || {}).accounts || []).filter(function (p) { return p.name === a.name; })[0];
         identity.appendChild(el('div', 'account-meta', probe && probe.lastProbedAt ? 'Last probe ' + fmtAgo(probe.lastProbedAt) + (probe.error ? ' · Failed' : '') : 'Quota reading time not reported'));
         tr.appendChild(identity);
@@ -2053,7 +2099,8 @@ ${SHARED_HELPERS}
         ['shared', 'session', 'models'].forEach(function (key, index) {
           var td = el('td'); td.setAttribute('data-label', ['Weekly / total quota','5-hour quota','Model-specific weekly quota'][index]);
           groups[key].forEach(function (q) { td.appendChild(quotaRow(q, a, s, !!binding && binding.label === q.label)); });
-          if (!groups[key].length) td.appendChild(el('span', 'quota-unknown', key === 'shared' ? 'Not reported' : 'No window reported'));
+          // A plan that meters no 5-hour window says so, by the rule status and the TUI use.
+          if (!groups[key].length) td.appendChild(el('span', 'quota-unknown', key === 'shared' ? 'Not reported' : key === 'session' && !showSessionRow(a.quota || {}) ? 'No 5-hour window on this plan' : 'No window reported'));
           tr.appendChild(td);
         });
         var action = el('td'); var btn = el('button', 'act', 'Details →'); btn.setAttribute('aria-label', 'Details for ' + (a.label || a.name)); btn.addEventListener('click', function () { showAccount(a); }); action.appendChild(btn); tr.appendChild(action); body.appendChild(tr);
@@ -2086,7 +2133,12 @@ ${SHARED_HELPERS}
     if (q.planType) wrap.appendChild(el('p', 'usage', 'Plan: ' + q.planType));
     wrap.appendChild(el('p', 'usage', (u.totalRequests || 0) + ' requests · ' + fmtNum(accountTokens(u)) + ' tokens reported. Cumulative account counters.'));
     wrap.appendChild(el('p', 'usage', u.lastUsed ? 'Last request ' + fmtAgo(u.lastUsed) : 'No requests recorded.'));
+    var served = recentModelLabels(u);
+    if (served.length) wrap.appendChild(el('p', 'usage', 'Served in the last 15 minutes: ' + served.join(' · ') + '.'));
     if (q.spend) { var spend = q.spend; wrap.appendChild(el('p', 'usage', 'Extra usage ' + (spend.enabled ? 'enabled' : 'disabled') + ' · ' + (spend.currency || 'USD') + ' ' + ((spend.usedMinor || 0) / Math.pow(10, spend.exponent == null ? 2 : spend.exponent)).toFixed(2) + ' spent this month')); }
+    // Spend on this account that did not come through this proxy, a floor (docs/quota.md).
+    var outside = outsideSpendText(q.outsideSpend);
+    if (outside) wrap.appendChild(el('p', 'usage', 'Outside this proxy: ' + outside));
     if (a.pausedUntil || a.rateLimitedUntil) wrap.appendChild(el('p', 'usage', 'Paused until ' + resetDate(a.pausedUntil || a.rateLimitedUntil)));
   }
 
@@ -3085,10 +3137,10 @@ ${SHARED_HELPERS}
         card.appendChild(el('p', 'usage', (credit.title || credit.resetType) + ' · ' + (credit.expiresAt ? (credit.expiresAt <= Date.now() ? 'expired ' : 'expires ') + shortDate(credit.expiresAt) : 'no expiry reported')
           + (credit.source === 'manual' ? ' · entered manually' : '')));
       });
-      // Anthropic lists web-issued banked resets to claude.ai sessions only.
+      // The usage endpoint answered ineligible, so it did not list this account's grants.
       if (inventory && inventory.oauth && !inventory.oauth.eligible) {
         var hidden = el('p', 'usage dim', 'Not listed to the proxy by Anthropic; add them under bankedResets in the config.');
-        hidden.title = 'Anthropic lists banked resets to claude.ai sessions only' + (inventory.oauth.reason ? ' (' + inventory.oauth.reason + ')' : '') + '. Copy one from claude.ai Settings > Usage.';
+        hidden.title = 'The usage endpoint answered ineligible' + (inventory.oauth.reason ? ' (' + inventory.oauth.reason + ')' : '') + '. Copy one from claude.ai Settings > Usage.';
         card.appendChild(hidden);
       }
       if (account.creditError) card.appendChild(el('p', 'warnt', account.creditError + ', showing the last good inventory.'));
