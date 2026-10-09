@@ -30,6 +30,7 @@ import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { QUOTA_BUCKETS, strictPercent } from './config-ops.js';
 import { ConfigOpError } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
+import { getRemotePrimary } from './remote-primary.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 /**
  * One field of an account-limits save: drop the account's own value, or set
@@ -61,6 +62,7 @@ import { envVar, legacyControlUrl } from './brand.js';
 export const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
+  'x-teamclaude-relay-hop',
 ]);
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
@@ -407,6 +409,7 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
  *   key-less caller naming the very address it listens on (#423).
  */
 export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null } = {}) {
+  const remotePrimary = getRemotePrimary(config);
   const boundHost = () => bindHost || config.proxy?.host;
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
@@ -560,6 +563,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
       }
 
+      if (req.method === 'GET' && req.url === '/teamclaude/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ service: 'teamclaude', instanceId: config.proxy?.instanceId || null, acceptsRelay: !remotePrimary, remotePrimary: remotePrimary?.status() || null }));
+        return;
+      }
+
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true, blockedModels: config.blockedModels || [] });
@@ -567,7 +576,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, upstreamPool: upstreamPoolStatus(), remotePrimary: remotePrimary?.status() || null }, null, 2));
         return;
       }
 
@@ -1076,6 +1085,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   const egress = createEgressGuard(config, logLine);
   const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
   const server = http.createServer(requestHandler);
+  server.on('close', () => remotePrimary?.close());
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
   // What bounds a directory of one-shot dumps is deleting the expired ones, not
@@ -1738,6 +1748,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // request into a 404 that it does not return today.
       const classifiedPath = classificationPath(req.url);
       if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
+
+      const remotePrimary = getRemotePrimary(config);
+      if (remotePrimary && await remotePrimary.handle(req, res, { pinned: pinnedIndex != null || forcedPin != null })) return;
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
