@@ -44,15 +44,21 @@ test('listed grants become one available credit per reset left; spent, malformed
   assert.deepEqual(ineligible, { eligible: false, reason: 'surface', credits: [] });
 });
 
-test('manual entries are not counted while Anthropic lists the grants; an ineligible block after a listed one keeps them', () => {
+test('one source at a time: listed grants, else manual entries, else the grants last listed', () => {
   const listed = normalizeClaudeResetGrants({ eligible: true, grants: [{ label: 'Explore Opus 5.5', resets_left: 1, ends_at: '2026-10-22T07:00:00Z' }] });
-  const manual = [{ expiresAt: '2026-10-22', title: 'Explore Opus 5.5' }];
+  const manual = [{ expiresAt: '2026-10-25', title: 'Recorded by hand' }];
   const inv = claudeResetInventory(listed, manual, start);
   assert.equal(inv.availableCount, 1, 'one reset, not one per source');
   assert.equal(inv.credits[0].source, 'oauth');
-  const after = claudeResetInventory(normalizeClaudeResetGrants(hidden), manual, start, inv);
-  assert.equal(after.availableCount, 1);
-  assert.equal(after.credits[0].source, 'oauth', 'the last listed grants carry over');
+  // The endpoint turns ineligible (say a raised cli_version floor), probe after probe.
+  const ineligible = normalizeClaudeResetGrants({ eligible: false, ineligible_reason: 'cli_version', grants: [] });
+  let carried = inv;
+  for (let i = 0; i < 3; i++) carried = claudeResetInventory(ineligible, null, start, carried);
+  assert.deepEqual(carried.oauth, { eligible: false, reason: 'cli_version' }, 'the ineligible answer is recorded, so the Resets view says so');
+  assert.deepEqual(carried.credits.map(c => c.source), ['oauth'], 'with nothing recorded by hand, the grants last listed stand in');
+  const recorded = claudeResetInventory(ineligible, manual, start, carried);
+  assert.deepEqual(recorded.credits.map(c => c.title), ['Recorded by hand'], 'manual entries replace them');
+  assert.equal(recorded.availableCount, 1);
   assert.equal(claudeResetInventory(normalizeClaudeResetGrants(hidden), manual, start).credits[0].source, 'manual', 'never listed: the manual entry counts');
 });
 

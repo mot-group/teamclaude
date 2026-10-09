@@ -102,24 +102,25 @@ export function manualResetCredits(entries) {
 }
 
 /**
- * The inventory the reset tracker stores and alerts on: every available credit
- * from both sources, plus whether Anthropic listed grants to this OAuth token.
- * A response without a `cedar_ember` section says nothing about grants, and an
- * ineligible one after an eligible one is no reading either (as for
- * bankedResets()), so the OAuth half of `previous` carries over rather than
- * being read as "none left", which would announce the same grants as new when
- * they come back. Manual entries count only while Anthropic does not list the
- * grants, or one reset would count twice.
+ * The inventory the reset tracker stores and alerts on, plus whether Anthropic
+ * listed grants to this OAuth token. Listed grants are the inventory. A
+ * response without a `cedar_ember` section says nothing about grants, so the
+ * OAuth half of `previous` carries over rather than being read as "none left",
+ * which would announce the same grants as new when the section returns. An
+ * ineligible answer is recorded as such, and the operator's manual entries are
+ * the inventory; with none recorded, the grants last listed stand in until they
+ * lapse, so a lapse in eligibility does not read as the resets being spent.
+ * One source at a time, so a reset is never counted twice.
  * @param {ClaudeResetGrants|null|undefined} grants
  * @param {unknown} bankedResets
  * @param {number} [now]
  * @param {{ credits?: ClaudeResetCredit[], oauth?: { eligible: boolean, reason: string|null }|null }|null} [previous]
  */
 export function claudeResetInventory(grants, bankedResets, now = Date.now(), previous = null) {
-  if (previous?.oauth && (!grants || (!grants.eligible && previous.oauth.eligible))) {
-    grants = { ...previous.oauth, credits: (previous.credits || []).filter(c => c.source === 'oauth') };
-  }
-  const credits = [...(grants?.credits || []), ...(grants?.eligible ? [] : manualResetCredits(bankedResets))];
+  const carried = (previous?.credits || []).filter(c => c.source === 'oauth');
+  if (!grants && previous?.oauth) grants = { ...previous.oauth, credits: carried };
+  const manual = manualResetCredits(bankedResets);
+  const credits = grants?.eligible ? grants.credits : manual.length ? manual : carried;
   const availableCount = credits.filter(c => c.status === 'available' && (c.expiresAt === null || c.expiresAt > now)).length;
   return { availableCount, credits, oauth: grants ? { eligible: grants.eligible, reason: grants.reason } : null };
 }
