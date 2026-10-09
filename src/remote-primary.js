@@ -3,6 +3,10 @@ import https from 'node:https';
 import { readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 
+/** @typedef {import('node:http').IncomingMessage | import('node:http2').Http2ServerRequest} Request */
+/** @typedef {import('node:http').ServerResponse | import('node:http2').Http2ServerResponse} Response */
+/** @typedef {{url: string, apiKeyFile: string, instanceId: string, mode?: string}} Settings */
+/** @type {WeakMap<object, RemotePrimary>} */
 const instances = new WeakMap();
 const NETWORK_ERRORS = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENETUNREACH', 'EHOSTUNREACH', 'ENOTFOUND', 'EAI_AGAIN']);
 const HOP_HEADERS = new Set(['host', 'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate']);
@@ -11,21 +15,25 @@ const MODEL_PATHS = new Set([
   'POST /backend-api/codex/responses', 'POST /backend-api/codex/responses/compact', 'GET /backend-api/codex/models',
 ]);
 
+/** @param {import('node:http').IncomingHttpHeaders | import('node:http2').IncomingHttpHeaders} headers */
 function headersFor(headers) {
   const excluded = new Set([...HOP_HEADERS, ...String(headers.connection || '').toLowerCase().split(',').map(s => s.trim())]);
   return Object.fromEntries(Object.entries(headers).filter(([name]) => !name.startsWith(':') && !excluded.has(name.toLowerCase())));
 }
 
+/** @param {Response} res @param {string} message */
 function answer(res, message, status = 503) {
   if (res.headersSent) { res.destroy(); return; }
   res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
   res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message } }));
 }
 
+/** @param {Request} req */
 export function isRemoteModelRequest(req) {
   return MODEL_PATHS.has(`${req.method} ${String(req.url || '').split('?')[0]}`);
 }
 
+/** @param {{remotePrimary?: Settings | null}} config */
 export function getRemotePrimary(config) {
   if (!config.remotePrimary) return null;
   if (!instances.has(config)) instances.set(config, new RemotePrimary(config.remotePrimary));
@@ -33,6 +41,7 @@ export function getRemotePrimary(config) {
 }
 
 export class RemotePrimary {
+  /** @param {Settings} settings @param {{intervalMs?: number, deadlineMs?: number, recoveryMs?: number, recoveryProbes?: number, failures?: number, now?: () => number, log?: (line: string) => void}} options */
   constructor(settings, { intervalMs = 5000, deadlineMs = 2000, recoveryMs = 60000, recoveryProbes = 13, failures = 3, now = Date.now, log = line => console.error(line) } = {}) {
     this.url = new URL(settings.url);
     const loopback = ['127.0.0.1', '[::1]'].includes(this.url.hostname);
@@ -53,14 +62,18 @@ export class RemotePrimary {
     this.now = now;
     this.log = log;
     this.route = this.mode === 'local-only' ? 'local' : 'starting';
+    /** @type {string | null} */
     this.reason = null;
     this.failed = 0;
     this.good = 0;
+    /** @type {number | null} */
     this.goodSince = null;
     this.forwarded = 0;
     this.local = 0;
     this.inFlight = 0;
+    /** @type {Promise<unknown> | null} */
     this.probing = null;
+    /** @type {import('node:http').ClientRequest | null} */
     this.probeRequest = null;
     this.closed = false;
     this.ready = this.mode === 'local-only' ? Promise.resolve() : this.probe();
@@ -72,6 +85,7 @@ export class RemotePrimary {
     return { mode: this.mode, route: this.route, reason: this.reason, consecutiveFailures: this.failed, consecutiveSuccesses: this.good, forwarded: this.forwarded, local: this.local, inFlight: this.inFlight };
   }
 
+  /** @param {string} route @param {string | null} reason */
   transition(route, reason = null) {
     if (this.closed) return;
     if (this.route !== route || this.reason !== reason) this.log(`[TeamClaude] Remote primary route: ${route}${reason ? ` (${reason})` : ''}`);
@@ -79,6 +93,7 @@ export class RemotePrimary {
     this.reason = reason;
   }
 
+  /** @param {boolean} ok @param {string | null} reason */
   observe(ok, reason = null, availability = false, immediate = false) {
     if (this.closed) return;
     if (ok) {
@@ -102,12 +117,13 @@ export class RemotePrimary {
     const transport = this.url.protocol === 'https:' ? https : http;
     this.probing = new Promise(resolve => {
       let settled = false;
+      /** @param {boolean} ok @param {string | null} reason */
       const finish = (ok, reason = null, availability = false) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         this.observe(ok, reason, availability);
-        resolve();
+        resolve(undefined);
       };
       const req = transport.get(new URL('/teamclaude/health', this.url), { headers: { 'x-api-key': this.key }, agent: false }, res => {
         let body = '';
@@ -117,7 +133,7 @@ export class RemotePrimary {
         });
         res.on('error', () => finish(false, 'health-connection-failed', true));
         res.on('end', () => {
-          if ([502, 503, 504].includes(res.statusCode)) { finish(false, 'health-unavailable', true); return; }
+          if ([502, 503, 504].includes(res.statusCode || 0)) { finish(false, 'health-unavailable', true); return; }
           if (res.statusCode !== 200) { finish(false, `health-http-${res.statusCode}`); return; }
           try {
             const health = JSON.parse(body);
@@ -129,13 +145,14 @@ export class RemotePrimary {
       this.probeRequest = req;
       const timer = setTimeout(() => { finish(false, 'health-timeout', true); req.destroy(); }, this.deadlineMs);
       req.on('error', err => {
-        const code = /** @type {NodeJS.ErrnoException} */ (err).code;
+        const code = /** @type {NodeJS.ErrnoException} */ (err).code || '';
         finish(false, NETWORK_ERRORS.has(code) ? 'health-connection-failed' : 'health-tls-or-config-error', NETWORK_ERRORS.has(code));
       });
     }).finally(() => { this.probing = null; this.probeRequest = null; });
     return this.probing;
   }
 
+  /** @param {Request} req @param {Response} res */
   async handle(req, res, { pinned = false } = {}) {
     if (!isRemoteModelRequest(req)) return false;
     if (req.headers['x-teamclaude-relay-hop']) { answer(res, 'Chained TeamClaude remote-primary routing is not supported', 508); return true; }
@@ -162,12 +179,12 @@ export class RemotePrimary {
         finished = true;
         this.inFlight--;
         clearTimeout(headerTimer);
-        resolve();
+        resolve(undefined);
       };
-      const outgoing = transport.request(new URL(req.url, this.url), { method: req.method, headers, agent: false }, upstream => {
+      const outgoing = transport.request(new URL(req.url || '/', this.url), { method: req.method, headers, agent: false }, upstream => {
         clearTimeout(headerTimer);
-        if ([401, 403].includes(upstream.statusCode)) this.observe(false, `inference-http-${upstream.statusCode}`);
-        res.writeHead(upstream.statusCode, headersFor(upstream.headers));
+        if ([401, 403].includes(upstream.statusCode || 0)) this.observe(false, `inference-http-${upstream.statusCode}`);
+        res.writeHead(upstream.statusCode || 502, headersFor(upstream.headers));
         upstream.on('error', () => { res.destroy(); finish(); });
         upstream.on('aborted', () => { res.destroy(); finish(); });
         upstream.on('end', finish);
@@ -186,7 +203,7 @@ export class RemotePrimary {
       });
       outgoing.on('error', err => {
         if (!req.aborted && !res.destroyed) {
-          if (NETWORK_ERRORS.has(/** @type {NodeJS.ErrnoException} */ (err).code)) this.observe(false, 'primary-connection-failed', true, true);
+          if (NETWORK_ERRORS.has(/** @type {NodeJS.ErrnoException} */ (err).code || '')) this.observe(false, 'primary-connection-failed', true, true);
           else this.observe(false, 'primary-tls-or-config-error');
           answer(res, 'Remote primary request failed; it was not replayed. Check route health before continuing.');
         }
