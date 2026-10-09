@@ -1577,6 +1577,20 @@ test('T2: the Left toggle changes numbers and fill widths but no grade, and pers
   assert.match(dom.querySelector('tr.account-row .bar').getAttribute('aria-valuetext'), /^59% spent, ok/, 'aria text stays on the spent ratio');
 });
 
+test('upstream 1.1.24 readings: models served, a plan with no 5-hour window, spend from outside the proxy', async () => {
+  const s = fixtureStatus();
+  s.accounts[0].usage = { recentModels: { 'claude-opus-5-5': Date.now() - 60e3, 'claude-haiku-4-5-20251001': Date.now() } };
+  s.accounts[0].quota.outsideSpend = { unified7d: { state: 'measured', share: 0.125 } };
+  s.accounts[2].quota.sessionWindowStated = false;
+  const { dom, rowFor } = await renderPage(s);
+  assert.deepEqual(rowFor('alex@personal.dev').querySelectorAll('.account-meta').map(e => e.textContent).slice(0, 2), ['Subscription', 'Serving Opus 5.5'], 'Haiku is left out while another model ran');
+  assert.deepEqual(rowFor('codex-primary').querySelectorAll('.quota-unknown').map(e => e.textContent), ['No 5-hour window on this plan', 'No window reported']);
+  rowFor('alex@personal.dev').querySelector('button.act').click();
+  const lines = dom.getElementById('accountDetails').querySelectorAll('p.usage').map(e => e.textContent);
+  assert.ok(lines.includes('Served in the last 15 minutes: Opus 5.5.'), lines.join('\n'));
+  assert.ok(lines.includes('Outside this proxy: 12.5% of the week went elsewhere'), lines.join('\n'));
+});
+
 test('T2: an unreported ratio renders "Not reported" and no bar; no gating bucket reads "No quota reported"', async () => {
   const s = fixtureStatus();
   s.accounts = [{ ...s.accounts[0], name: 'blank', quota: { unified7d: null, tokensLimit: 10, tokensRemaining: null } }];

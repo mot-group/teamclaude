@@ -185,6 +185,19 @@ test('a width short of whole names on both sides is shared, not given to one pan
   assert.ok(right.nameW > 20, `the Codex pane got name columns past its minimum: ${right.nameW}`);
 });
 
+test('past the width both panes need, more columns change nothing: bars stop at the list cap, the rest stays blank', () => {
+  // Shared between the panes, the spare width set the Codex pane mid-screen on
+  // an ultrawide, with 12-column bars at both ends of the gap.
+  const am = fleet([claude('someone.long@example.com'), claude('b@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
+  const panes = ({ lines }) => listLines(lines).map(l => l.trimEnd());
+  const wide = screen(am, 300);
+  const ultra = screen(am, 660);
+  assert.ok(ultra.drawn.length && ultra.drawn.every(r => r.pane), 'it splits');
+  // 20 is BAR_MAX, where the one-column list's bars stop too.
+  for (const row of ultra.drawn) assert.equal(row.bw, 20, row.text);
+  assert.deepEqual(panes(ultra), panes(wide));
+});
+
 test('each pane marks the account its own provider cursor names', () => {
   const am = fleet([claude('a@x.com'), claude('b@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
   am.setCurrentAccount(1);
@@ -251,6 +264,19 @@ test('a Codex pane whose accounts state no five-hour window drops Ses; Wk takes 
   assert.match(rows[0], /k1@x\.com +active +Wk /);
   assert.doesNotMatch(rows[0], /Ses/);
   assert.match(rows[1], /k2@x\.com +active +Ses .*Wk /);
+});
+
+// #511: the flag says the plan meters no session window, but a reading is
+// still on the account (the header path never clears one). It may be what
+// keeps the account out of rotation, so its cell stays visible.
+test('a Codex row keeps its Ses cell while a session reading is still present', () => {
+  const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
+  noSessionWindow(am.accounts[1]);
+  Object.assign(am.accounts[2].quota, { unified5h: 0.99, unified5hReset: Date.now() + h, sessionWindowStated: false });
+  const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[1]).filter(r => r.trim());
+  assert.match(rows[0], /k1@x\.com +active +Wk /, rows[0]);
+  assert.doesNotMatch(rows[0], /Ses/);
+  assert.match(rows[1], /k2@x\.com .*Ses .*Wk /, rows[1]);
 });
 
 test('an account that has not reported yet keeps the Ses column, so it does not come and go at startup', () => {

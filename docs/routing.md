@@ -18,7 +18,7 @@ How TeamClaude decides which account serves a request, and what it does when tha
 
 TeamClaude prefers to keep you on one account. It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).
 
-When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`.
+When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
 
 ## The two kinds of 429
 
@@ -67,6 +67,17 @@ attempt. After the hop the existing behaviour takes over: the sx.org fresh-IP
 retry if `sx.mode` is `429`, otherwise the inline wait, otherwise a 429 to the
 client with its `retry-after`. An IP-scoped limit is logged as such, since that
 is what an operator chasing a fleet-wide throttle is looking for.
+
+## Thinking blocks across accounts
+
+Since Claude Sonnet 5.5, a thinking block is bound to the **organization** whose account produced it ([preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking), "Thinking blocks stay with the account that produced them"). When a later request in the same conversation goes out on an account of a *different* organization, the API drops those earlier Sonnet 5.5 thinking blocks before the model sees them. The request succeeds and the answer comes back; the model simply answers that turn without the reasoning it had built up, and rebuilds it from the visible history. With the `thinking-binding-controls-2026-08-01` beta header the response lists each dropped block in `input_transformations` with the reason `organization_binding_mismatch`. Blocks from other models are not organization-bound (a model switch has its own, separate rules on that page).
+
+What that means for a pool:
+
+- **Accounts of one organization** (seats on a Team or Enterprise plan) are unaffected: the blocks stay readable on every account the conversation lands on.
+- **Accounts of different organizations** — the usual shape for a pool of personal Max subscriptions, where each login is its own org — pay the drop once per switch of a Sonnet 5.5 conversation: the threshold rotation, the [failover hop](#one-failover-hop-on-a-rate-limit), a re-routed [pin](#session-aware-routing), or a [`TC_ACCT`](#pin-a-session-to-one-account) change. It is the same shape as the cold prompt cache a switch already costs, and it costs nothing on the turns that stay put.
+
+TeamClaude does not strip or rewrite thinking blocks, so nothing is lost for good: the blocks stay in the client's history, and a conversation that moves back to its original organization reads them again. Which organization each account belongs to is on its row in `teamclaude status` and in the dashboard. Nothing here needs configuring; the levers that keep a conversation on one account — `switchThreshold`, `distributeSessions`, a route or a pin — are the ones that keep its reasoning too.
 
 ## Storm control
 

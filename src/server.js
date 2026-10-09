@@ -15,7 +15,7 @@ import { TopLevelFieldFinder, modelGlobMatches, parseRequestStream } from './mod
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
@@ -247,6 +247,55 @@ export function isOverageHeader(name) {
  */
 export function shouldStripOverageHeaders(config) {
   return /** @type {{ stripOverageHeaders?: unknown } | null | undefined} */ (config)?.stripOverageHeaders === true;
+}
+
+// A third-party backend sends no `anthropic-ratelimit-unified-*` headers, so
+// Claude Code never learns its quota. With `synthesizeQuotaHeaders: true` the
+// windows the probe read (backend-quota.js) are stated in the client-bound
+// copy, in the shape Claude Code parses: a 0-1 utilization and an epoch-second
+// reset per window. A window without a future reset is left out, because
+// Claude Code drops it, and a monthly window has no header Claude Code reads.
+// Off unless explicitly enabled: Claude Code words its limit warnings for
+// Anthropic plans.
+const SYNTHESIZED_WINDOWS = /** @type {const} */ ([['fiveHour', '5h'], ['weekly', '7d']]);
+
+/**
+ * @param {Record<string, { utilization: number, resetAt: number|null }>|null|undefined} windows
+ * @param {number} [now]
+ * @returns {Record<string, string>}
+ */
+export function backendQuotaHeaders(windows, now = Date.now()) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [key, name] of SYNTHESIZED_WINDOWS) {
+    const w = windows?.[key];
+    if (!w || !Number.isFinite(w.utilization) || !(Number(w.resetAt) > now)) continue;
+    out[`anthropic-ratelimit-unified-${name}-utilization`] = String(w.utilization);
+    out[`anthropic-ratelimit-unified-${name}-reset`] = String(Math.floor(Number(w.resetAt) / 1000));
+  }
+  if (Object.keys(out).length) out['anthropic-ratelimit-unified-status'] = 'allowed';
+  return out;
+}
+
+/**
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+export function shouldSynthesizeQuotaHeaders(config) {
+  return /** @type {{ synthesizeQuotaHeaders?: unknown } | null | undefined} */ (config)?.synthesizeQuotaHeaders === true;
+}
+
+/**
+ * The client-header flags a reload copies off the disk config, both sampled
+ * per request through the two functions above.
+ *
+ * @param {unknown} diskConfig
+ */
+export function reloadedHeaderFlags(diskConfig) {
+  return {
+    stripOverageHeaders: shouldStripOverageHeaders(diskConfig),
+    synthesizeQuotaHeaders: shouldSynthesizeQuotaHeaders(diskConfig),
+  };
 }
 
 // Constant-time proxy-API-key comparison (both the HTTP gate and the CONNECT
@@ -1579,7 +1628,103 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // different account than the one you're logged in as"), Remote Control binds to
 // the wrong account, and artifacts get published under it. Observed on a live
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
+// Artifacts (deploy, read, list, comments) are served under /api/frame/*, owned
+// by the client's user like the identity plane above; a rotated account's token
+// sees them as not found.
+//
+// The Remote Control bridge is the same plane under other prefixes. Since
+// Claude Code 2.1.287 `claude remote-control` honours HTTPS_PROXY
+// (anthropics/claude-code#97352), so its control calls arrive here too:
+// /v1/environments/* registers the machine, polls it for work, acks and
+// heartbeats that work, reconnects and takes the machine offline;
+// /v1/sessions creates the sessions it serves and /v1/sessions/* drives them;
+// /v2/session_ingress/* and /v2/ccr-sessions/* are the session-scoped
+// endpoints those sessions use (MCP servers among them). Under a rotated token
+// the machine was registered under whichever account rotation picked, a
+// different org on each restart, and creating the session then answered 404.
+// The work poll drew a 401 from every account in turn: its bearer is the
+// environment secret that registration returned, not an OAuth token, so a
+// fleet token in its place can only be refused (ack and heartbeat carry the
+// work's session-ingress token the same way). Observed on a live fleet: 1286
+// "token rejected" lines in the 4h after the 2.1.287 update, against 31 in
+// the 24h before. The two /v1 prefixes also serve the public Managed Agents
+// API, whose environments and sessions belong to the organization that
+// created them, so rotation could not serve those across a multi-org pool
+// either.
+//
+// Each entry ends in '/', so it stops at a segment boundary: `/v1/sessions/`
+// does not take `/v1/sessionsX`. The entry without that slash, the collection
+// itself, matches as well, since a session is created with a bare
+// POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
+
+/**
+ * Whether a classified path is on the client's own identity plane: below an
+ * entry of CLIENT_CREDENTIAL_PATHS, or the collection that entry names.
+ * @param {string} path
+ */
+function isClientCredentialPath(path) {
+  return CLIENT_CREDENTIAL_PATHS.some((p) => path.startsWith(p) || path === p.slice(0, -1));
+}
+
+/**
+ * The authority a request was addressed to, as the client wrote it: the
+ * `:authority` pseudo-header under HTTP/2 (the compat layer exposes it as
+ * `req.authority`, falling back to `host`), the Host header under HTTP/1.
+ * Under a terminated MITM tunnel that is the CONNECT target as the client sees
+ * it; on the base listener it is this proxy's own address.
+ * @param {any} req
+ * @returns {string|undefined}
+ */
+export function requestAuthority(req) {
+  return req?.authority || req?.headers?.host || req?.headers?.[':authority'];
+}
+
+/**
+ * The hostname inside an authority (`chatgpt.com:443`, `CHATGPT.COM.`), or null.
+ * @param {unknown} authority
+ */
+function hostOfAuthority(authority) {
+  if (typeof authority !== 'string' || !authority) return null;
+  // Lower-cased by the parser; a trailing dot is the same name, as in a CONNECT.
+  try { return new URL(`http://${authority}`).hostname.replace(/\.$/, '') || null; } catch { return null; }
+}
+
+/**
+ * Where a request that arrived on ANOTHER provider's intercepted host, but is
+ * not that provider's inference, is relayed with the client's own credential —
+ * or null when the request is ours to route.
+ *
+ * MITM terminates every intercepted host on one server, and the request path
+ * routes by its PATH alone (providerForPath): `/backend-api/codex/*` is Codex,
+ * everything else is Anthropic. That left every other request a Codex client
+ * makes on chatgpt.com — codex-cli 0.156's workspace discovery
+ * (`/backend-api/wham/accounts/check`), its plugin, MCP and settings calls —
+ * classified as Anthropic and sent to api.anthropic.com with a pooled Claude
+ * token, which answered 404; 0.156 refuses to start on that (#492). None of
+ * it is inference, and all of it belongs to the client's own ChatGPT login, so
+ * it goes to the host the client asked for, headers intact, the way
+ * `/v1/oauth/token` is relayed raw.
+ *
+ * The origin is the one that provider's accounts are reached at: the provider
+ * default (https://chatgpt.com) unless an account overrides `upstream`, in
+ * which case that gateway stands in for the host and gets the lot. Only a host
+ * this config intercepts qualifies — the rule hostMode applies to the CONNECT —
+ * and never the default provider's, whose traffic is routed as it always was.
+ *
+ * @param {{ authority: string|undefined, url: string|undefined, config: any, accounts?: any[] }} opts
+ * @returns {string|null}
+ */
+export function clientPassthroughOrigin({ authority, url, config, accounts = [] }) {
+  const host = hostOfAuthority(authority);
+  if (!host) return null;
+  const provider = providerForHost(host);
+  if (!provider || provider === DEFAULT_PROVIDER) return null;
+  if (!interceptHostsFor(config?.accounts || []).includes(host)) return null;
+  if (providerForPath(url || '/') === provider) return null;
+  const sample = accounts.find((a) => providerOf(a) === provider) || null;
+  return upstreamFor(sample || { provider }, null);
+}
 
 // Claude Code's session id is a UUID, but other clients tag sessions too, so
 // the shape is a conservative charset rather than the UUID grammar: wide enough
@@ -1731,7 +1876,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
       // likewise account-bound: files uploaded from claude.ai belong to the
       // paired identity, so fetching them with a rotated token 403s and Claude
-      // Code silently drops the image from the message.
+      // Code silently drops the image from the message. The Remote Control
+      // bridge's environments and sessions are bound to the client's login the
+      // same way (see CLIENT_CREDENTIAL_PATHS).
       //
       // Below the pin strip, so this reads the path that will actually be sent,
       // and on its classification form: `/%61pi/oauth/…`, `/api/oauth%2fprofile`,
@@ -1746,8 +1893,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Still ABOVE the TC_ACCT branch below, which does not touch req.url —
       // moving past it would turn an unknown TC_ACCT pin on an identity-plane
       // request into a 404 that it does not return today.
+      // A request on another provider's intercepted host that is not that
+      // provider's inference — a Codex client's workspace, plugin and settings
+      // calls on chatgpt.com — belongs to the client's own login there, not to
+      // either pool, and goes to that host as sent (#492). Before the identity
+      // plane below, which is Anthropic's.
+      const passthrough = clientPassthroughOrigin({ authority: requestAuthority(req), url: req.url, config, accounts: /** @type {any} */ (accountManager).accounts });
+      if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config)); return; }
+
       const classifiedPath = classificationPath(req.url);
-      if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
+      if (isClientCredentialPath(classifiedPath)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
 
       const remotePrimary = getRemotePrimary(config);
       if (remotePrimary && await remotePrimary.handle(req, res, { pinned: pinnedIndex != null || forcedPin != null })) return;
@@ -1874,9 +2029,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      // stripOverage is sampled once here, at dispatch: retries and holds of
-      // this request keep it, and a reload applies to subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // stripOverage and synthesizeQuota are sampled once here, at dispatch:
+      // retries and holds of this request keep them, and a reload applies to
+      // subsequent requests.
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -3508,6 +3664,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (sendBody.length > 0) l.body('REQUEST BODY', sendBody, req.headers['content-type']);
   };
 
+  let activityOpened = false;
   try {
     // Storm control: pace requests onto a freshly-switched account so a failover
     // burst doesn't slam it all at once and cascade (issue #84). The slot is held
@@ -3519,6 +3676,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // is paused or ramping, which is exactly when clients give up, so leaving it
     // unmarked clustered false positives where the signal is read hardest.
     if (!await accountManager.admit(account.index, () => clientGone(res))) { ctx.abandoned = true; return; }
+    accountManager.beginActivity(account.index);
+    activityOpened = true;
     // This request may have selected the account before another in-flight request
     // observed an entitlement denial. Re-check after admission, when the queued
     // request is about to send, so the cooldown also drains that preselected
@@ -4048,6 +4207,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // A headerless stream is told it is one (see `streamAssumed` above).
     if (streamAssumed) responseHeaders['content-type'] = contentType;
 
+    // A backend's probed windows, stated for the client only (see
+    // backendQuotaHeaders): updateQuota above already ran on the upstream's
+    // own headers, and an upstream that states its own unified quota is left
+    // alone rather than mixed with ours. An error response gets nothing: its
+    // `status: allowed` would be a verdict the proxy never made.
+    if (ctx.synthesizeQuota === true && upstreamRes.status < 400
+        && !Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-'))) {
+      Object.assign(responseHeaders, backendQuotaHeaders(account.quota?.backend?.windows));
+    }
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     // The catch block's retry is guarded by `!res.headersSent`, so a stay
@@ -4213,6 +4382,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.proxyClosed = true;
       res.destroy();
     }
+  } finally {
+    // Outside-spend attribution counts this account as busy from dispatch until
+    // the response has fully ended, streams included (#475).
+    if (activityOpened) accountManager.endActivity(account.index);
   }
 }
 

@@ -59,6 +59,8 @@ For Anthropic API key accounts (billed via Console):
 teamclaude login --api
 ```
 
+A key is **metered** — every token it serves is billed — while a subscription's quota is paid for whether it is spent or not. So a key is added at `priority: 100`, the fallback tier: rotation reaches it only when every account ahead of it is spent, and leaves it the moment one of them has quota again (a higher-priority account preempts on the next selection, so a reset elsewhere moves traffic back off the key). Pass `--priority <n>` to place it yourself; `--priority 0` puts it level with the subscriptions, which is where an added key sat before 1.1.23. A key already in the config keeps whatever priority it has: `teamclaude priority <name> 100` (or `--last`) moves it to the back.
+
 ### When the key is rejected (401)
 
 A 401 on an API-key account never reaches the client. The request fails over to the next account, and the account that answered it is held out of rotation for a cooldown, then tried again. It is not benched for good, because a 401 does not always mean the key is bad: a gateway such as LiteLLM, set as the account's `upstream`, can answer one while its own upstream is unreachable.
@@ -96,6 +98,30 @@ teamclaude routing <name> --check  # test the proxy the account already has
 ```
 
 `login`, `import`, `enable`, `disable`, `priority` and `routing` notify a running server to reload, so credential, priority, enable/disable and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+
+## Syncing accounts across machines (callback.net)
+
+A pooled OAuth token lives a few days, and then has to be signed in again — on every machine that holds a copy. Sign each install in to [callback.net](https://www.callback.net/) instead, and they keep each other's tokens:
+
+```bash
+teamclaude callback login      # prints a URL to approve in any browser (--no-browser to not open one)
+teamclaude callback status     # who this install is signed in as
+teamclaude callback sync       # reconcile the running server with the store now
+teamclaude callback logout     # revoke the session and stop syncing
+```
+
+The sign-in is a poll-token OAuth2 flow: the URL can be opened on any machine, so it works over SSH and in a container, and no local port is listened on. The session token is this install's own and lives beside the config (`<config>.callback.json`, mode `0600`), never in the config itself. Being signed in is the whole opt-in; there is no config key. `logout` turns it off.
+
+**What callback.net does with the data.** It stores your tokens and nothing else: the rows are the account's identity and its access and refresh tokens, encrypted in transit (TLS) and at rest, readable only with your callback.net login, and never used by the service itself — it holds them so your other installs can read them. The service is provided free of charge, as a convenience for exactly this: syncing your own tokens between your own computers. Use it for that and nothing else; in particular, it is not a place to share accounts with other people, and the pool's per-client keys and routing are the tools for sharing a proxy.
+
+While signed in, every **OAuth** account (Claude and Codex) is kept as one row of your `User/Credential` store on callback.net, encrypted at rest and keyed by the account's identity (provider, account, organization), so each of your installs names the same account the same way. What travels is the identity and the tokens: `priority`, `disabled`, `routing` and the display order stay on each install. API-key accounts and [third-party backends](#third-party-backend-accounts) are not synced — a key does not expire, and a backend credential is not ours to renew.
+
+- **A pass** runs when the server starts, on every reload (`callback login`, `login`, `import` and `callback sync` all trigger one) and once a day. A row with no local account becomes one, so signing in on a new machine brings every account over. A row whose token is newer than the local one — the later `expiresAt`, which a renewal always pushes forward — replaces it. A local account newer than its row updates the row, and one with no row creates it.
+- **A token refresh** goes through the row's advisory lock, so one install renews and the rest adopt. A refresh rotates the token family, and two installs renewing one account at once would each invalidate the other's copy — which is exactly the "sign in again everywhere" this exists to end. With the lock taken, the row is read first: if another install has already renewed, that token is adopted and the provider is not called. Refused, another install is renewing: a token that is still good (the refresh runs five minutes ahead of expiry) is simply kept, the renewal arrives through the store, and the next request asks again. A token that has already expired, or that upstream just rejected, waits instead, re-reading every 5 seconds for 30 seconds, adopts what the holder stores, and otherwise tries the lock again; a lock that nobody releases times out after 30 seconds. A store that cannot be reached never stops a refresh: the account is renewed without it and stored on the next pass.
+- **Every other token change** on an install — a `login`, an `import`, a refresh Claude Code made itself that the proxy relayed — is stored the same way.
+- **Removal travels.** `teamclaude remove` (or the TUI, or the MCP endpoint) writes a tombstone into the account's row — `{"_deleted": "<time>"}` — and every other install removes the account at its next pass. A token refresh on an install that has not yet seen the tombstone still goes through, but never writes over it; only an explicit sign-in (`login`, `import`) does, which is how a removed account comes back everywhere. A tombstone older than a week is deleted by whichever pass sees it.
+
+`teamclaude status --json` carries the sync's state under `callbackSync`: the last pass, its error if it failed, how many accounts the store holds and how many tombstones.
 
 ## Per-account routing (`routing`)
 
@@ -137,7 +163,7 @@ Besides the CLI there are two more places to set it. In the TUI, **`g`** then **
 
 Routing covers what TeamClaude does with the account's own credential. Two kinds of traffic are outside that, and both keep the fleet path:
 
-- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*` and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
+- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*`, the Remote Control bridge's `/v1/environments/*`, `/v1/sessions/*`, `/v2/session_ingress/*` and `/v2/ccr-sessions/*`, and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
 - A sign-in or import that names no account. Which account it belongs to is only known once the profile has been read, so that lookup cannot use a proxy it has not found yet. Pass `--name` (or `--routing`) and it can.
 
 ### The proxy is tested before anything depends on it
@@ -290,6 +316,18 @@ Two boundaries worth knowing:
   the proxy to read is not a neutral default.
 - `ab.chatgpt.com` is never intercepted. It is OpenAI's telemetry endpoint,
   carries no inference, and there is nothing there to rewrite.
+- On the intercepted `chatgpt.com`, only `/backend-api/codex/*` is pooled.
+  Everything else the CLI sends there — the workspace discovery codex-cli
+  0.156 makes before every turn (`/backend-api/wham/accounts/check`), its
+  plugin, MCP and settings calls — goes through to `chatgpt.com` with the
+  client's own login, untouched. Those calls are not inference and belong to
+  that login; they used to be classified as Anthropic traffic and answered 404
+  by `api.anthropic.com` ([#492](https://github.com/KarpelesLab/teamclaude/issues/492)).
+- The Codex **Responses WebSocket** is refused (`501`). A WebSocket is relayed
+  with the client's own headers, so a turn over it would run on the client's
+  login and book nothing against the pool. Refused, the CLI falls back to
+  HTTPS, where the pool serves it — the cost is its reconnect attempts before
+  it does.
 
 The base-URL route below still works and is the way to pool Codex without MITM.
 
@@ -417,6 +455,33 @@ held to a 10-second budget, because the waiting client's patience for the
 response head is finite and the retry needs the rest of it. Every attempt and outcome is
 logged.
 
+## Claude banked usage-limit resets
+
+Claude sometimes grants an account a **banked usage-limit reset**, shown under
+**Resets** on the claude.ai usage page (for example "Full reset — Expires
+Oct 23"). Spending one clears the account's 5-hour and 7-day windows ahead of
+their own reset, whenever you choose.
+
+The [quota probe](quota.md#quota-probe) reads the count from the same
+zero-spend `/api/oauth/usage` call it already makes. It asks with
+`?cedar_ember=1` and a Claude Code `User-Agent`, because the endpoint only
+includes the reset block for a recent Claude Code client. The count shows up on
+the same surfaces as the
+[Codex reset credits](#free-rate-limit-reset-credits): `RC1` on the TUI row, a
+`Reset` line in `teamclaude status` with when the reset lapses
+(`expires 18d 23h`), and each reset with its expiry in the dashboard's
+[Resets view](reset-tracking.md#banked-claude-resets). A reset
+past its expiry date is dropped from every surface, as is a reading more than
+7 days old.
+
+The probe is off by default, so the count is only as fresh as the last probe:
+`p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
+it once.
+
+TeamClaude only **reports** a banked reset; it never spends one.
+`autoRedeemResets` applies to Codex accounts only. Spend a Claude reset
+yourself, on the claude.ai usage page or with `/limit-reset` in Claude Code.
+
 ## Third-party backend accounts
 
 Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.
@@ -440,6 +505,46 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
 - **`messageThreads`** — set to `true` when the backend keeps Anthropic message-thread state (a relay that reaches Anthropic does). Off by default for a third-party backend — see below.
 
 Where the provider publishes one, its own balance or quota is shown in `teamclaude status` — see [third-party backend quota](quota.md#third-party-backend-quota).
+
+A [NanoGPT](https://docs.nano-gpt.com/integrations/claude-code) account is the same shape. Its Anthropic-compatible endpoint is `/api/v1/messages`, so the `upstream` is `https://api.nano-gpt.com/api` — Claude Code's SDK appends `/v1/messages` itself, and the `/api/v1` base in NanoGPT's integration page would double it. Claude model names are accepted as they are, so no `modelMap` is needed for Claude; a non-Claude model is named `provider/model`, for example `z-ai/glm-5.3`:
+
+```json
+{
+  "name": "nano-gpt",
+  "type": "oauth",
+  "accessToken": "your-nanogpt-api-key",
+  "upstream": "https://api.nano-gpt.com/api",
+  "priority": 100
+}
+```
+
+`priority: 100` makes it a fallback for **every** model once the Claude accounts are spent — Claude names included, which NanoGPT passes through to Anthropic and bills by its own rules. A [route](routing.md#model-routes) is what sends a session to it on purpose, but a route only restricts who serves the models it matches; it does not keep the account out of ordinary rotation for the rest, so leave the priority high whichever you choose:
+
+```json
+{ "name": "nano", "match": ["z-ai/*", "moonshotai/*", "deepseek/*"], "accounts": ["nano-gpt"] }
+```
+
+Which models a NanoGPT subscription covers, and which are billed from the balance on top, is set by NanoGPT and not published per model; its `Plan` line in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)) shows when a request has started to bill the balance.
+
+A [Z.ai GLM Coding Plan](https://docs.z.ai/devpack/tool/claude) is the same shape. Its endpoint serves only its own model names, so map the Claude names your sessions send onto them, and it takes the key as a bearer exactly as Claude Code's `ANTHROPIC_AUTH_TOKEN` would send it:
+
+```json
+{
+  "name": "z.ai",
+  "type": "oauth",
+  "accessToken": "your-z.ai-api-key",
+  "upstream": "https://api.z.ai/api/anthropic",
+  "priority": 100,
+  "modelMap": {
+    "claude-haiku-4-5-20251001": "glm-5.3-flash",
+    "claude-sonnet-5": "glm-5.3",
+    "claude-opus-5": "glm-5.3",
+    "claude-fable-5-1": "glm-5.3"
+  }
+}
+```
+
+Its 5-hour and weekly windows show up in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)). `priority: 100` makes it a fallback once the Claude accounts are spent — and then the `modelMap` above rewrites the Claude names onto GLM. A [route](routing.md#model-routes) matching `glm-*` sends a session to it on purpose, but a route only restricts who serves the models it matches; it does not keep the account out of ordinary rotation for the rest, so keep the priority high either way.
 
 Reserve the backend for sessions that explicitly ask for its models with a [route](routing.md#model-routes):
 

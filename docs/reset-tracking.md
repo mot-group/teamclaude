@@ -23,9 +23,9 @@ The prober also reads Codex's reset credit inventory. It displays the available 
 
 ## Banked Claude resets
 
-Anthropic gives paid plans occasional banked limit resets, redeemed with **Reset for free** in claude.ai Settings > Usage or Claude Desktop. The Claude probe asks the OAuth usage endpoint for its grant list (`?cedar_ember=1`, part of the same request). Anthropic currently answers OAuth tokens with `eligible: false` and reason `surface`, and lists no grants: web-issued resets are only shown to claude.ai sessions. The Resets view says so on each Claude account. If Anthropic starts listing grants to OAuth tokens, they appear with no further change.
+Anthropic gives paid plans occasional banked limit resets, redeemed with **Reset for free** in claude.ai Settings > Usage or Claude Desktop. The Claude probe asks the OAuth usage endpoint for its grant list (`?cedar_ember=1` and a Claude Code `User-Agent`, part of the same request). Each reset a grant still holds is listed in the Resets view, titled by the grant's label, and expires at the grant's end date. The grant id is never stored, because it is the handle that spends a reset. The same block feeds the `RC` tag and the `Reset` status line ([Claude banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets)), by the same counting rules. The first probe after an upgrade from a version that could not read grants sends one "available" alert per account that holds a reset.
 
-Until then, record a banked reset you see in claude.ai on the account's config row and reload:
+If the endpoint answers `eligible: false` (its reason so far has been the caller, such as `surface` or `cli_version`), the Resets view says so and keeps the grants it last listed until they lapse. For that case, record a banked reset you see in claude.ai on the account's config row and reload. Manual entries replace the last listed grants while the probe cannot list them and are ignored while it can, so a reset is never counted twice:
 
 ```json
 { "name": "claude-main", "type": "oauth", "bankedResets": [{ "expiresAt": "2026-10-22", "title": "Explore Opus 5.5" }] }
