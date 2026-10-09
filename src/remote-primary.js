@@ -8,7 +8,7 @@ import { isAbsolute } from 'node:path';
 /** @typedef {{url: string, apiKeyFile: string, instanceId: string, mode?: string}} Settings */
 /** @type {WeakMap<object, RemotePrimary>} */
 const instances = new WeakMap();
-const NETWORK_ERRORS = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENETUNREACH', 'EHOSTUNREACH', 'ENOTFOUND', 'EAI_AGAIN']);
+const NETWORK_ERRORS = new Set(['ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ETIMEDOUT', 'ENETUNREACH', 'ENETDOWN', 'EHOSTUNREACH', 'EHOSTDOWN', 'EADDRNOTAVAIL', 'ENOTFOUND', 'EAI_AGAIN']);
 const HOP_HEADERS = new Set(['host', 'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate']);
 const MODEL_PATHS = new Set([
   'POST /v1/messages', 'POST /v1/messages/count_tokens', 'GET /v1/models',
@@ -36,7 +36,7 @@ export function isRemoteModelRequest(req) {
 /** @param {{remotePrimary?: Settings | null}} config */
 export function getRemotePrimary(config) {
   if (!config.remotePrimary) return null;
-  if (!instances.has(config)) instances.set(config, new RemotePrimary(config.remotePrimary));
+  if (!instances.has(config) || instances.get(config)?.closed) instances.set(config, new RemotePrimary(config.remotePrimary));
   return instances.get(config);
 }
 
@@ -156,7 +156,7 @@ export class RemotePrimary {
   async handle(req, res, { pinned = false } = {}) {
     if (!isRemoteModelRequest(req)) return false;
     if (req.headers['x-teamclaude-relay-hop']) { answer(res, 'Chained TeamClaude remote-primary routing is not supported', 508); return true; }
-    if (pinned && this.mode !== 'local-only') { answer(res, 'Account pins cannot cross TeamClaude instances. Clear the pin or explicitly select local-only mode.', 400); return true; }
+    if (pinned) { this.local++; return false; }
     await this.ready;
     if (res.destroyed || req.aborted) return true;
     if (this.route === 'local') { this.local++; return false; }

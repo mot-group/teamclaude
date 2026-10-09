@@ -31,7 +31,7 @@ Add this block to the client's TeamClaude configuration, substituting the actual
 
 Restart the local TeamClaude service after changing this block or the client key file. Credentials never belong in URLs, repositories, or logs. HTTPS certificate validation stays enabled. HTTP is supported only for literal loopback destinations used by local tests.
 
-Keep Claude and Codex endpoints pointed at the local listener, normally `127.0.0.1:3456`. Retain the native app login. A direct remote base URL would bypass local fallback. Remove stale account pins: `/tc-acct/` and `TC_ACCT` cannot identify the same enrollment across independent pools and are refused for relayed inference.
+Keep Claude and Codex endpoints pointed at the local listener, normally `127.0.0.1:3456`. Retain the native app login. A direct remote base URL would bypass local fallback. Explicit `/tc-acct/` and MITM `TC_ACCT` account pins stay local, including the existing keep-warm scheduler. They never cross independent pools. Remove stale pins from ordinary fleet launchers to avoid intentionally bypassing the primary. The maintained review launchers reject `TC_ACCT` when a remote primary is configured unless mode is `local-only`.
 
 Supported remote paths are Claude messages, token counting, and model listing, plus Codex responses, response compaction, and model listing. Other paths retain existing behavior. Identity-bound traffic deliberately keeps the native client's credentials and local route.
 

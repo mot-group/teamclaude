@@ -145,11 +145,55 @@ test('an interrupted stream fails rather than appending a standby response', asy
   assert.equal(router.status().local, 0);
 });
 
-test('identity routes and administrative requests stay local; model pins and relay loops are rejected', async t => {
+test('identity routes, administrative requests and explicit pins stay local; relay loops are rejected', async t => {
   const { send, state } = await fixture(t);
   for (const path of ['/v1/oauth/token', '/api/oauth/profile', '/v1/code/test', '/teamclaude/reload']) assert.equal(await (await send({}, path)).text(), 'LOCAL');
-  assert.equal((await send({ 'test-pin': 'true' })).status, 400);
+  assert.equal(await (await send({ 'test-pin': 'true' })).text(), 'LOCAL');
   assert.equal((await send({ 'x-teamclaude-relay-hop': '1' })).status, 508);
+  assert.equal(state.received.length, 0);
+});
+
+test('named client keys authenticate real primary health and both Claude and Codex inference', async t => {
+  const seen = [];
+  const vendor = http.createServer((req, res) => {
+    seen.push({ path: req.url, auth: req.headers.authorization, key: req.headers['x-api-key'] });
+    req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ content: [], output: [], usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstream = await listen(vendor); t.after(() => stop(vendor));
+  const accounts = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'claude-provider-token', expiresAt: Date.now() + 3600000 },
+    { name: 'codex', provider: 'codex', type: 'oauth', accessToken: 'codex-provider-token', expiresAt: Date.now() + 3600000, upstream },
+  ], 0.98);
+  const primary = createProxyServer(accounts, { upstream, proxy: { apiKey: 'admin', clientKeys: [{ name: 'machine', key: 'client-key' }], trustLoopback: false, instanceId: 'ubuntu' } });
+  const url = await listen(primary); t.after(() => stop(primary));
+  assert.equal((await fetch(url + '/teamclaude/health', { headers: { 'x-api-key': 'wrong' } })).status, 401);
+  const health = await fetch(url + '/teamclaude/health', { headers: { 'x-api-key': 'client-key' } });
+  assert.equal(health.status, 200); assert.equal((await health.json()).instanceId, 'ubuntu');
+  for (const [path, model] of [['/v1/messages', 'claude-test'], ['/backend-api/codex/responses', 'gpt-test']]) {
+    const response = await fetch(url + path, { method: 'POST', headers: { 'x-api-key': 'client-key', 'content-type': 'application/json' }, body: JSON.stringify({ model, messages: [], input: [] }) });
+    assert.equal(response.status, 200); await response.text();
+  }
+  assert.equal(seen[0].auth, 'Bearer claude-provider-token');
+  assert.equal(seen[1].auth, 'Bearer codex-provider-token');
+  assert.equal(seen[1].key, undefined);
+});
+
+test('real account-prefix warm-up requests keep using the local pool while a primary is configured', async t => {
+  const { config, state } = await fixture(t);
+  let localRequests = 0;
+  const vendor = http.createServer((req, res) => { localRequests++; req.resume(); res.end('{"content":[]}'); });
+  const upstream = await listen(vendor); t.after(() => stop(vendor));
+  const accounts = new AccountManager([{ name: 'standby', type: 'apikey', apiKey: 'local-provider-key' }], 0.98);
+  const proxyConfig = { proxy: {}, upstream, remotePrimary: config };
+  const server = createProxyServer(accounts, proxyConfig); const url = await listen(server); t.after(() => stop(server));
+  const send = () => fetch(url + '/tc-acct/standby/v1/messages', { method: 'POST', body: '{"model":"claude-test","messages":[]}' });
+  let r = await send(); assert.equal(r.status, 200); await r.text();
+  state.health = 503;
+  const router = getRemotePrimary(proxyConfig);
+  await router.ready; for (let i = 0; i < 3; i++) await router.probe();
+  r = await send(); assert.equal(r.status, 200); await r.text();
+  assert.equal(localRequests, 2);
   assert.equal(state.received.length, 0);
 });
 
