@@ -33,10 +33,13 @@ This listener uses HTTP. Passwords and session cookies travel unencrypted, so us
 | `TEAMCLAUDE_DASHBOARD_HOST` | `127.0.0.1` | Specific local address to listen on |
 | `TEAMCLAUDE_DASHBOARD_PORT` | `3457` | Dashboard port |
 | `TEAMCLAUDE_DASHBOARD_HOSTNAMES` | Empty | Comma-separated extra hostnames allowed by the Host header check |
+| `TEAMCLAUDE_DASHBOARD_SECURE` | `false` | Set to `true` behind an HTTPS reverse proxy to require HTTPS browser origins and mark session cookies Secure. This does not enable TLS on the Node listener. |
 | `TEAMCLAUDE_DASHBOARD_PASSWORD_FILE` | `~/.config/teamclaude-dashboard-password.json` | Salted password hash file |
 | `TEAMCLAUDE_CONFIG` | `~/.config/teamclaude.json` | Proxy configuration, read at dashboard startup |
 
 The default configuration directory honors `XDG_CONFIG_HOME`. The dashboard uses the proxy port and key from that configuration. Restart the dashboard after changing those values. Account data comes from the live proxy on each refresh.
+
+For Tailscale Serve, keep the dashboard bound to `127.0.0.1`, add the machine's exact tailnet DNS hostname to `TEAMCLAUDE_DASHBOARD_HOSTNAMES`, and set `TEAMCLAUDE_DASHBOARD_SECURE=true`. Configure Serve to forward private HTTPS to the dashboard port. Use the HTTPS address in your browser. Do not enable Funnel or expose the plain HTTP listener on the LAN. The HTTPS entry must preserve the Host header so the browser origin matches. Direct HTTP browser login is intentionally refused in secure mode.
 
 To rotate the password, stop the dashboard, move the password hash file to a private backup, run `--init-password` again, and restart. The initializer refuses to overwrite an existing hash.
 
