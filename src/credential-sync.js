@@ -88,14 +88,15 @@ export function isSyncable(a) {
 /**
  * The store key for an account, or null when it is not syncable. Built from the
  * identity, never the per-install config id, so every install of one person
- * names one account the same way.
+ * names one account the same way. A Codex login carries its user as well as
+ * its workspace: members of one ChatGPT workspace share the accountId.
  * @param {Record<string, any>|null|undefined} a
  * @returns {string|null}
  */
 export function syncKeyFor(a) {
   if (!a || !isSyncable(a)) return null;
   const provider = providerOf(a);
-  if (provider === 'codex') return `${KEY_PREFIX}codex.${segment(a.accountId)}`;
+  if (provider === 'codex') return `${KEY_PREFIX}codex.${segment(a.accountId)}${a.userId ? `.${segment(a.userId)}` : ''}`;
   return `${KEY_PREFIX}anthropic.${segment(a.accountUuid)}.${segment(a.orgUuid || a.orgName || 'org')}`;
 }
 
@@ -347,14 +348,15 @@ export class CredentialSync {
 
   /**
    * The row for an account: by key, else by the identity its blob carries (a
-   * row written from an entry that named the organization differently).
+   * row written from an entry that named the organization differently). A key
+   * whose row names someone else is not this account's row.
    * @param {Record<string, any>} account
    * @returns {Row|null}
    */
   _rowFor(account) {
     const key = syncKeyFor(account);
     const byKey = key ? this.rows.get(key) : null;
-    if (byKey) return byKey;
+    if (byKey && (!byKey.blob || sameIdentity(byKey.blob, account))) return byKey;
     for (const row of this.rows.values()) if (row.blob && sameIdentity(row.blob, account)) return row;
     return null;
   }

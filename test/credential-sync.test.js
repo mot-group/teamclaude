@@ -110,7 +110,8 @@ const tokensOf = (a) => ({ accessToken: a.credential, refreshToken: a.refreshTok
 test('only OAuth logins to a provider we refresh are synced, keyed by identity and never by the config id', () => {
   assert.equal(syncKeyFor(claude('a')), `${KEY_PREFIX}anthropic.uuid-a.org-a`);
   assert.equal(syncKeyFor(claude('a', { orgUuid: undefined })), `${KEY_PREFIX}anthropic.uuid-a.Org_a`);
-  assert.equal(syncKeyFor(codex('c')), `${KEY_PREFIX}codex.acct-c`);
+  assert.equal(syncKeyFor(codex('c')), `${KEY_PREFIX}codex.acct-c.user-c`);
+  assert.equal(syncKeyFor(codex('c', { userId: undefined })), `${KEY_PREFIX}codex.acct-c`);
   // The same person on two installs: the same key, whatever ids the configs minted.
   assert.equal(syncKeyFor({ ...claude('a'), id: 'id-1' }), syncKeyFor({ ...claude('a'), id: 'id-2' }));
   for (const not of [
@@ -164,12 +165,22 @@ test('the first pass stores every syncable account, and only those', async () =>
   const { sync, store } = setup([claude('a'), codex('c'), { name: 'k', type: 'apikey', apiKey: 'k' }, claude('g', { upstream: 'https://gw.example' })]);
   const r = await sync.sync('start');
   assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 2, added: 0, evicted: 0, expired: 0, rows: 0 });
-  assert.deepEqual([...store.rows.values()].map((x) => x.Key).sort(), [`${KEY_PREFIX}anthropic.uuid-a.org-a`, `${KEY_PREFIX}codex.acct-c`]);
+  assert.deepEqual([...store.rows.values()].map((x) => x.Key).sort(), [`${KEY_PREFIX}anthropic.uuid-a.org-a`, `${KEY_PREFIX}codex.acct-c.user-c`]);
   const blob = store.blob(`${KEY_PREFIX}anthropic.uuid-a.org-a`);
   assert.equal(blob.accessToken, 'at-a-1');
   assert.equal(blob.by, 'this-box');
   // A second pass changes nothing.
   assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 2 });
+});
+
+test('two members of one ChatGPT workspace keep their own rows and tokens', async () => {
+  const a = codex('a', { accountId: 'acct-w', userId: 'user-1' });
+  const b = codex('b', { accountId: 'acct-w', userId: 'user-2', expiresAt: T0 + 7 * H });
+  const { sync, store, am } = setup([a, b]);
+  assert.equal((await sync.sync('start')).created, 2);
+  assert.equal((await sync.sync('daily')).adopted, 0);
+  assert.deepEqual(am.accounts.map((x) => x.refreshToken), ['rt-a-1', 'rt-b-1']);
+  assert.equal(store.blob(`${KEY_PREFIX}codex.acct-w.user-2`).refreshToken, 'rt-b-1');
 });
 
 test('a row with no local account becomes one, with its tokens and identity but none of another install\'s settings', async () => {
