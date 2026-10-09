@@ -43,6 +43,8 @@ While the config is being rewritten — by the server rotating a refresh token, 
 
 | Field | Description |
 | --- | --- |
+| `remotePrimary` | Optional remote inference routing with automatic local fallback. Set `url`, absolute `apiKeyFile`, expected `instanceId`, and `mode`. Restart after changes. See [remote primary](remote-primary.md). |
+| `proxy.instanceId` | Stable per-installation ID returned by authenticated `/teamclaude/health`. A remote primary client verifies this value before forwarding. |
 | `forecast` | Opt-in subscription-level forecasting: `enabled`, exact `models`, approved `alternatives` pairs, and verified Codex `modelScopes`. Defaults to disabled. Restart after changing this block. See [forecast configuration](forecast/README.md). Existing probe cadence is unchanged. |
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is exempt unless `proxy.trustLoopback` is `false` |
